@@ -1,134 +1,306 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue May 20 17:35:02 2025
+
+@author: User
+"""
 
 import streamlit as st
 import pandas as pd
-import os
 import requests
 import io
-import glob
-from datetime import datetime
 
-st.set_page_config(page_title="Mayoristas Encargomio", layout="wide")
-st.title("📦 Procesamiento de Mayoristas - Encargomio")
+st.set_page_config(page_title="Conciliaciones Mayoristas", layout="wide")
 
-# Diccionarios globales
-ingresos_por_casillero = {}
-egresos_por_casillero = {}
-ingresos_extra_por_casillero = {}
-conciliaciones = {}
+# — 1) Egresos (Compras) —
+@st.cache_data
+def procesar_egresos(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    casilleros = ["9444", "14856", "11591", "1444", "1633"]
+    df = df.copy()
+    df["Fecha Compra"] = pd.to_datetime(df["Fecha Compra"], errors="coerce", utc=True)
+    df["Fecha Compra"] = df["Fecha Compra"].dt.tz_convert(None).dt.strftime("%Y-%m-%d")
+    df["Casillero"] = df["Casillero"].astype(str)
+    df = df[df["Casillero"].isin(casilleros)]
+    df["Tipo"] = "Egreso"
+    df["Total de Pago COP"] = pd.to_numeric(df["Total de Pago COP"], errors="coerce")
+    df["Valor de compra COP"] = pd.to_numeric(df["Valor de compra COP"], errors="coerce")
+    mask = (df["Estado de Orden"] == "Cancelada") & df["Total de Pago COP"].isna()
+    df.loc[mask, "Total de Pago COP"] = df.loc[mask, "Valor de compra COP"]
+    df["Orden"] = pd.to_numeric(df["Orden"], errors="coerce").astype("Int64")
+    df = df.sort_values("Orden")
+    df["Orden"] = df["Orden"].astype(str)
+    df = df.rename(columns={
+        "Fecha Compra": "Fecha",
+        "Valor de compra COP": "Monto"
+    })[["Fecha","Tipo","Monto","Orden","TRM","Usuario","Casillero","Estado de Orden","Nombre del producto"]]
+    df.loc[df["Casillero"]=="9444","Usuario"] = "Maira Alejandra Paez"
+    salida = {}
+    for cas in casilleros:
+        salida[f"egresos_{cas}"] = df[df["Casillero"]==cas].reset_index(drop=True)
+    return salida
 
-casilleros = ["9444", "14856", "11591", "1444", "1633"]
+# — 2) Ingresos Extra —
+@st.cache_data
+def procesar_ingresos_extra(hojas: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    resultado = {}
+    for hoja, df in (hojas or {}).items():
+        cas = hoja.split("-")[0].strip()
+        if not cas.isdigit(): continue
+        df2 = df.copy()
+        if "Casillero" in df2.columns:
+            df2["Casillero"] = df2["Casillero"].astype(str)
+        else:
+            df2["Casillero"] = cas
+        if "Fecha" in df2.columns:
+            try:
+                fmax = pd.to_datetime(df2["Fecha"]).max().strftime("%Y-%m-%d")
+                url = f"https://www.datos.gov.co/resource/mcec-87by.json?vigenciadesde={fmax}T00:00:00.000"
+                data = requests.get(url).json()
+                trm = float(data[0]["valor"]) if data and "valor" in data[0] else None
+            except:
+                trm = None
+            df2["TRM"] = trm
+        resultado[f"extra_{cas}"] = df2.reset_index(drop=True)
+    return resultado
 
-# ========== Funciones ==========
-
-def cargar_trm(fecha_str):
-    try:
-        url = f"https://www.datos.gov.co/resource/mcec-87by.json?vigenciadesde={fecha_str}T00:00:00.000"
-        response = requests.get(url)
-        data = response.json()
-        if data and "valor" in data[0]:
-            return float(data[0]["valor"])
-    except:
-        pass
-    return None
-
-def procesar_egresos(df_compras):
-    df_compras["Fecha Compra"] = pd.to_datetime(df_compras["Fecha Compra"], errors="coerce", utc=True).dt.tz_convert(None)
-    df_compras["Fecha Compra"] = df_compras["Fecha Compra"].dt.strftime('%Y-%m-%d')
-    df_compras["Casillero"] = df_compras["Casillero"].astype(str)
-    df_compras["Orden"] = pd.to_numeric(df_compras["Orden"], errors="coerce").astype("Int64")
-    df_compras["Total de Pago COP"] = pd.to_numeric(df_compras["Total de Pago COP"], errors='coerce')
-    df_compras["Valor de compra COP"] = pd.to_numeric(df_compras["Valor de compra COP"], errors='coerce')
-    df_compras["Orden"] = df_compras["Orden"].astype(str)
-
-    df_filtrado = df_compras[df_compras["Casillero"].isin(casilleros)].copy()
-    df_filtrado["Tipo"] = "Egreso"
-    condicion = (df_filtrado["Estado de Orden"] == "Cancelada") & (df_filtrado["Total de Pago COP"].isna())
-    df_filtrado.loc[condicion, "Total de Pago COP"] = df_filtrado.loc[condicion, "Valor de compra COP"]
-    df_filtrado.rename(columns={"Fecha Compra": "Fecha", "Valor de compra COP": "Monto"}, inplace=True)
-
-    for casillero in casilleros:
-        df_cas = df_filtrado[df_filtrado["Casillero"] == casillero]
-        if not df_cas.empty:
-            nombre_df = f"egresos_{casillero}"
-            egresos_por_casillero[nombre_df] = df_cas.copy()
-            st.success(f"Egresos cargados: {nombre_df} ({len(df_cas)} filas)")
-
-def procesar_ingresos_extra(hojas):
-    for nombre_hoja, df in hojas.items():
-        casillero = str(nombre_hoja).split("-")[0].strip()
-        if casillero.isdigit():
-            nombre_df = f"Movimientos_extra_{casillero}"
-            df["Casillero"] = df.get("Casillero", casillero)
-            df["Casillero"] = df["Casillero"].astype(str)
-            trm_valor = cargar_trm(pd.to_datetime(df["Fecha"]).max().strftime("%Y-%m-%d"))
-            df["TRM"] = trm_valor
-            ingresos_extra_por_casillero[nombre_df] = df.copy()
-            st.success(f"Ingreso extra cargado: {nombre_df} ({len(df)} filas)")
-
-def procesar_ingresos_archivos_multiples(files, usuario, casillero):
+# — 3+4) Ingresos Cliente Genérico —
+@st.cache_data
+def procesar_ingresos_cliente(files: list[bytes], usuario: str, casillero: str) -> pd.DataFrame:
     dfs = []
-    for archivo in files:
-        df = pd.read_csv(archivo, sep='	', encoding='latin-1', engine='python')
+    for up in files:
+        df = pd.read_csv(up, sep="\t", encoding="latin-1", engine="python")
+        df["Archivo_Origen"] = up.name
         dfs.append(df)
     if not dfs:
-        return
-    df_final = pd.concat(dfs, ignore_index=True)
-    df_final["REFERENCIA"] = df_final["REFERENCIA"].fillna(df_final["DESCRIPCIÓN"])
-    df_final = df_final.dropna(how='all', axis=1)
-    df_final["FECHA"] = pd.to_datetime(df_final["FECHA"], format="%Y/%m/%d", errors='coerce')
-    df_final["VALOR"] = df_final["VALOR"].replace({",": ""}, regex=True).astype(float)
-    df_final["Tipo"] = "Ingreso"
-    df_final["Orden"] = ""
-    df_final["Usuario"] = usuario
-    df_final["Casillero"] = casillero
-    df_final["Estado de Orden"] = ""
-    df_final = df_final.rename(columns={"FECHA": "Fecha", "VALOR": "Monto", "REFERENCIA": "Nombre del producto"})
-    df_final = df_final[df_final["Nombre del producto"] != "ABONO INTERESES AHORROS"]
-    df_final = df_final[df_final["Monto"] > 0]
-    trm_valor = cargar_trm(df_final["Fecha"].max().strftime("%Y-%m-%d"))
-    df_final["TRM"] = trm_valor
-    df_final = df_final[["Fecha", "Tipo", "Monto", "Orden", "TRM", "Usuario", "Casillero", "Estado de Orden", "Nombre del producto"]]
-    ingresos_por_casillero[f"ingresos_{casillero}"] = df_final.copy()
-    st.success(f"Ingresos cargados para {usuario} ({casillero}): {len(df_final)} filas.")
+        return pd.DataFrame()
+    df = pd.concat(dfs, ignore_index=True)
+    df["REFERENCIA"] = df["REFERENCIA"].fillna(df.get("DESCRIPCIÓN",""))
+    df = df.dropna(how="all", axis=1)
+    df["FECHA"] = pd.to_datetime(df["FECHA"], format="%Y/%m/%d", errors="coerce")
+    df["VALOR"] = df["VALOR"].astype(str).str.replace(",","").astype(float)
+    df["Tipo"] = "Ingreso"
+    df["Orden"] = ""
+    df["Usuario"] = usuario
+    df["Casillero"] = casillero
+    df["Estado de Orden"] = ""
+    out = df.rename(columns={
+        "FECHA":"Fecha",
+        "VALOR":"Monto",
+        "REFERENCIA":"Nombre del producto"
+    })[["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Estado de Orden","Nombre del producto"]]
+    out = out[out["Nombre del producto"]!="ABONO INTERESES AHORROS"]
+    out = out[out["Monto"]>0]
+    try:
+        fmax = out["Fecha"].max().strftime("%Y-%m-%d")
+        url = f"https://www.datos.gov.co/resource/mcec-87by.json?vigenciadesde={fmax}T00:00:00.000"
+        data = requests.get(url).json()
+        trm = float(data[0]["valor"]) if data and "valor" in data[0] else None
+    except:
+        trm = None
+    out["TRM"] = trm
+    return out.reset_index(drop=True)
 
-# ========== Interfaz ==========
+def main():
+    st.title("📊 Conciliaciones Mayoristas")
 
-st.header("1️⃣ Cargar COMPRAS")
-archivo_compras = st.file_uploader("Archivo de COMPRAS (.xlsx)", type=["xlsx"], key="compras")
-if archivo_compras:
-    df_compras = pd.read_excel(archivo_compras)
-    procesar_egresos(df_compras)
+    # 1) Egresos
+    st.header("1) Egresos (Compras)")
+    compras = st.file_uploader("Sube archivos de COMPRAS", type=["xls","xlsx"], accept_multiple_files=True)
+    egresos = {}
+    if compras:
+        dfc = pd.concat([pd.read_excel(f) for f in compras], ignore_index=True)
+        egresos = procesar_egresos(dfc)
+        tabs = st.tabs(list(egresos.keys()))
+        for tab, key in zip(tabs, egresos):
+            with tab:
+                df = egresos[key]
+                if df.empty:
+                    st.info("Sin egresos")
+                else:
+                    st.dataframe(df, use_container_width=True)
+    else:
+        st.info("📂 Aún no subes Compras")
 
-st.header("2️⃣ Cargar INGRESOS EXTRA")
-archivo_extra = st.file_uploader("Archivo INGRESOS EXTRA (.xlsx con varias hojas)", type=["xlsx"], key="extra")
-if archivo_extra:
-    hojas = pd.read_excel(archivo_extra, sheet_name=None)
-    procesar_ingresos_extra(hojas)
+    st.markdown("---")
 
-st.header("3️⃣ Cargar archivos Nathalia (.xls múltiples)")
-archivos_nathalia = st.file_uploader("Archivos de Nathalia", type=["xls"], accept_multiple_files=True)
-if archivos_nathalia:
-    procesar_ingresos_archivos_multiples(archivos_nathalia, usuario="Nathalia Ospina", casillero="1633")
+    # 2) Ingresos Extra
+    st.header("2) Ingresos Extra")
+    extra = st.file_uploader("Sube archivo de INGRESOS EXTRA", type=["xls","xlsx"])
+    ingresos_extra = {}
+    if extra:
+        hojas = pd.read_excel(extra, sheet_name=None)
+        ingresos_extra = procesar_ingresos_extra(hojas)
+        tabs2 = st.tabs(list(ingresos_extra.keys()))
+        for tab, key in zip(tabs2, ingresos_extra):
+            with tab:
+                df = ingresos_extra[key]
+                if df.empty:
+                    st.info("Sin datos")
+                else:
+                    st.dataframe(df, use_container_width=True)
+    else:
+        st.info("📂 Aún no subes Ingresos Extra")
 
-st.header("4️⃣ Cargar archivos Elvis (.xls múltiples)")
-archivos_elvis = st.file_uploader("Archivos de Elvis", type=["xls"], accept_multiple_files=True, key="elvis")
-if archivos_elvis:
-    procesar_ingresos_archivos_multiples(archivos_elvis, usuario="Paula Herrera", casillero="11591")
+    st.markdown("---")
 
-st.header("5️⃣ Conciliación Final")
-if st.button("Ejecutar conciliación"):
-    for casillero in casilleros:
-        ingresos_df = ingresos_por_casillero.get(f"ingresos_{casillero}")
-        egresos_df = egresos_por_casillero.get(f"egresos_{casillero}")
-        extra_df = ingresos_extra_por_casillero.get(f"Movimientos_extra_{casillero}")
-
-        frames = [df for df in [ingresos_df, egresos_df, extra_df] if df is not None and not df.empty]
-        if frames:
-            df_final = pd.concat(frames, ignore_index=True)
-            conciliaciones[f"conciliacion_{casillero}"] = df_final
-            st.success(f"✔️ Conciliación generada para casillero {casillero} ({len(frames)} fuentes)")
+    # 3) Ingresos Nathalia
+    st.header("3) Ingresos Nathalia Ospina (CA1633)")
+    nat_files = st.file_uploader("Sube archivos .xls de Nathalia", type="xls", accept_multiple_files=True)
+    ingresos_nath = {}
+    if nat_files:
+        df_nat = procesar_ingresos_cliente(nat_files, "Nathalia Ospina", "1633")
+        ingresos_nath["ingresos_1633"] = df_nat
+        if df_nat.empty:
+            st.info("Sin movimientos válidos")
         else:
-            conciliaciones[f"conciliacion_{casillero}"] = pd.DataFrame()
-            st.warning(f"⛔ Sin movimientos para casillero {casillero}, conciliación vacía creada")
+            st.dataframe(df_nat, use_container_width=True)
+    else:
+        st.info("📂 No subes archivos de Nathalia")
 
-    st.balloons()
+    st.markdown("---")
+
+    # 4) Ingresos Elvis
+    st.header("4) Ingresos Elvis (CA11591)")
+    elv_files = st.file_uploader("Sube archivos .xls de Elvis", type="xls", accept_multiple_files=True)
+    ingresos_elv = {}
+    if elv_files:
+        df_elv = procesar_ingresos_cliente(elv_files, "Paula Herrera", "11591")
+        ingresos_elv["ingresos_11591"] = df_elv
+        if df_elv.empty:
+            st.info("Sin movimientos válidos")
+        else:
+            st.dataframe(df_elv, use_container_width=True)
+    else:
+        st.info("📂 No subes archivos de Elvis")
+
+    st.markdown("---")
+
+    # 5) Conciliaciones
+    # 5) Conciliaciones Finales
+    st.header("5) Conciliaciones Finales")
+    
+    casilleros = ["9444", "14856", "11591", "1444", "1633"]
+    conciliaciones = {}
+    
+    for cas in casilleros:
+            # --- INGRESOS: primero de Nathalia, si existe y no está vacío ---
+            key_ing = f"ingresos_{cas}"
+            ing_n = ingresos_nath.get(key_ing)
+            ing_e = ingresos_elv.get(key_ing)
+        
+            if ing_n is not None and not ing_n.empty:
+                inc = ing_n
+            elif ing_e is not None and not ing_e.empty:
+                inc = ing_e
+            else:
+                inc = None
+        
+            # --- EGRESOS ---
+            egr = egresos.get(f"egresos_{cas}")
+        
+            # --- EXTRA (usa la misma clave que definiste en tu dict de ingresos extra) ---
+            ext = ingresos_extra.get(f"extra_{cas}")
+        
+            # --- Armar lista de DataFrames válidos ---
+            frames = []
+            for df in (inc, egr, ext):
+                if df is not None and not df.empty:
+                    frames.append(df)
+        
+            # --- Guardar conciliación (aunque sea vacía) ---
+            if frames:
+                conciliaciones[f"conciliacion_{cas}"] = pd.concat(frames, ignore_index=True)
+            else:
+                conciliaciones[f"conciliacion_{cas}"] = pd.DataFrame()
+        
+        # --- Mostrar resultados en pestañas ---
+    tabs5 = st.tabs(list(conciliaciones.keys()))
+    for tab, key in zip(tabs5, conciliaciones.keys()):
+            with tab:
+                dfc = conciliaciones[key]
+                if dfc.empty:
+                    st.info("⛔ Sin movimientos para este casillero")
+                else:
+                    st.dataframe(dfc, use_container_width=True)
+        
+    st.markdown("---")
+
+    st.markdown("---")
+
+    # 6) Histórico: carga y actualización
+    st.header("6) Actualizar Histórico")
+    hist_file = st.file_uploader("Sube tu archivo HISTÓRICO EXISTENTE", type=["xls","xlsx"])
+    if hist_file:
+        historico = pd.read_excel(hist_file, sheet_name=None)
+        fecha_carga = pd.Timestamp.today().strftime("%Y-%m-%d")
+        # actualizar cada conciliación
+        for clave, df_nuevo in conciliaciones.items():
+            cas = clave.replace("conciliacion_","")
+            dfn = df_nuevo.copy()
+            dfn["Fecha de Carga"] = fecha_carga
+            if dfn.empty: continue
+            usuario = dfn["Usuario"].iloc[0]
+            cnum = dfn["Casillero"].iloc[0]
+            hoja = next((h for h in historico if h.startswith(cas)), None)
+            if hoja:
+                combinado = pd.concat([historico[hoja], dfn], ignore_index=True)
+            else:
+                combinado = dfn
+                hoja = f"{cas} - sin_nombre"
+            # eliminar duplicados egresos
+            mask_e = combinado["Tipo"]=="Egreso"
+            egrs = combinado[mask_e].drop_duplicates(subset=["Orden","Tipo"])
+            otros = combinado[~mask_e]
+            combinado = pd.concat([otros,egrs], ignore_index=True)
+            combinado["Monto"] = pd.to_numeric(combinado["Monto"], errors="coerce")
+            # eliminar duplicados extra
+            if "Motivo" in combinado.columns:
+                mask_x = combinado["Motivo"]=="Ingreso_extra"
+                iex = combinado[mask_x].drop_duplicates(subset=["Orden","Motivo"])
+                ot = combinado[~mask_x]
+                combinado = pd.concat([ot,iex], ignore_index=True)
+            # completar ingresos nulos
+            mask_n = (combinado["Tipo"]=="Ingreso") & combinado["Monto"].isna()
+            for i,row in combinado[mask_n].iterrows():
+                o = row["Orden"]
+                match = combinado[(combinado["Tipo"]=="Egreso") & (combinado["Orden"]==o)]
+                if not match.empty:
+                    combinado.at[i,"Monto"] = match["Monto"].iloc[0]
+            # balance y fila total
+            tot_i = combinado[combinado["Tipo"]=="Ingreso"]["Monto"].sum()
+            tot_e = combinado[combinado["Tipo"]=="Egreso"]["Monto"].sum()
+            bal = tot_i - tot_e
+            estado = "Al día" if bal>=0 else "Alerta"
+            fila = pd.DataFrame([{
+                "Fecha": fecha_carga,
+                "Tipo":"Total",
+                "Monto":bal,
+                "Orden":estado,
+                "TRM":"",
+                "Usuario":usuario,
+                "Casillero":cnum,
+                "Fecha de Carga":fecha_carga,
+                "Estado de Orden":"",
+                "Nombre del producto":""
+            }])
+            historico[hoja] = pd.concat([combinado,fila], ignore_index=True)
+        # generar excel en memoria
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            for h,dfh in historico.items():
+                w.book.create_sheet(h[:31])
+                dfh.to_excel(w, sheet_name=h[:31], index=False)
+        buf.seek(0)
+        st.download_button(
+            "⬇️ Descargar Histórico Actualizado",
+            data=buf,
+            file_name="Historico_movimientos_actualizado.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.info("📂 Aún no subes tu histórico")
+
+    st.caption("Desarrollado con ❤️ y Streamlit")
+
+if __name__=="__main__":
+    main()
