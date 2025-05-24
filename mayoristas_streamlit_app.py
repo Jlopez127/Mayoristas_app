@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 import io
 from datetime import datetime
-import xlrd
+
 
 st.set_page_config(page_title="Conciliaciones Mayoristas", layout="wide")
 
