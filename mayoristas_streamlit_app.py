@@ -9,6 +9,8 @@ import streamlit as st
 import pandas as pd
 import requests
 import io
+from datetime import datetime
+import xlrd
 
 st.set_page_config(page_title="Conciliaciones Mayoristas", layout="wide")
 
@@ -65,18 +67,76 @@ def procesar_ingresos_extra(hojas: dict[str, pd.DataFrame]) -> dict[str, pd.Data
 
 # — 3+4) Ingresos Cliente Genérico —
 @st.cache_data
-def procesar_ingresos_cliente(files: list[bytes], usuario: str, casillero: str) -> pd.DataFrame:
+
+
+
+# 1) Tu función original para los .xls (TSV renombrado)
+def procesar_ingresos_clientes_xls(files: list[bytes], usuario: str, casillero: str) -> pd.DataFrame:
+      dfs = []
+      for up in files:
+          df = pd.read_csv(up, sep="\t", encoding="latin-1", engine="python")
+          df["Archivo_Origen"] = up.name
+          dfs.append(df)
+      if not dfs:
+          return pd.DataFrame()
+      df = pd.concat(dfs, ignore_index=True)
+      df["REFERENCIA"] = df["REFERENCIA"].fillna(df.get("DESCRIPCIÓN",""))
+      df = df.dropna(how="all", axis=1)
+      df["FECHA"] = pd.to_datetime(df["FECHA"], format="%Y/%m/%d", errors="coerce")
+      df["VALOR"] = df["VALOR"].astype(str).str.replace(",","").astype(float)
+      df["Tipo"] = "Ingreso"
+      df["Orden"] = ""
+      df["Usuario"] = usuario
+      df["Casillero"] = casillero
+      df["Estado de Orden"] = ""
+      out = df.rename(columns={
+          "FECHA":"Fecha",
+          "VALOR":"Monto",
+          "REFERENCIA":"Nombre del producto"
+      })[["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Estado de Orden","Nombre del producto"]]
+      out = out[out["Nombre del producto"]!="ABONO INTERESES AHORROS"]
+      out = out[out["Monto"]>0]
+      try:
+          fmax = out["Fecha"].max().strftime("%Y-%m-%d")
+          url = f"https://www.datos.gov.co/resource/mcec-87by.json?vigenciadesde={fmax}T00:00:00.000"
+          data = requests.get(url).json()
+          trm = float(data[0]["valor"]) if data and "valor" in data[0] else None
+      except:
+          trm = None
+      out["TRM"] = trm
+      return out.reset_index(drop=True)
+
+# 2) Nueva función para CSV “reales”
+def procesar_ingresos_clientes_csv(files: list[bytes], usuario: str, casillero: str) -> pd.DataFrame:
     dfs = []
     for up in files:
-        df = pd.read_csv(up, sep="\t", encoding="latin-1", engine="python")
+        contenido = up.read() if hasattr(up, "read") else up
+        buf = io.StringIO(contenido.decode("utf-8"))
+        df = pd.read_csv(buf, header=None, sep=",", encoding="utf-8")
+        if df.shape[1] != 9:
+            import streamlit as st
+            st.warning(f"⚠️ '{up.name}' tiene {df.shape[1]} columnas (esperaba 9). Se omite.")
+            continue
+        df.columns = [
+            "DESCRIPCIÓN", "DESCONOCIDA_1", "DESCONOCIDA_2", "FECHA",
+            "DESCONOCIDA_3", "VALOR", "DESCONOCIDA_4", "REFERENCIA", "DESCONOCIDA_5"
+        ]
         df["Archivo_Origen"] = up.name
         dfs.append(df)
     if not dfs:
-        return pd.DataFrame()
+       return pd.DataFrame()
     df = pd.concat(dfs, ignore_index=True)
     df["REFERENCIA"] = df["REFERENCIA"].fillna(df.get("DESCRIPCIÓN",""))
     df = df.dropna(how="all", axis=1)
-    df["FECHA"] = pd.to_datetime(df["FECHA"], format="%Y/%m/%d", errors="coerce")
+    # Aseguramos que sea string de 8 dígitos y parseamos como YYYYMMDD
+    df["FECHA"] = (
+       df["FECHA"]
+       .astype(str)
+       .str.zfill(8)              # asegurar 8 dígitos
+       .pipe(pd.to_datetime,     # parsear
+             format="%d%m%Y",     # <– ahora día-mes-año
+             errors="coerce")
+       )        
     df["VALOR"] = df["VALOR"].astype(str).str.replace(",","").astype(float)
     df["Tipo"] = "Ingreso"
     df["Orden"] = ""
@@ -84,21 +144,23 @@ def procesar_ingresos_cliente(files: list[bytes], usuario: str, casillero: str) 
     df["Casillero"] = casillero
     df["Estado de Orden"] = ""
     out = df.rename(columns={
-        "FECHA":"Fecha",
-        "VALOR":"Monto",
-        "REFERENCIA":"Nombre del producto"
-    })[["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Estado de Orden","Nombre del producto"]]
+           "FECHA":"Fecha",
+           "VALOR":"Monto",
+           "REFERENCIA":"Nombre del producto"
+       })[["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Estado de Orden","Nombre del producto"]]
     out = out[out["Nombre del producto"]!="ABONO INTERESES AHORROS"]
     out = out[out["Monto"]>0]
     try:
-        fmax = out["Fecha"].max().strftime("%Y-%m-%d")
-        url = f"https://www.datos.gov.co/resource/mcec-87by.json?vigenciadesde={fmax}T00:00:00.000"
-        data = requests.get(url).json()
-        trm = float(data[0]["valor"]) if data and "valor" in data[0] else None
+           fmax = out["Fecha"].max().strftime("%Y-%m-%d")
+           url = f"https://www.datos.gov.co/resource/mcec-87by.json?vigenciadesde={fmax}T00:00:00.000"
+           data = requests.get(url).json()
+           trm = float(data[0]["valor"]) if data and "valor" in data[0] else None
     except:
-        trm = None
+           trm = None
     out["TRM"] = trm
     return out.reset_index(drop=True)
+# 3) Pipeline común (extrae tu lógica de post-procesamiento)
+
 
 def main():
     st.title("📊 Conciliaciones Mayoristas")
@@ -143,38 +205,86 @@ def main():
 
     st.markdown("---")
 
-    # 3) Ingresos Nathalia
+   # 3) Ingresos Nathalia Ospina (CA1633)
     st.header("3) Ingresos Nathalia Ospina (CA1633)")
-    nat_files = st.file_uploader("Sube archivos .xls de Nathalia", type="xls", accept_multiple_files=True)
+    nat_files = st.file_uploader(
+        "Sube archivos .xls y .csv de Nathalia", 
+        type=["xls", "xlsx", "csv"], 
+        accept_multiple_files=True
+    )
     ingresos_nath = {}
+    
     if nat_files:
-        df_nat = procesar_ingresos_cliente(nat_files, "Nathalia Ospina", "1633")
+        # Separar por extensiones
+        xls_files = [f for f in nat_files if f.name.lower().endswith((".xls", ".xlsx"))]
+        csv_files = [f for f in nat_files if f.name.lower().endswith(".csv")]
+    
+        dfs = []
+        if xls_files:
+            df_xls = procesar_ingresos_clientes_xls(xls_files, "Nathalia Ospina", "1633")
+            dfs.append(df_xls)
+        if csv_files:
+            df_csv = procesar_ingresos_clientes_csv(csv_files, "Nathalia Ospina", "1633")
+            dfs.append(df_csv)
+    
+        # Concatenar resultados o crear DataFrame vacío
+        if dfs:
+            df_nat = pd.concat(dfs, ignore_index=True)
+        else:
+            df_nat = pd.DataFrame()
+    
         ingresos_nath["ingresos_1633"] = df_nat
+    
+        # Mostrar en la app
         if df_nat.empty:
             st.info("Sin movimientos válidos")
         else:
             st.dataframe(df_nat, use_container_width=True)
     else:
         st.info("📂 No subes archivos de Nathalia")
-
+    
     st.markdown("---")
 
-    # 4) Ingresos Elvis
+    # 4) Ingresos Elvis (CA11591)
     st.header("4) Ingresos Elvis (CA11591)")
-    elv_files = st.file_uploader("Sube archivos .xls de Elvis", type="xls", accept_multiple_files=True)
+    elv_files = st.file_uploader(
+        "Sube archivos .xls y .csv de Elvis",
+        type=["xls", "xlsx", "csv"],
+        accept_multiple_files=True
+    )
     ingresos_elv = {}
+    
     if elv_files:
-        df_elv = procesar_ingresos_cliente(elv_files, "Paula Herrera", "11591")
+        # Separar por extensión
+        xls_files = [f for f in elv_files if f.name.lower().endswith((".xls", ".xlsx"))]
+        csv_files = [f for f in elv_files if f.name.lower().endswith(".csv")]
+    
+        dfs = []
+        if xls_files:
+            df_xls = procesar_ingresos_clientes_xls(xls_files, "Elvis", "11591")
+            dfs.append(df_xls)
+        if csv_files:
+            df_csv = procesar_ingresos_clientes_csv(csv_files, "Elvis", "11591")
+            dfs.append(df_csv)
+    
+        # Concatenar resultados o crear DataFrame vacío
+        if dfs:
+            df_elv = pd.concat(dfs, ignore_index=True)
+        else:
+            df_elv = pd.DataFrame()
+    
         ingresos_elv["ingresos_11591"] = df_elv
+    
+        # Mostrar en la app
         if df_elv.empty:
             st.info("Sin movimientos válidos")
         else:
             st.dataframe(df_elv, use_container_width=True)
     else:
         st.info("📂 No subes archivos de Elvis")
-
+    
     st.markdown("---")
-
+    
     # 5) Conciliaciones
     # 5) Conciliaciones Finales
     st.header("5) Conciliaciones Finales")
