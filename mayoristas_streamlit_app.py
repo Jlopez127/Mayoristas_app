@@ -11,8 +11,29 @@ import requests
 import io
 from datetime import datetime
 from datetime import timedelta
-
+import dropbox
 st.set_page_config(page_title="Conciliaciones Mayoristas", layout="wide")
+# Crea un cliente de Dropbox usando tu token de Secrets
+cfg_dbx = st.secrets["dropbox"]
+# Muestra los primeros y últimos caracteres, y la longitud para verificar saltos de línea o espacios
+st.write("▶ Token empieza con:", repr(cfg_dbx["token"][:5]))
+st.write("▶ Token acaba con: ", repr(cfg_dbx["token"][-5:]))
+st.write("▶ Longitud total del token:", len(cfg_dbx["token"]))
+dbx = dropbox.Dropbox(cfg_dbx["token"])
+def upload_to_dropbox(data: bytes):
+    """Sube (o sobrescribe) un archivo a Dropbox."""
+    cfg = st.secrets["dropbox"]
+    try:
+        dbx.files_upload(
+            data,
+            cfg["remote_path"],
+            mode=dropbox.files.WriteMode.overwrite
+        )
+        st.success("✅ Histórico subido a Dropbox")
+    except Exception as e:
+        st.error(f"❌ Error subiendo a Dropbox: {e}")
+
+
 
 # — 1) Egresos (Compras) —
 @st.cache_data
@@ -783,12 +804,18 @@ def main():
                 w.book.create_sheet(h[:31])
                 dfh.to_excel(w, sheet_name=h[:31], index=False)
         buf.seek(0)
+        data_bytes = buf.read()
+
+        # 1) Botón de descarga local
         st.download_button(
             "⬇️ Descargar Histórico Actualizado",
-            data=buf,
+            data=data_bytes,  # <-- aquí, usa data_bytes
             file_name=f"{pd.Timestamp.today().strftime('%Y%m%d')}_Historico_mayoristas.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
+        # 2) Subida automática a Dropbox
+        upload_to_dropbox(data_bytes)
     else:
         st.info("📂 Aún no subes tu histórico")
 
