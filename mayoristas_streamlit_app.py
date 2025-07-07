@@ -719,7 +719,7 @@ def main():
     st.markdown("---")
 
     # 6) Histórico: carga y actualización
-    st.header("7) Actualizar Histórico")
+    st.header("7) Actualizar Histórico") 
     hist_file = st.file_uploader("Sube tu archivo HISTÓRICO EXISTENTE", type=["xls","xlsx"])
     if hist_file:
         historico = pd.read_excel(hist_file, sheet_name=None)
@@ -738,6 +738,7 @@ def main():
             else:
                 combinado = dfn
                 hoja = f"{cas} - sin_nombre"
+            combinado["Orden"] = combinado["Orden"].astype(str)    
             # eliminar duplicados egresos
             mask_e = combinado["Tipo"]=="Egreso"
             egrs = combinado[mask_e].drop_duplicates(subset=["Orden","Tipo"])
