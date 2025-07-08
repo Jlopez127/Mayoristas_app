@@ -15,11 +15,11 @@ import dropbox
 st.set_page_config(page_title="Conciliaciones Mayoristas", layout="wide")
 # Crea un cliente de Dropbox usando tu token de Secrets
 cfg_dbx = st.secrets["dropbox"]
-# Muestra los primeros y últimos caracteres, y la longitud para verificar saltos de línea o espacios
-st.write("▶ Token empieza con:", repr(cfg_dbx["token"][:5]))
-st.write("▶ Token acaba con: ", repr(cfg_dbx["token"][-5:]))
-st.write("▶ Longitud total del token:", len(cfg_dbx["token"]))
-dbx = dropbox.Dropbox(cfg_dbx["token"])
+dbx = dropbox.Dropbox(
+    app_key=cfg_dbx["app_key"],
+    app_secret=cfg_dbx["app_secret"],
+    oauth2_refresh_token=cfg_dbx["refresh_token"],
+)
 def upload_to_dropbox(data: bytes):
     """Sube (o sobrescribe) un archivo a Dropbox."""
     cfg = st.secrets["dropbox"]
