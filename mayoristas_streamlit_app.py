@@ -135,83 +135,147 @@ def procesar_ingresos_clientes_csv(files: list[bytes], usuario: str, casillero: 
     dfs = []
     for up in files:
         contenido = up.read() if hasattr(up, "read") else up
-        buf = io.StringIO(contenido.decode("utf-8"))
-        df = pd.read_csv(buf, header=None, sep=",", encoding="utf-8")
-        if df.shape[1] != 9:
+        fname = getattr(up, "name", "archivo_sin_nombre")
+        
+        texto = None
+        for codec in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+            try:
+                texto = contenido.decode(codec)
+                break
+            except UnicodeDecodeError:
+                continue
+        
+        if texto is None:
             import streamlit as st
-            st.warning(f"⚠️ '{up.name}' tiene {df.shape[1]} columnas (esperaba 9). Se omite.")
+            st.warning(f"⚠️ No se pudo decodificar '{fname}' con utf-8 / utf-8-sig / latin-1 / cp1252. Se omite.")
             continue
+        
+        buf = io.StringIO(texto)
+        df = pd.read_csv(buf, header=None, sep=",")  # <- ya no pases 'encoding'
+
+        # Normalizar a 10 columnas (acepta 9 o 10)
+        if df.shape[1] == 9:
+            df["DESCONOCIDA_6"] = None  # agrega columna vacía al final
+        elif df.shape[1] != 10:
+            import streamlit as st
+            fname = getattr(up, "name", "archivo_sin_nombre")
+            st.warning(f"⚠️ '{fname}' tiene {df.shape[1]} columnas (esperaba 9 o 10). Se omite.")
+            continue
+
+        # Esquema fijo de 10 columnas
         df.columns = [
             "DESCRIPCIÓN", "DESCONOCIDA_1", "DESCONOCIDA_2", "FECHA",
-            "DESCONOCIDA_3", "VALOR", "DESCONOCIDA_4", "REFERENCIA", "DESCONOCIDA_5"
+            "DESCONOCIDA_3", "VALOR", "DESCONOCIDA_4", "REFERENCIA",
+            "DESCONOCIDA_5", "DESCONOCIDA_6"
         ]
-        df["Archivo_Origen"] = up.name
+        df["Archivo_Origen"] = getattr(up, "name", "archivo_sin_nombre")
         dfs.append(df)
+
     if not dfs:
-       return pd.DataFrame()
+        return pd.DataFrame()
+
     df = pd.concat(dfs, ignore_index=True)
-    df["REFERENCIA"] = df["REFERENCIA"].fillna(df.get("DESCRIPCIÓN",""))
+
+    # Completar REFERENCIA con DESCRIPCIÓN si viene vacía
+    df["REFERENCIA"] = df["REFERENCIA"].fillna(df.get("DESCRIPCIÓN", ""))
+
+    # Eliminar columnas completamente vacías
     df = df.dropna(how="all", axis=1)
-    # Aseguramos que sea string de 8 dígitos y parseamos como YYYYMMDD
-    df["FECHA"] = (
-       df["FECHA"]
-       .astype(str)
-       .str.zfill(8)              # asegurar 8 dígitos
-       .pipe(pd.to_datetime,     # parsear
-             format="%d%m%Y",     # <– ahora día-mes-año
-             errors="coerce")
-       )        
-    df["VALOR"] = df["VALOR"].astype(str).str.replace(",","").astype(float)
+
+    # ---- Fecha con fallback por fila ----
+    fechas_raw = df["FECHA"].astype(str).str.strip().str.zfill(8)
+    f1 = pd.to_datetime(fechas_raw, format="%Y%m%d", errors="coerce")   # nuevo formato
+    f2 = pd.to_datetime(fechas_raw, format="%d%m%Y", errors="coerce")   # formato viejo
+    df["FECHA"] = f1.fillna(f2)
+    # ------------------------------------
+
+    # LIMPIEZA DE VALOR
+    df["VALOR"] = (
+        df["VALOR"]
+        .astype(str)
+        .str.replace(",", "", regex=False)  # elimina separador de miles si aparece
+        .str.strip()
+        .astype(float)
+    )
+
+    # Enriquecimiento
     df["Tipo"] = "Ingreso"
     df["Orden"] = ""
     df["Usuario"] = usuario
     df["Casillero"] = casillero
     df["Estado de Orden"] = ""
+
+    # Renombrar y seleccionar columnas finales
     out = df.rename(columns={
-           "FECHA":"Fecha",
-           "VALOR":"Monto",
-           "REFERENCIA":"Nombre del producto"
-       })[["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Estado de Orden","Nombre del producto"]]
-    out = out[out["Nombre del producto"]!="ABONO INTERESES AHORROS"]
-    out = out[out["Monto"]>0]
+        "FECHA": "Fecha",
+        "VALOR": "Monto",
+        "REFERENCIA": "Nombre del producto"
+    })[["Fecha", "Tipo", "Monto", "Orden", "Usuario", "Casillero", "Estado de Orden", "Nombre del producto"]]
+
+    # Filtros de negocio
+    out = out[out["Nombre del producto"] != "ABONO INTERESES AHORROS"]
+    out = out[out["Monto"] > 0]
+
+    # TRM desde datos.gov.co (si posible)
     try:
-           fmax = out["Fecha"].max().strftime("%Y-%m-%d")
-           url = f"https://www.datos.gov.co/resource/mcec-87by.json?vigenciadesde={fmax}T00:00:00.000"
-           data = requests.get(url).json()
-           trm = float(data[0]["valor"]) if data and "valor" in data[0] else None
-    except:
-           trm = None
+        fmax = out["Fecha"].max().strftime("%Y-%m-%d")
+        url = f"https://www.datos.gov.co/resource/mcec-87by.json?vigenciadesde={fmax}T00:00:00.000"
+        data = requests.get(url).json()
+        trm = float(data[0]["valor"]) if data and "valor" in data[0] else None
+    except Exception:
+        trm = None
+
     out["TRM"] = trm
     return out.reset_index(drop=True)
+
 # 3) Pipeline común (extrae tu lógica de post-procesamiento)
 
-
 def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: str, casillero: str) -> pd.DataFrame:
+    import io
+    import pandas as pd
+    import requests
+    try:
+        import streamlit as st
+    except Exception:
+        # Si no se ejecuta en Streamlit, definimos un stub mínimo para evitar errores.
+        class _Stub:
+            def warning(self, *a, **k): pass
+        st = _Stub()
+
     dfs = []
     for up in files:
-        # Leemos el contenido en bytes
+        # --- Lectura robusta del archivo (bytes -> str) ---
         contenido = up.read() if hasattr(up, "read") else up
+        fname = getattr(up, "name", "archivo_sin_nombre")
 
-        # Intentamos primero decodificar en UTF-8; si da UnicodeDecodeError, usamos Latin-1
-        try:
-            texto = contenido.decode("utf-8")
-        except UnicodeDecodeError:
-            texto = contenido.decode("latin-1")
-
-        # Convertimos ese texto a StringIO para que pandas lo lea sin problemas
-        buf = io.StringIO(texto)
-
-        # Ahora pd.read_csv funcionará porque 'texto' es un string válido.
-        df = pd.read_csv(buf, header=None, sep=",", encoding="latin-1")
-        if df.shape[1] != 9:
-            st.warning(f"⚠️ '{up.name}' tiene {df.shape[1]} columnas (esperaba 9). Se omite.")
+        texto = None
+        for codec in ("utf-8", "utf-8-sig", "latin-1"):
+            try:
+                texto = contenido.decode(codec)
+                break
+            except UnicodeDecodeError:
+                continue
+        if texto is None:
+            st.warning(f"⚠️ No se pudo decodificar '{fname}' con utf-8 / utf-8-sig / latin-1. Se omite.")
             continue
 
+        buf = io.StringIO(texto)
+        df = pd.read_csv(buf, header=None, sep=",")
+
+        # --- Normalizar a 10 columnas (acepta 9 o 10) ---
+        if df.shape[1] == 9:
+            df["DESCONOCIDA_6"] = None  # agrega columna vacía al final
+        elif df.shape[1] != 10:
+            st.warning(f"⚠️ '{fname}' tiene {df.shape[1]} columnas (esperaba 9 o 10). Se omite.")
+            continue
+
+        # Esquema fijo de 10 columnas
         df.columns = [
             "DESCRIPCIÓN", "DESCONOCIDA_1", "DESCONOCIDA_2", "FECHA",
-            "DESCONOCIDA_3", "VALOR", "DESCONOCIDA_4", "REFERENCIA", "DESCONOCIDA_5"
+            "DESCONOCIDA_3", "VALOR", "DESCONOCIDA_4", "REFERENCIA",
+            "DESCONOCIDA_5", "DESCONOCIDA_6"
         ]
-        df["Archivo_Origen"] = up.name
+        df["Archivo_Origen"] = fname
         dfs.append(df)
 
     if not dfs:
@@ -220,102 +284,92 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
     # Concatenamos todos los DataFrames válidos
     df = pd.concat(dfs, ignore_index=True)
 
-    # Usar DESCRIPCIÓN como respaldo de REFERENCIA
+    # REFERENCIA fallback desde DESCRIPCIÓN
     df["REFERENCIA"] = df["REFERENCIA"].fillna(df.get("DESCRIPCIÓN", ""))
+    # Eliminar columnas completamente vacías
     df = df.dropna(how="all", axis=1)
 
-    # Convertir FECHA a datetime
-    df["FECHA"] = (
-        df["FECHA"]
-        .astype(str)
+    # ---- FECHA con fallback por fila ----
+    # Limpia todo lo que no sea dígito, rellena a 8 y prueba YYYYMMDD; si NaT, prueba DDMMYYYY
+    fechas_raw = (
+        df["FECHA"].astype(str).str.strip()
+        .str.replace(r"[^\d]", "", regex=True)
         .str.zfill(8)
-        .pipe(pd.to_datetime, format="%d%m%Y", errors="coerce")
+    )
+    f1 = pd.to_datetime(fechas_raw, format="%Y%m%d", errors="coerce")  # nuevo
+    f2 = pd.to_datetime(fechas_raw, format="%d%m%Y", errors="coerce")  # viejo
+    df["FECHA"] = f1.fillna(f2)
+
+    # ---- VALOR a float ----
+    df["VALOR"] = (
+        df["VALOR"].astype(str)
+        .str.replace(",", "", regex=False)  # si viniera separador de miles
+        .str.strip()
+        .replace({"": None})
+        .astype(float)
     )
 
-    # Convertir VALOR a float
-    df["VALOR"] = df["VALOR"].astype(str).str.replace(",", "").astype(float)
-
-    # Obtener TRM por fecha del rango
+    # ===================== TRM por rango =====================
     try:
-       # 1) Definimos fecha_max en base a las transacciones:
-       fecha_max_dt = df["FECHA"].max().date()
-       
-       # 2) Pedimos todas las TRM publicadas hasta esa fecha máxima:
-       punto_corte = fecha_max_dt.strftime("%Y-%m-%dT00:00:00.000")
-       url = (
-           "https://www.datos.gov.co/resource/mcec-87by.json?"
-           f"$where=vigenciadesde <= '{punto_corte}'"
-           "&$order=vigenciadesde DESC"
-       )
-       respuesta = requests.get(url)
-       respuesta.raise_for_status()
-       lista_trm = respuesta.json()
+        # 1) Fecha máxima de transacción
+        fecha_max_dt = df["FECHA"].max().date()
 
-       if not lista_trm:
-           st.warning("No se encontraron registros de TRM anteriores o iguales a la fecha máxima.")
-           df_trm = pd.DataFrame(columns=["Fecha", "TRM"])
-       else:
-           trm_df = pd.DataFrame(lista_trm)
-           if "vigenciadesde" not in trm_df.columns or "valor" not in trm_df.columns:
-               st.warning("La API de TRM no devolvió los campos esperados.")
-               df_trm = pd.DataFrame(columns=["Fecha", "TRM"])
-           else:
-               # Convertimos vigenciadesde a date y el valor a float
-               trm_df["vigenciadesde"] = pd.to_datetime(trm_df["vigenciadesde"]).dt.date
-               trm_df["valor"] = trm_df["valor"].astype(float)
-               trm_df = trm_df.rename(columns={"vigenciadesde": "Fecha", "valor": "TRM"})
-               
-               # Dejamos sólo la primera fila de cada fecha (en caso de duplicados)
-               trm_df = trm_df.drop_duplicates(subset="Fecha", keep="first")
-               
-               # Ordenamos de forma descendente por Fecha
-               trm_df = trm_df.sort_values("Fecha", ascending=False).set_index("Fecha")
-   
-               # 3) AHORA tomamos la fecha mínima de TRM (p.ej. 2025-05-23):
-               fecha_min_trm = trm_df.index.min()  # ej. date(2025,5,23)
+        # 2) Traemos TRM publicadas hasta esa fecha (orden descendente)
+        punto_corte = f"{fecha_max_dt:%Y-%m-%d}T00:00:00.000"
+        url = (
+            "https://www.datos.gov.co/resource/mcec-87by.json?"
+            f"$where=vigenciadesde <= '{punto_corte}'&$order=vigenciadesde DESC"
+        )
+        respuesta = requests.get(url)
+        respuesta.raise_for_status()
+        lista_trm = respuesta.json()
 
-               # 4) Y la fecha mínima de transacción:
-               fecha_min_tx = df["FECHA"].dt.date.min()  # ej. date(2025,5,25)
+        if not lista_trm:
+            st.warning("No se encontraron registros de TRM anteriores o iguales a la fecha máxima.")
+            df_trm_para_joins = pd.DataFrame(columns=["Fecha", "TRM"])
+        else:
+            trm_df = pd.DataFrame(lista_trm)
+            if "vigenciadesde" not in trm_df.columns or "valor" not in trm_df.columns:
+                st.warning("La API de TRM no devolvió los campos esperados.")
+                df_trm_para_joins = pd.DataFrame(columns=["Fecha", "TRM"])
+            else:
+                trm_df["vigenciadesde"] = pd.to_datetime(trm_df["vigenciadesde"]).dt.date
+                trm_df["valor"] = trm_df["valor"].astype(float)
+                trm_df = trm_df.rename(columns={"vigenciadesde": "Fecha", "valor": "TRM"})
+                trm_df = trm_df.drop_duplicates(subset="Fecha", keep="first")
+                trm_df = trm_df.sort_values("Fecha", ascending=False).set_index("Fecha")
 
-               # 5) Queremos que nuestro rango empiece en el menor de ambos:
-               #    (si fecha_min_trm < fecha_min_tx, arranquemos desde la TRM más antigua)
-               fecha_inicio_rango = min(fecha_min_trm, fecha_min_tx)
-               fecha_fin_rango    = fecha_max_dt
+                # 3) Rango de fechas para ffill
+                fecha_min_trm = trm_df.index.min()
+                fecha_min_tx = df["FECHA"].dt.date.min()
+                fecha_inicio_rango = min(fecha_min_trm, fecha_min_tx)
+                fecha_fin_rango = fecha_max_dt
 
-               rango_fechas = pd.date_range(
-                   start = fecha_inicio_rango,
-                   end   = fecha_fin_rango,
-                   freq  = "D"
-               ).date
+                rango_fechas = pd.date_range(start=fecha_inicio_rango, end=fecha_fin_rango, freq="D").date
+                df_trm_full = pd.DataFrame(index=rango_fechas, columns=["TRM"])
 
-               # 6) Creamos un DataFrame vacío para todo ese rango:
-               df_trm_full = pd.DataFrame(index=rango_fechas, columns=["TRM"])
+                # 7) Colocar TRM conocida en días disponibles
+                for dia in trm_df.index:
+                    df_trm_full.loc[dia, "TRM"] = trm_df.loc[dia, "TRM"]
 
-               # 7) Colocamos en cada día la TRM que exista:
-               for dia in trm_df.index:
-                   df_trm_full.loc[dia, "TRM"] = trm_df.loc[dia, "TRM"]
+                # 8) Rellenar hacia adelante
+                df_trm_full["TRM"] = df_trm_full["TRM"].ffill()
 
-               # 8) Hacemos ffill para copiar la última TRM hacia adelante
-               df_trm_full["TRM"] = df_trm_full["TRM"].ffill()
-
-               # 9) Preparamos el DataFrame para el merge final:
-               df_trm_para_joins = (
-                   df_trm_full
-                   .reset_index()
-                   .rename(columns={"index": "Fecha"})
-               )
+                # 9) Preparar para merge
+                df_trm_para_joins = df_trm_full.reset_index().rename(columns={"index": "Fecha"})
     except Exception as e:
-       st.warning(f"No se pudo obtener TRM: {e}")
-       df_trm_para_joins = pd.DataFrame(columns=["Fecha", "TRM"])
+        st.warning(f"No se pudo obtener TRM: {e}")
+        df_trm_para_joins = pd.DataFrame(columns=["Fecha", "TRM"])
+    # =========================================================
 
-    # Preparar columna Fecha para merge
+    # Preparar columna Fecha (date) y merge con TRM
     df["Fecha"] = df["FECHA"].dt.date
-
-    # Merge con TRM
     df = df.merge(df_trm_para_joins, on="Fecha", how="left")
 
-    # Calcular VALOR en COP
-    df["VALOR_USD"] = df["VALOR"] / (df["TRM"] + 100)
+    # Calcular VALOR en USD (como en tu ejemplo, usando TRM + 100) y evitar división por nulo
+    # Si TRM es NaN, el resultado será NaN; puedes decidir si llenar con 0 u otro valor.
+    df["VALOR_USD"] = df["TRM"]
+    df.loc[df["TRM"].notna(), "VALOR_USD"] = df.loc[df["TRM"].notna(), "VALOR"] / (df.loc[df["TRM"].notna(), "TRM"] + 100)
 
     # Asignar columnas estándar
     df["Tipo"] = "Ingreso"
@@ -324,17 +378,18 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
     df["Casillero"] = casillero
     df["Estado de Orden"] = ""
 
-    # Construcción final del DataFrame
+    # Construcción final
     out = df.rename(columns={
         "VALOR_USD": "Monto",
         "REFERENCIA": "Nombre del producto"
     })[["Fecha", "Tipo", "Monto", "Orden", "Usuario", "Casillero", "Estado de Orden", "Nombre del producto", "TRM"]]
 
-    # Filtrar datos válidos
+    # Filtros de negocio
     out = out[out["Nombre del producto"] != "ABONO INTERESES AHORROS"]
     out = out[out["Monto"] > 0]
 
     return out.reset_index(drop=True)
+
 
 def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> pd.DataFrame:
     """
