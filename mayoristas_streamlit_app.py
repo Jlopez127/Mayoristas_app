@@ -12,6 +12,9 @@ import io
 from datetime import datetime
 from datetime import timedelta
 import dropbox
+import numpy as np
+
+
 st.set_page_config(page_title="Conciliaciones Mayoristas", layout="wide")
 # Crea un cliente de Dropbox usando tu token de Secrets
 cfg_dbx = st.secrets["dropbox"]
@@ -38,12 +41,15 @@ def upload_to_dropbox(data: bytes):
 # — 1) Egresos (Compras) —
 @st.cache_data
 def procesar_egresos(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    casilleros = ["9444", "14856", "11591", "1444", "1633"]
+    casilleros = ["9444", "14856", "11591", "1444", "1633", "13608"]
     df = df.copy()
     df["Fecha Compra"] = pd.to_datetime(df["Fecha Compra"], errors="coerce", utc=True)
-    df["Fecha Compra"] = df["Fecha Compra"].dt.tz_convert(None).dt.strftime("%Y-%m-%d")
+    df["Fecha Compra"] = df["Fecha Compra"].dt.tz_convert(None)
     df["Casillero"] = df["Casillero"].astype(str)
     df = df[df["Casillero"].isin(casilleros)]
+    cutoff = pd.Timestamp("2025-08-25")
+    df = df[(df["Casillero"] != "13608") | (df["Fecha Compra"] >= cutoff)]
+    df["Fecha Compra"] = df["Fecha Compra"].dt.strftime("%Y-%m-%d")
     df["Tipo"] = "Egreso"
     df["Total de Pago COP"] = pd.to_numeric(df["Total de Pago COP"], errors="coerce")
     df["Valor de compra COP"] = pd.to_numeric(df["Valor de compra COP"], errors="coerce")
@@ -552,6 +558,115 @@ def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> p
     out = out[out["Monto"] > 0]
 
     return out.reset_index(drop=True)
+
+
+
+
+
+# === Config de cobros mensuales por casillero (fácil de cambiar) ===
+COBROS_MENSUALES_CONF = {
+    # casillero : {"inicio": "YYYY-MM-01", "monto": int}
+    "1633": {"inicio": "2024-02-01", "monto": 711_750}
+    #,
+   # "1444": {"inicio": "2024-10-01", "monto": 100},
+}
+
+def aplicar_cobro_contabilidad_mensual(historico, hoja, casillero, usuario, fecha_carga, inicio_yyyymm, monto, etiqueta_base="cobro contabilidad"):
+    """
+    Agrega un Egreso mensual fijo con Fecha = último día de cada mes, desde 'inicio_yyyymm'
+    hasta el MES ANTERIOR a 'fecha_carga'. Idempotente (no duplica por Orden/Nombre del producto).
+    Luego descuenta la suma agregada del último 'Total'.
+    """
+    import calendar
+    from datetime import date
+
+    if hoja not in historico:
+        return historico
+
+    dfh = historico[hoja].copy()
+    # Normalizaciones
+    dfh["Fecha_dt"] = pd.to_datetime(dfh["Fecha"], errors="coerce").dt.date
+    dfh["Monto"]    = pd.to_numeric(dfh["Monto"], errors="coerce")
+
+    # Día de ejecución
+    fc_date = pd.to_datetime(fecha_carga, errors="coerce").date()
+    # Mes anterior al de la ejecución (límites del backfill)
+    last_of_prev_month = fc_date.replace(day=1) - timedelta(days=1)
+    end_y, end_m = last_of_prev_month.year, last_of_prev_month.month
+
+    # Inicio parametrizable (YYYY-MM-01)
+    start_date = pd.to_datetime(inicio_yyyymm, errors="coerce").date()
+    start_y, start_m = start_date.year, start_date.month
+
+    # Si el inicio es posterior al fin (todavía no hay nada que cargar), salir
+    if (start_y, start_m) > (end_y, end_m):
+        dfh = dfh.drop(columns=["Fecha_dt"], errors="ignore")
+        historico[hoja] = dfh
+        return historico
+
+    meses = {
+        1:"enero",2:"febrero",3:"marzo",4:"abril",5:"mayo",6:"junio",
+        7:"julio",8:"agosto",9:"septiembre",10:"octubre",11:"noviembre",12:"diciembre"
+    }
+
+    agregado_total = 0.0
+    y, m = start_y, start_m
+
+    while (y, m) <= (end_y, end_m):
+        # último día del mes (y, m)
+        last_day = calendar.monthrange(y, m)[1]
+        fecha_mes = date(y, m, last_day)
+        orden_nombre = f"{etiqueta_base} ({meses[m]} {y})"
+
+        # idempotencia: no agregues si ya existe ese Orden o Nombre del producto
+        existe = False
+        if "Orden" in dfh.columns:
+            existe = existe or dfh["Orden"].astype(str).str.lower().eq(orden_nombre.lower()).any()
+        if "Nombre del producto" in dfh.columns:
+            existe = existe or dfh["Nombre del producto"].astype(str).str.lower().eq(orden_nombre.lower()).any()
+
+        if not existe:
+            nueva = pd.DataFrame([{
+                "Fecha": fecha_mes,
+                "Tipo": "Egreso",
+                "Orden": orden_nombre,
+                "Monto": float(monto),
+                "Motivo": "contabilidad",
+                "TRM": "",
+                "Usuario": usuario,
+                "Casillero": str(casillero),
+                "Estado de Orden": "",
+                "Nombre del producto": orden_nombre,
+                "Fecha de Carga": fecha_carga
+            }])
+            dfh = pd.concat([dfh, nueva], ignore_index=True)
+            agregado_total += float(monto)
+
+        # siguiente mes
+        if m == 12:
+            y, m = y + 1, 1
+        else:
+            m += 1
+
+    # Si agregamos algo, ajusta el último Total
+    if agregado_total > 0:
+        mask_tot = dfh["Tipo"].astype(str).str.upper() == "TOTAL"
+        if mask_tot.any():
+            ult_fecha_total = dfh.loc[mask_tot, "Fecha_dt"].max()
+            mask_ult = mask_tot & (dfh["Fecha_dt"] == ult_fecha_total)
+            if mask_ult.any():
+                val = pd.to_numeric(dfh.loc[mask_ult, "Monto"], errors="coerce") - agregado_total
+                dfh.loc[mask_ult, "Monto"] = val
+                dfh.loc[mask_ult, "Orden"] = val.apply(lambda x: "Al día" if x >= 0 else "Alerta")
+
+    dfh = dfh.drop(columns=["Fecha_dt"], errors="ignore")
+    historico[hoja] = dfh
+    return historico
+
+
+
+
+
 def main():
     st.title("📊 Conciliaciones Mayoristas")
 
@@ -672,10 +787,52 @@ def main():
             st.dataframe(df_elv, use_container_width=True)
     else:
         st.info("📂 No subes archivos de Elvis")
+        
+        
+        
+    st.markdown("---")
+        
+        # 3) Ingresos Julian Sanchez (CA13608)
+    st.header("5) Ingresos Julian Sanchez (CA13608)")
+    jul_files = st.file_uploader(
+        "Sube archivos .xls y .csv de Julian",
+        type=["xls", "xlsx", "csv"],
+        accept_multiple_files=True
+    )
+    ingresos_jul = {}
     
+    if jul_files:
+        # Separar por extensiones
+        xls_files = [f for f in jul_files if f.name.lower().endswith((".xls", ".xlsx"))]
+        csv_files = [f for f in jul_files if f.name.lower().endswith(".csv")]
+    
+        dfs = []
+        if xls_files:
+            df_xls = procesar_ingresos_clientes_xls(xls_files, "Julian Sanchez", "13608")
+            dfs.append(df_xls)
+        if csv_files:
+            df_csv = procesar_ingresos_clientes_csv(csv_files, "Julian Sanchez", "13608")
+            dfs.append(df_csv)
+    
+        # Concatenar resultados o crear DataFrame vacío
+        if dfs:
+            df_jul = pd.concat(dfs, ignore_index=True)
+        else:
+            df_jul = pd.DataFrame()
+    
+        ingresos_jul["ingresos_13608"] = df_jul
+    
+        # Mostrar en la app
+        if df_jul.empty:
+            st.info("Sin movimientos válidos")
+        else:
+            st.dataframe(df_jul, use_container_width=True)
+    else:
+        st.info("📂 No subes archivos de Julian")
+        
     st.markdown("---")
     
-    st.header("5) Ingresos Maria Moises (CA1444)")
+    st.header("6) Ingresos Maria Moises (CA1444)")
     moises_files = st.file_uploader(
         "Sube archivos .csv de Maria Moises (Bancolombia o Davivienda)", 
         type=["xls", "xlsx", "csv"], 
@@ -739,20 +896,23 @@ def main():
     
     # 5) Conciliaciones
     # 5) Conciliaciones Finales
-    st.header("6) Conciliaciones Finales")
+    st.header("7) Conciliaciones Finales")
     
-    casilleros = ["9444", "14856", "11591", "1444", "1633"]
+    casilleros = ["9444", "14856", "11591", "1444", "1633", "13608"]
     conciliaciones = {}
     
     for cas in casilleros:
         key_ing = f"ingresos_{cas}"
     
         # 2) Obtener cada fuente de ingresos en orden de prioridad
+        ing_j = ingresos_jul.get(key_ing)
         ing_n = ingresos_nath.get(key_ing)
         ing_e = ingresos_elv.get(key_ing)
         ing_m = ingresos_moises.get(key_ing)
     
-        if ing_n is not None and not ing_n.empty:
+        if ing_j is not None and not ing_j.empty:
+            inc = ing_j
+        elif ing_n is not None and not ing_n.empty:
             inc = ing_n
         elif ing_e is not None and not ing_e.empty:
             inc = ing_e
@@ -792,87 +952,255 @@ def main():
     st.markdown("---")
 
 
+
+    
+
+
+
     st.markdown("---")
 
     # 6) Histórico: carga y actualización
-    st.header("7) Actualizar Histórico") 
+    # 6) Histórico: carga y actualización
+    st.header("8) Actualizar Histórico") 
     hist_file = st.file_uploader("Sube tu archivo HISTÓRICO EXISTENTE", type=["xls","xlsx"])
     if hist_file:
         historico = pd.read_excel(hist_file, sheet_name=None)
         fecha_carga = pd.Timestamp.today().strftime("%Y-%m-%d")
+    
         # actualizar cada conciliación
         for clave, df_nuevo in conciliaciones.items():
-            cas = clave.replace("conciliacion_","")
+            cas = clave.replace("conciliacion_", "")
             dfn = df_nuevo.copy()
             dfn["Fecha de Carga"] = fecha_carga
-            if dfn.empty: continue
+            if dfn.empty:
+                continue
+    
             usuario = dfn["Usuario"].iloc[0]
-            cnum = dfn["Casillero"].iloc[0]
+            cnum    = dfn["Casillero"].iloc[0]
+    
+            # 1) Detectar hoja histórica existente
             hoja = next((h for h in historico if h.startswith(cas)), None)
             if hoja:
-                combinado = pd.concat([historico[hoja], dfn], ignore_index=True)
+                hist_df  = historico[hoja].copy()
+                combinado = pd.concat([hist_df, dfn], ignore_index=True)
             else:
+                hist_df  = pd.DataFrame()
                 combinado = dfn
                 hoja = f"{cas} - sin_nombre"
-            combinado["Orden"] = combinado["Orden"].astype(str)    
+    
+            # 2) Dedups y limpiezas
+            combinado["Orden"] = combinado["Orden"].astype(str)
+    
             # eliminar duplicados egresos
-            mask_e = combinado["Tipo"]=="Egreso"
-            egrs = combinado[mask_e].drop_duplicates(subset=["Orden","Tipo"])
-            otros = combinado[~mask_e]
-            combinado = pd.concat([otros,egrs], ignore_index=True)
+            mask_e = combinado["Tipo"] == "Egreso"
+            egrs   = combinado[mask_e].drop_duplicates(subset=["Orden", "Tipo"])
+            otros  = combinado[~mask_e]
+            combinado = pd.concat([otros, egrs], ignore_index=True)
+    
+            # normalizar Monto
             combinado["Monto"] = pd.to_numeric(combinado["Monto"], errors="coerce")
-            # eliminar duplicados extra
+    
+            # eliminar duplicados extra (si aplica)
             if "Motivo" in combinado.columns:
-                mask_x = combinado["Motivo"]=="Ingreso_extra"
-                iex = combinado[mask_x].drop_duplicates(subset=["Orden","Motivo"])
-                ot = combinado[~mask_x]
-                combinado = pd.concat([ot,iex], ignore_index=True)
-            # completar ingresos nulos
-            mask_n = (combinado["Tipo"]=="Ingreso") & combinado["Monto"].isna()
-            for i,row in combinado[mask_n].iterrows():
+                mask_x = combinado["Motivo"] == "Ingreso_extra"
+                iex    = combinado[mask_x].drop_duplicates(subset=["Orden", "Motivo"])
+                ot     = combinado[~mask_x]
+                combinado = pd.concat([ot, iex], ignore_index=True)
+    
+            # completar ingresos nulos desde egresos por Orden (cuando aplique)
+            mask_n = (combinado["Tipo"] == "Ingreso") & combinado["Monto"].isna()
+            for i, row in combinado[mask_n].iterrows():
                 o = row["Orden"]
-                match = combinado[(combinado["Tipo"]=="Egreso") & (combinado["Orden"]==o)]
+                match = combinado[(combinado["Tipo"] == "Egreso") & (combinado["Orden"] == o)]
                 if not match.empty:
-                    combinado.at[i,"Monto"] = match["Monto"].iloc[0]
-            # balance y fila total
-            tot_i = combinado[combinado["Tipo"]=="Ingreso"]["Monto"].sum()
-            tot_e = combinado[combinado["Tipo"]=="Egreso"]["Monto"].sum()
-            bal = tot_i - tot_e
-            estado = "Al día" if bal>=0 else "Alerta"
-            fila = pd.DataFrame([{
-                "Fecha": fecha_carga,
-                "Tipo":"Total",
-                "Monto":bal,
-                "Orden":estado,
-                "TRM":"",
-                "Usuario":usuario,
-                "Casillero":cnum,
-                "Fecha de Carga":fecha_carga,
-                "Estado de Orden":"",
-                "Nombre del producto":""
-            }])
-            historico[hoja] = pd.concat([combinado,fila], ignore_index=True)
+                    combinado.at[i, "Monto"] = match["Monto"].iloc[0]
+    
+            # ==================== Totales acumulados diarios (global) ====================
+            # A) Fecha para comenzar a ACTUALIZAR totales: última 'Fecha de Carga' ya guardada
+            if not hist_df.empty and "Fecha de Carga" in hist_df.columns:
+                ult_fc_series = pd.to_datetime(hist_df["Fecha de Carga"], errors="coerce").dt.date.dropna()
+                start_update_date = ult_fc_series.max() if not ult_fc_series.empty else None
+            else:
+                start_update_date = None
+    
+            # B) Preparar transacciones (excluir filas 'Total' para el cálculo)
+            combinado["Fecha"] = pd.to_datetime(combinado["Fecha"], errors="coerce").dt.date
+            combinado_tx = combinado[combinado["Tipo"].astype(str).str.upper() != "TOTAL"].copy()
+            combinado_tx = combinado_tx.dropna(subset=["Fecha"])
+    
+            # Si no hay fechas válidas, guarda tal cual y sigue
+            if combinado_tx.empty:
+                historico[hoja] = combinado
+                continue
+    
+            # C) Rango completo global (desde fecha mínima de transacción hasta hoy)
+            min_date = combinado_tx["Fecha"].min()
+            today    = pd.Timestamp.today().date()
+            days_full = pd.date_range(start=min_date, end=today, freq="D").date
+    
+            # D) Agregados por día sobre TODO el histórico (global)
+            ingresos_d = (combinado_tx[combinado_tx["Tipo"] == "Ingreso"]
+                          .groupby("Fecha")["Monto"].sum())
+            egresos_d  = (combinado_tx[combinado_tx["Tipo"] == "Egreso"]
+                          .groupby("Fecha")["Monto"].sum())
+    
+            ingresos_full = pd.Series(index=days_full, data=[ingresos_d.get(d, 0.0) for d in days_full])
+            egresos_full  = pd.Series(index=days_full, data=[egresos_d.get(d, 0.0) for d in days_full])
+    
+            # E) Saldo ACUMULADO GLOBAL (hasta cada día)
+            saldo_acum_full = ingresos_full.cumsum() - egresos_full.cumsum()
+    
+            # F) Determinar el rango a ACTUALIZAR:
+            if start_update_date is None:
+                update_days = days_full
+            else:
+                update_days = [d for d in days_full if d >= start_update_date]
+    
+            # G) Eliminar 'Total' existentes SOLO en el rango de actualización para no duplicar
+            es_total = combinado["Tipo"].astype(str).str.upper() == "TOTAL"
+            en_rango = combinado["Fecha"].isin(update_days)
+            combinado_sin_totales_rango = combinado[~(es_total & en_rango)].copy()
+    
+            # H) Construir nuevas filas 'Total' usando el ACUMULADO GLOBAL para ese día
+            tot_rows = pd.DataFrame({
+                "Fecha": list(update_days),
+                "Tipo": "Total",
+                "Monto": [float(saldo_acum_full.get(d, 0.0)) for d in update_days],
+                "Orden": ["Al día" if float(saldo_acum_full.get(d, 0.0)) >= 0 else "Alerta" for d in update_days],
+                "TRM": "",
+                "Usuario": usuario,
+                "Casillero": cnum,
+                "Fecha de Carga": fecha_carga,  # marca de recálculo
+                "Estado de Orden": "",
+                "Nombre del producto": ""
+            })
+    
+            # I) Reconstruir la hoja
+            historico[hoja] = pd.concat([combinado_sin_totales_rango, tot_rows], ignore_index=True)
+            # ================== /Totales acumulados diarios (global) =====================
+    
+            # ---------- COMISIÓN QUINCENAL POR TOTALES (SOLO CA1444) ----------
+            if cas == "1444":
+                import calendar
+    
+                dfh = historico[hoja].copy()
+                # Normaliza
+                dfh["Fecha_dt"] = pd.to_datetime(dfh["Fecha"], errors="coerce").dt.date
+                dfh["Monto"] = pd.to_numeric(dfh["Monto"], errors="coerce")
+    
+                fc_date = pd.to_datetime(fecha_carga, errors="coerce").date()
+                y, m, d = fc_date.year, fc_date.month, fc_date.day
+    
+                meses = {
+                    1:"enero",2:"febrero",3:"marzo",4:"abril",5:"mayo",6:"junio",
+                    7:"julio",8:"agosto",9:"septiembre",10:"octubre",11:"noviembre",12:"diciembre"
+                }
+    
+                def agregar_comision_rango(ini_date, fin_date, etiqueta):
+                    orden_nombre = f"Comision de ({etiqueta})"
+    
+                    # NO duplicar si ya existe ese Orden/Nombre
+                    existe = False
+                    if "Orden" in dfh.columns:
+                        existe = existe or dfh["Orden"].astype(str).str.lower().eq(orden_nombre.lower()).any()
+                    if "Nombre del producto" in dfh.columns:
+                        existe = existe or dfh["Nombre del producto"].astype(str).str.lower().eq(orden_nombre.lower()).any()
+                    if existe:
+                        return 0.0, dfh
+    
+                    # Solo Totales en el ciclo
+                    mask = (dfh["Tipo"].astype(str).str.upper() == "TOTAL") & \
+                           (dfh["Fecha_dt"] >= ini_date) & (dfh["Fecha_dt"] <= fin_date)
+                    serie = pd.to_numeric(dfh.loc[mask, "Monto"], errors="coerce")
+                    serie = serie[serie < 0]
+                    if serie.empty:
+                        return 0.0, dfh
+    
+                    comision = float(abs(serie.min()) * 0.015)  # 1.5%
+    
+                    nueva = pd.DataFrame([{
+                        "Fecha": fc_date,
+                        "Tipo": "Egreso",
+                        "Orden": orden_nombre,
+                        "Monto": comision,
+                        "Motivo": "comision",
+                        "TRM": "",
+                        "Usuario": "Maria Moises",
+                        "Casillero": "1444",
+                        "Estado de Orden": "",
+                        "Nombre del producto": orden_nombre,
+                        "Fecha de Carga": fecha_carga
+                    }])
+    
+                    return comision, pd.concat([dfh, nueva], ignore_index=True)
+    
+                total_comision_hoy = 0.0
+    
+                # Día 1..15 → H2 del mes anterior (16–fin)
+                if 1 <= d <= 15:
+                    prev_y  = y if m > 1 else y - 1
+                    prev_m  = m - 1 if m > 1 else 12
+                    last_prev = calendar.monthrange(prev_y, prev_m)[1]
+                    ini = pd.Timestamp(prev_y, prev_m, 16).date()
+                    fin = pd.Timestamp(prev_y, prev_m, last_prev).date()
+                    etiqueta = f"16-fin {meses[prev_m]} {prev_y}"
+                    comi, dfh = agregar_comision_rango(ini, fin, etiqueta)
+                    total_comision_hoy += comi
+    
+                # Día ≥16 → H1 del mes actual (1–15)
+                if d >= 16:
+                    ini = pd.Timestamp(y, m, 1).date()
+                    fin = pd.Timestamp(y, m, 15).date()
+                    etiqueta = f"1-15 {meses[m]} {y}"
+                    comi, dfh = agregar_comision_rango(ini, fin, etiqueta)
+                    total_comision_hoy += comi
+    
+                # Restar al último Total si hubo comisión hoy
+                if total_comision_hoy > 0:
+                    mask_tot = dfh["Tipo"].astype(str).str.upper() == "TOTAL"
+                    if mask_tot.any():
+                        ult_fecha_total = dfh.loc[mask_tot, "Fecha_dt"].max()
+                        mask_ult = mask_tot & (dfh["Fecha_dt"] == ult_fecha_total)
+                        if mask_ult.any():
+                            val = pd.to_numeric(dfh.loc[mask_ult, "Monto"], errors="coerce") - total_comision_hoy
+                            dfh.loc[mask_ult, "Monto"] = val
+                            dfh.loc[mask_ult, "Orden"] = val.apply(lambda x: "Al día" if x >= 0 else "Alerta")
+    
+                dfh = dfh.drop(columns=["Fecha_dt"], errors="ignore")
+                historico[hoja] = dfh
+            # ---------- /COMISIÓN QUINCENAL ----------
+            # ---- Cobros mensuales de contabilidad (parametrizados por casillero) ----
+            if cas in COBROS_MENSUALES_CONF:
+                cfg = COBROS_MENSUALES_CONF[cas]
+                historico = aplicar_cobro_contabilidad_mensual(
+                    historico, hoja, cas, usuario, fecha_carga,
+                    inicio_yyyymm=cfg["inicio"], monto=cfg["monto"], etiqueta_base="cobro contabilidad"
+                )
+            # -------------------------------------------------------------------------
+
+
         # generar excel en memoria
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            for h,dfh in historico.items():
+            for h, dfh in historico.items():
                 w.book.create_sheet(h[:31])
                 dfh.to_excel(w, sheet_name=h[:31], index=False)
         buf.seek(0)
         data_bytes = buf.read()
-
+    
         # 1) Botón de descarga local
         st.download_button(
             "⬇️ Descargar Histórico Actualizado",
-            data=data_bytes,  # <-- aquí, usa data_bytes
+            data=data_bytes,
             file_name=f"{pd.Timestamp.today().strftime('%Y%m%d')}_Historico_mayoristas.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
-        # 2) Subida automática a Dropbox
+    
+        # 2) Subida automática a Dropbox (DESACTIVADA mientras probamos)
         upload_to_dropbox(data_bytes)
     else:
         st.info("📂 Aún no subes tu histórico")
+
 
     st.caption("Desarrollado con ❤️ y Streamlit")
 
