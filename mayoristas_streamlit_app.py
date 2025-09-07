@@ -1279,7 +1279,8 @@ def main():
         
         # ⬅️ Envía correos por casillero (solo a los configurados)
         # 👉 envío de alerta SOLO para este casillero (sin adjuntos)
-        obtener_y_enviar_alerta_saldo(historico, cas, fecha_carga)
+        for cas in st.secrets.get("gmail", {}).get("recipients", {}).keys():
+            obtener_y_enviar_alerta_saldo(historico, str(cas), fecha_carga)
 
         # 1) Botón de descarga local
         st.download_button(
