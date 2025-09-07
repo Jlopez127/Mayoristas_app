@@ -665,13 +665,10 @@ def aplicar_cobro_contabilidad_mensual(historico, hoja, casillero, usuario, fech
     historico[hoja] = dfh
     return historico
 
-def send_mail_gmail(subject: str, body: str, to_addrs, 
-                    attachment_bytes: bytes | None = None, 
-                    attachment_name: str | None = None) -> bool:
-    """
-    Envía un correo usando Gmail SMTP (requiere App Password).
-    Lee credenciales desde st.secrets['gmail'].
-    """
+
+
+def send_mail_gmail(subject: str, body: str, to_addrs) -> bool:
+    """SMTP Gmail con App Password. Sin adjuntos."""
     try:
         cfg = st.secrets["gmail"]
         sender = cfg["address"]
@@ -691,47 +688,70 @@ def send_mail_gmail(subject: str, body: str, to_addrs,
     msg["Subject"] = subject
     msg.set_content(body)
 
-    if attachment_bytes and attachment_name:
-        msg.add_attachment(
-            attachment_bytes,
-            maintype="application",
-            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=attachment_name,
-        )
-
     try:
         context = ssl.create_default_context()
         with smtplib.SMTP_SSL(smtp_server, smtp_port, context=context) as server:
             server.login(sender, app_pw)
             server.send_message(msg)
-        st.success(f"📧 Email enviado a: {msg['To']}")
         return True
     except Exception as e:
         st.error(f"❌ Error enviando email: {e}")
         return False
 
 
-def enviar_notificacion_por_casillero(casillero: str, fecha_carga: str, archivo_bytes: bytes):
+def obtener_y_enviar_alerta_saldo(historico: dict, casillero: str, fecha_carga: str) -> None:
     """
-    Busca el destinatario según casillero en st.secrets['gmail']['recipients'].
-    Si no hay match, usa st.secrets['gmail']['default_to'] si existe.
-    Adjunta el Excel generado.
+    Toma el último 'Total' del casillero en 'historico' y envía un correo SOLO
+    al destinatario configurado para ese casillero. No usa default_to.
     """
-    gcfg = st.secrets.get("gmail", {})
-    recipients_map = gcfg.get("recipients", {})
-    destino = recipients_map.get(str(casillero), gcfg.get("default_to"))
-
-    if not destino:
-        # Sin destino configurado: no enviamos nada (silencioso)
+    # 1) hallar la hoja del casillero
+    hoja = next((h for h in historico if h.startswith(str(casillero))), None)
+    if not hoja:
         return
 
-    subject = f"[Mayoristas] Histórico actualizado - Casillero {casillero} ({fecha_carga})"
+    dfh = historico[hoja].copy()
+    if dfh.empty:
+        return
+
+    # 2) filtrar Totales y tomar el más reciente por Fecha
+    dfh["Tipo"] = dfh["Tipo"].astype(str)
+    df_tot = dfh[dfh["Tipo"].str.upper() == "TOTAL"].copy()
+    if df_tot.empty:
+        return
+
+    df_tot["Fecha"] = pd.to_datetime(df_tot["Fecha"], errors="coerce")
+    df_tot = df_tot.dropna(subset=["Fecha"])
+    if df_tot.empty:
+        return
+
+    df_tot = df_tot.sort_values("Fecha")
+    fila = df_tot.iloc[-1]
+    saldo = pd.to_numeric(fila["Monto"], errors="coerce")
+    fecha_saldo = fila["Fecha"].date()
+
+    if pd.isna(saldo):
+        return
+
+    # 3) destinatario SOLO si está mapeado
+    recipients_map = st.secrets.get("gmail", {}).get("recipients", {})
+    destino = recipients_map.get(str(casillero))
+    if not destino:
+        return  # no enviar si no hay correo configurado para ese casillero
+
+    # 4) construir y enviar
+    subject = f"[Encargomio] Saldo actual casillero {casillero} - {fecha_carga}"
     body = (
-        f"Hola,\n\nSe actualizó el histórico del casillero {casillero} el {fecha_carga}.\n"
-        f"Adjunto el archivo consolidado.\n\nSaludos."
+        "Hola,\n\n"
+        f"Te informamos que tu saldo actual con Encargomio al {fecha_saldo:%Y-%m-%d} es:\n"
+        f"    ${saldo:,.0f}\n\n"
+        "Este mensaje es informativo. Si detectas alguna inconsistencia, por favor responde a este correo.\n\n"
+        "Saludos,\nEncargomio"
     )
-    fname = f"{fecha_carga}_Historico_mayoristas.xlsx"
-    send_mail_gmail(subject, body, destino, archivo_bytes, fname)
+
+    ok = send_mail_gmail(subject, body, destino)
+    if ok:
+        st.success(f"📧 Alerta enviada a {destino} (casillero {casillero})")
+
 
 
 
@@ -1258,9 +1278,9 @@ def main():
         data_bytes = buf.read()
         
         # ⬅️ Envía correos por casillero (solo a los configurados)
-        for cas in casilleros:
-            enviar_notificacion_por_casillero(cas, fecha_carga, data_bytes)
-    
+        # 👉 envío de alerta SOLO para este casillero (sin adjuntos)
+        obtener_y_enviar_alerta_saldo(historico, cas, fecha_carga)
+
         # 1) Botón de descarga local
         st.download_button(
             "⬇️ Descargar Histórico Actualizado",
