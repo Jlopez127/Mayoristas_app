@@ -13,6 +13,8 @@ from datetime import datetime
 from datetime import timedelta
 import dropbox
 import numpy as np
+import smtplib, ssl
+from email.message import EmailMessage
 
 
 st.set_page_config(page_title="Conciliaciones Mayoristas", layout="wide")
@@ -663,6 +665,73 @@ def aplicar_cobro_contabilidad_mensual(historico, hoja, casillero, usuario, fech
     historico[hoja] = dfh
     return historico
 
+def send_mail_gmail(subject: str, body: str, to_addrs, 
+                    attachment_bytes: bytes | None = None, 
+                    attachment_name: str | None = None) -> bool:
+    """
+    Envía un correo usando Gmail SMTP (requiere App Password).
+    Lee credenciales desde st.secrets['gmail'].
+    """
+    try:
+        cfg = st.secrets["gmail"]
+        sender = cfg["address"]
+        app_pw = cfg["app_password"]
+        smtp_server = cfg.get("smtp_server", "smtp.gmail.com")
+        smtp_port = int(cfg.get("smtp_port", 465))
+    except Exception as e:
+        st.error("❌ Falta configuración gmail en st.secrets['gmail']: " + str(e))
+        return False
+
+    if isinstance(to_addrs, str):
+        to_addrs = [to_addrs]
+
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = ", ".join(to_addrs)
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    if attachment_bytes and attachment_name:
+        msg.add_attachment(
+            attachment_bytes,
+            maintype="application",
+            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=attachment_name,
+        )
+
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(smtp_server, smtp_port, context=context) as server:
+            server.login(sender, app_pw)
+            server.send_message(msg)
+        st.success(f"📧 Email enviado a: {msg['To']}")
+        return True
+    except Exception as e:
+        st.error(f"❌ Error enviando email: {e}")
+        return False
+
+
+def enviar_notificacion_por_casillero(casillero: str, fecha_carga: str, archivo_bytes: bytes):
+    """
+    Busca el destinatario según casillero en st.secrets['gmail']['recipients'].
+    Si no hay match, usa st.secrets['gmail']['default_to'] si existe.
+    Adjunta el Excel generado.
+    """
+    gcfg = st.secrets.get("gmail", {})
+    recipients_map = gcfg.get("recipients", {})
+    destino = recipients_map.get(str(casillero), gcfg.get("default_to"))
+
+    if not destino:
+        # Sin destino configurado: no enviamos nada (silencioso)
+        return
+
+    subject = f"[Mayoristas] Histórico actualizado - Casillero {casillero} ({fecha_carga})"
+    body = (
+        f"Hola,\n\nSe actualizó el histórico del casillero {casillero} el {fecha_carga}.\n"
+        f"Adjunto el archivo consolidado.\n\nSaludos."
+    )
+    fname = f"{fecha_carga}_Historico_mayoristas.xlsx"
+    send_mail_gmail(subject, body, destino, archivo_bytes, fname)
 
 
 
@@ -1187,6 +1256,10 @@ def main():
                 dfh.to_excel(w, sheet_name=h[:31], index=False)
         buf.seek(0)
         data_bytes = buf.read()
+        
+        # ⬅️ Envía correos por casillero (solo a los configurados)
+        for cas in casilleros:
+            enviar_notificacion_por_casillero(cas, fecha_carga, data_bytes)
     
         # 1) Botón de descarga local
         st.download_button(
