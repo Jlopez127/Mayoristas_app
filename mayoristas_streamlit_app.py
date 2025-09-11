@@ -799,11 +799,11 @@ def main():
 
     st.markdown("---")
 
-   # 3) Ingresos Nathalia Ospina (CA1633)
+    # 3) Ingresos Nathalia Ospina (CA1633)
     st.header("3) Ingresos Nathalia Ospina (CA1633)")
     nat_files = st.file_uploader(
-        "Sube archivos .xls y .csv de Nathalia", 
-        type=["xls", "xlsx", "csv"], 
+        "Sube archivos .xls y .csv de Nathalia",
+        type=["xls", "xlsx", "csv"],
         accept_multiple_files=True
     )
     ingresos_nath = {}
@@ -1009,6 +1009,65 @@ def main():
             inc = ing_m
         else:
             inc = None
+            
+            
+            # ------------------ NUEVO: GMF 4x1000 SOLO PARA 1633 ------------------
+        gmf_df = None
+        if cas == "1633":
+            # Elegir de qué DF calcular el GMF (preferimos el ingreso real que se usó)
+            base_ing = inc if (inc is not None and not inc.empty) else ing_n  # fallback a Nath si inc viene de otra persona
+            if base_ing is not None and not base_ing.empty:
+                tmp = base_ing.copy()
+        
+                # Asegurar numérico
+                tmp["Monto"] = pd.to_numeric(tmp["Monto"], errors="coerce").fillna(0)
+        
+                # Tomar SOLO movimientos de tipo Ingreso (por si en 'inc' vienen también Egresos)
+                if "Tipo" in tmp.columns:
+                    tmp = tmp[tmp["Tipo"].astype(str).str.strip().str.lower() == "ingreso"]
+        
+                # Evitar doble conteo si ya agregaste una fila GMF en otro paso
+                if "Nombre del producto" in tmp.columns:
+                    tmp = tmp[~tmp["Nombre del producto"].astype(str).str.contains("4x1000", case=False, na=False)]
+        
+                gmf_total = round(0.004 * tmp["Monto"].sum(), 2)  # 4x1000 = 0.4%
+                
+                # calcular la fecha a usar
+                fecha_base = pd.to_datetime(base_ing.get("Fecha", pd.NaT), errors="coerce")
+                fecha_gmf = fecha_base.max()
+                if pd.isna(fecha_gmf):
+                    fecha_gmf = pd.Timestamp.today().normalize()
+                orden_gmf = f"GMF-4x1000-ACUM-{fecha_gmf.strftime('%Y%m%d')}"
+                
+                # Si quieres que sea EGRESO POSITIVO (recomendado para no caer en filtros de monto>0)
+                if gmf_total != 0:
+                    # Construir la fila con las columnas que maneja tu pipeline
+                    cols = list(base_ing.columns)
+                    fila = {c: None for c in cols}
+        
+                    fila.update({
+                        "Fecha": pd.Timestamp.today().normalize(),     # o pd.to_datetime(base_ing["Fecha"]).max()
+                        "Tipo": "Egreso",                              # <<< CLAVE
+                        "Monto": gmf_total,                            # <<< POSITIVO
+                        "Orden": orden_gmf,
+                        "Usuario": "Nathalia Ospina",
+                        "Casillero": "1633",
+                        "Estado de Orden": "",
+                        "Nombre del producto": "GMF 4x1000 acumulado",
+                    })
+        
+                    # Si existe TRM, puedes heredar el último
+                    if "TRM" in cols:
+                        try:
+                            fila["TRM"] = pd.to_numeric(base_ing["TRM"], errors="coerce").dropna().iloc[-1]
+                        except Exception:
+                            fila["TRM"] = None
+        
+                    gmf_df = pd.DataFrame([fila])
+# ----------------------------------------------------------------------
+            
+            
+            
     
         # EGRESOS
         egr = egresos.get(f"egresos_{cas}")
@@ -1021,6 +1080,11 @@ def main():
         for df in (inc, egr, ext):
             if df is not None and not df.empty:
                 frames.append(df)
+                
+        
+        if gmf_df is not None and not gmf_df.empty:
+            frames.append(gmf_df)
+        
     
         # 4) Guardar la conciliación (si no hay nada, vacío)
         if frames:
