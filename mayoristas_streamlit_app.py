@@ -97,8 +97,101 @@ def procesar_ingresos_extra(hojas: dict[str, pd.DataFrame]) -> dict[str, pd.Data
         resultado[f"extra_{cas}"] = df2.reset_index(drop=True)
     return resultado
 
-# — 3+4) Ingresos Cliente Genérico —
+
+
 @st.cache_data
+
+def procesar_devoluciones(hojas: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """
+    Lee un Excel con múltiples hojas (una por casillero).
+    Espera la estructura:
+    Tipo, Fecha, Orden, Monto, Usuario, Casillero, Motivo, Nombre del producto
+    (Tipo='Ingreso' y Motivo='Devolucion' pueden venir o se completan).
+    """
+    resultado = {}
+    for hoja, df in (hojas or {}).items():
+        cas = hoja.split("-")[0].strip()
+        if not cas.isdigit():
+            continue
+
+        df2 = df.copy()
+        # 1) Limpia posibles espacios y normaliza headers
+        df2.columns = [str(c).strip() for c in df2.columns]
+
+        # 2) Validaciones mínimas
+        if "Fecha" not in df2.columns:
+            st.warning(f"Hoja '{hoja}': falta columna 'Fecha'. Se omite.")
+            continue
+        if "Orden" not in df2.columns:
+            st.warning(f"Hoja '{hoja}': falta columna 'Orden'. Se omite.")
+            continue
+        if "Monto" not in df2.columns:
+            st.warning(f"Hoja '{hoja}': falta columna 'Monto'. Se omite.")
+            continue
+
+        # 3) Normalizaciones de tipo
+        df2["Fecha"] = pd.to_datetime(df2["Fecha"], errors="coerce").dt.date
+        df2["Orden"] = df2["Orden"].astype("string").str.strip()   # conserva ceros a la izquierda
+        df2["Monto"] = pd.to_numeric(df2["Monto"], errors="coerce")
+
+        # Opcionales / defaults
+        if "Usuario" not in df2.columns:
+            df2["Usuario"] = ""
+        else:
+            df2["Usuario"] = df2["Usuario"].astype(str).str.strip()
+
+        # Casillero: si no viene en el archivo, usamos el de la hoja
+        if "Casillero" not in df2.columns:
+            df2["Casillero"] = str(cas)
+        else:
+            df2["Casillero"] = df2["Casillero"].astype(str).str.strip()
+
+        # Motivo (marcador para validación)
+        if "Motivo" not in df2.columns:
+            df2["Motivo"] = "Devolucion"
+        else:
+            df2["Motivo"] = df2["Motivo"].astype(str).str.strip()
+            df2.loc[df2["Motivo"] == "", "Motivo"] = "Devolucion"
+
+        # Nombre del producto
+        if "Nombre del producto" not in df2.columns:
+            df2["Nombre del producto"] = "Devolución"
+        else:
+            df2["Nombre del producto"] = df2["Nombre del producto"].astype(str).str.strip()
+
+        # Tipo (siempre Ingreso para devoluciones)
+        if "Tipo" not in df2.columns:
+            df2["Tipo"] = "Ingreso"
+        else:
+            df2["Tipo"] = df2["Tipo"].astype(str).str.strip()
+            df2.loc[df2["Tipo"] == "", "Tipo"] = "Ingreso"
+
+        # 4) Filtra filas válidas
+        df2 = df2.dropna(subset=["Fecha", "Orden", "Monto"])
+
+        # 5) Salida EXACTA en el orden requerido (sin TRM)
+        out = df2[[
+            "Tipo",
+            "Fecha",
+            "Orden",
+            "Monto",
+            "Usuario",
+            "Casillero",
+            "Motivo",
+            "Nombre del producto",
+        ]].copy()
+
+        resultado[f"devoluciones_{cas}"] = out.reset_index(drop=True)
+
+    return resultado
+
+
+
+
+
+
+
+
 
 
 
@@ -239,45 +332,67 @@ def procesar_ingresos_clientes_csv(files: list[bytes], usuario: str, casillero: 
 # 3) Pipeline común (extrae tu lógica de post-procesamiento)
 
 def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: str, casillero: str) -> pd.DataFrame:
+    """
+    1444 (María Moises)
+    - Lee CSVs bancarios.
+    - (Opcional) Netea egresos extra en COP por fecha (cargados por el usuario).
+    - AVISOS:
+        * Total: 'Saldo disponible en COP (esta carga): $X'
+        * Detalle diario: '📅 <día> de <mes>: $Y COP disponibles' (si hay varios días).
+    - Convierte SOLO el neto a USD con TRM diaria (TRM+100).
+    - Si falta COP para cubrir egresos extra del día, muestra advertencia.
+    - Guarda un log paralelo en st.session_state["1444_movimientos_cop"].
+    """
     import io
     import pandas as pd
     import requests
+
+    # ---- Streamlit (stub si no hay) ----
     try:
         import streamlit as st
     except Exception:
-        # Si no se ejecuta en Streamlit, definimos un stub mínimo para evitar errores.
         class _Stub:
             def warning(self, *a, **k): pass
+            def info(self, *a, **k): pass
+            def checkbox(self, *a, **k): return False
+            def radio(self, *a, **k): return "Escribir manualmente"
+            def file_uploader(self, *a, **k): return None
+            def data_editor(self, *a, **k): return pd.DataFrame()
+            def expander(self, *a, **k):
+                class _E: 
+                    def __enter__(selfi): return selfi
+                    def __exit__(selfi, *x): return False
+                return _E()
+            def dataframe(self, *a, **k): pass
+            def caption(self, *a, **k): pass
         st = _Stub()
 
+    # ------------------ Lectura robusta CSV (Bancolombia) ------------------
     dfs = []
     for up in files:
-        # --- Lectura robusta del archivo (bytes -> str) ---
         contenido = up.read() if hasattr(up, "read") else up
         fname = getattr(up, "name", "archivo_sin_nombre")
 
         texto = None
-        for codec in ("utf-8", "utf-8-sig", "latin-1"):
+        for codec in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
             try:
                 texto = contenido.decode(codec)
                 break
             except UnicodeDecodeError:
                 continue
         if texto is None:
-            st.warning(f"⚠️ No se pudo decodificar '{fname}' con utf-8 / utf-8-sig / latin-1. Se omite.")
+            st.warning(f"⚠️ No se pudo decodificar '{fname}' (utf-8/utf-8-sig/latin-1/cp1252). Se omite.")
             continue
 
         buf = io.StringIO(texto)
         df = pd.read_csv(buf, header=None, sep=",")
 
-        # --- Normalizar a 10 columnas (acepta 9 o 10) ---
         if df.shape[1] == 9:
-            df["DESCONOCIDA_6"] = None  # agrega columna vacía al final
+            df["DESCONOCIDA_6"] = None
         elif df.shape[1] != 10:
             st.warning(f"⚠️ '{fname}' tiene {df.shape[1]} columnas (esperaba 9 o 10). Se omite.")
             continue
 
-        # Esquema fijo de 10 columnas
         df.columns = [
             "DESCRIPCIÓN", "DESCONOCIDA_1", "DESCONOCIDA_2", "FECHA",
             "DESCONOCIDA_3", "VALOR", "DESCONOCIDA_4", "REFERENCIA",
@@ -289,114 +404,233 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
     if not dfs:
         return pd.DataFrame()
 
-    # Concatenamos todos los DataFrames válidos
     df = pd.concat(dfs, ignore_index=True)
-
-    # REFERENCIA fallback desde DESCRIPCIÓN
     df["REFERENCIA"] = df["REFERENCIA"].fillna(df.get("DESCRIPCIÓN", ""))
-    # Eliminar columnas completamente vacías
     df = df.dropna(how="all", axis=1)
 
-    # ---- FECHA con fallback por fila ----
-    # Limpia todo lo que no sea dígito, rellena a 8 y prueba YYYYMMDD; si NaT, prueba DDMMYYYY
+    # ---- Fecha ----
     fechas_raw = (
         df["FECHA"].astype(str).str.strip()
         .str.replace(r"[^\d]", "", regex=True)
         .str.zfill(8)
     )
-    f1 = pd.to_datetime(fechas_raw, format="%Y%m%d", errors="coerce")  # nuevo
-    f2 = pd.to_datetime(fechas_raw, format="%d%m%Y", errors="coerce")  # viejo
+    f1 = pd.to_datetime(fechas_raw, format="%Y%m%d", errors="coerce")
+    f2 = pd.to_datetime(fechas_raw, format="%d%m%Y", errors="coerce")
     df["FECHA"] = f1.fillna(f2)
 
-    # ---- VALOR a float ----
+    # ---- Valor COP ----
     df["VALOR"] = (
         df["VALOR"].astype(str)
-        .str.replace(",", "", regex=False)  # si viniera separador de miles
+        .str.replace(",", "", regex=False)
         .str.strip()
         .replace({"": None})
         .astype(float)
     )
 
-    # ===================== TRM por rango =====================
+    # ========= Egresos extra (opcionales) =========
+    egresos_extra = pd.DataFrame(columns=["Fecha", "Monto_COP", "Descripcion"])
+    usar_extras = False
     try:
-        # 1) Fecha máxima de transacción
-        fecha_max_dt = df["FECHA"].max().date()
+        usar_extras = st.checkbox("¿Tienes egresos extra en COP para netear (1444)?", value=False, key="eg_extra_1444_toggle")
+    except Exception:
+        pass
 
-        # 2) Traemos TRM publicadas hasta esa fecha (orden descendente)
-        punto_corte = f"{fecha_max_dt:%Y-%m-%d}T00:00:00.000"
-        url = (
-            "https://www.datos.gov.co/resource/mcec-87by.json?"
-            f"$where=vigenciadesde <= '{punto_corte}'&$order=vigenciadesde DESC"
-        )
-        respuesta = requests.get(url)
-        respuesta.raise_for_status()
-        lista_trm = respuesta.json()
+    if usar_extras:
+        modo = st.radio("Cómo cargar egresos extra", ["Escribir manualmente", "Subir CSV"], index=0, horizontal=True, key="eg_extra_1444_modo")
+        if modo == "Subir CSV":
+            up_ex = st.file_uploader("CSV con columnas: Fecha, Monto (o Valor), Descripcion (opcional)", type=["csv"], key="eg_extras_1444_csv")
+            if up_ex is not None:
+                try:
+                    tmp = pd.read_csv(up_ex)
+                    cols = {c.lower().strip(): c for c in tmp.columns}
+                    col_fecha = cols.get("fecha")
+                    col_monto = cols.get("monto", cols.get("valor"))
+                    col_desc  = cols.get("descripcion")
+                    if not col_fecha or not col_monto:
+                        st.warning("⚠️ El CSV debe traer 'Fecha' y 'Monto' (o 'Valor').")
+                    else:
+                        egresos_extra = pd.DataFrame({
+                            "Fecha": pd.to_datetime(tmp[col_fecha], errors="coerce").dt.date,
+                            "Monto_COP": pd.to_numeric(tmp[col_monto], errors="coerce").abs(),
+                            "Descripcion": tmp[col_desc] if col_desc else ""
+                        }).dropna(subset=["Fecha", "Monto_COP"])
+                except Exception as e:
+                    st.warning(f"⚠️ No se pudo leer el CSV de egresos extra: {e}")
+        else:
+            with st.expander("➕ Egresos extra manuales (COP)", expanded=True):
+                plantilla = pd.DataFrame({"Fecha": [pd.Timestamp.today().date()], "Monto_COP": [0.0], "Descripcion": [""]})
+                egresos_extra = st.data_editor(plantilla, num_rows="dynamic", use_container_width=True, key="eg_extra_1444_editor")
+                if not egresos_extra.empty:
+                    egresos_extra["Fecha"] = pd.to_datetime(egresos_extra["Fecha"], errors="coerce").dt.date
+                    egresos_extra["Monto_COP"] = pd.to_numeric(egresos_extra["Monto_COP"], errors="coerce").abs()
+                    egresos_extra["Descripcion"] = egresos_extra.get("Descripcion", "").astype(str)
+                    egresos_extra = egresos_extra.dropna(subset=["Fecha", "Monto_COP"])
 
-        if not lista_trm:
-            st.warning("No se encontraron registros de TRM anteriores o iguales a la fecha máxima.")
+    # ========= Neteo diario en COP =========
+    mask_interes = df["REFERENCIA"].astype(str).str.strip().str.upper().eq("ABONO INTERESES AHORROS")
+    df_neteo = df[~mask_interes].copy()
+    df_neteo["FECHA_DATE"] = df_neteo["FECHA"].dt.date
+
+    ingresos_por_dia = df_neteo.groupby("FECHA_DATE")["VALOR"].sum(min_count=1).fillna(0.0)
+    extras_por_dia = egresos_extra.groupby("Fecha")["Monto_COP"].sum().astype(float) if not egresos_extra.empty else pd.Series(dtype="float64")
+
+    log_rows = []
+    if not extras_por_dia.empty:
+        for fecha, egreso_cop in extras_por_dia.items():
+            ingreso_dia = float(ingresos_por_dia.get(fecha, 0.0))
+            neteo_aplicado = float(min(egreso_cop, ingreso_dia))
+            cop_convertible = float(max(0.0, ingreso_dia - egreso_cop))
+            egreso_pendiente = float(max(0.0, egreso_cop - ingreso_dia))
+
+            # Netear filas del día
+            if ingreso_dia > 0.0:
+                idxs = df_neteo.index[df_neteo["FECHA_DATE"] == fecha].tolist()
+                restante = egreso_cop
+                for idx in idxs:
+                    if restante <= 0: break
+                    val = float(df_neteo.at[idx, "VALOR"] or 0.0)
+                    if val <= 0: continue
+                    if val <= restante:
+                        restante -= val
+                        df_neteo.at[idx, "VALOR"] = 0.0
+                    else:
+                        df_neteo.at[idx, "VALOR"] = val - restante
+                        restante = 0.0
+
+            if egreso_pendiente > 0:
+                st.warning(f"AVISO (1444) {fecha}: Debes ${egreso_pendiente:,.0f} COP por netear. Cárgalo mañana.")
+
+            log_rows.append({
+                "Fecha": fecha,
+                "Egreso_extra_COP": egreso_cop,
+                "Ingresos_COP_del_dia": ingreso_dia,
+                "Neteo_aplicado_COP": neteo_aplicado,
+                "COP_convertible_a_USD": cop_convertible,
+                "Egreso_pendiente_COP": egreso_pendiente,
+                "TRM_del_dia": None,
+                "USD_generado": None,
+                "Aviso": ("DEBE ${:,.0f} COP — Cargar mañana".format(egreso_pendiente) if egreso_pendiente > 0 else "")
+            })
+
+        # Eliminar filas que quedaron en 0
+        df_neteo = df_neteo[df_neteo["VALOR"].fillna(0.0) > 0.0].copy()
+
+    # Base neteada que sí se convierte
+    df_convertible = df_neteo.copy()
+
+    # ======= AVISOS: Total y detalle por día =======
+    disponible_total_cop = float(pd.to_numeric(df_convertible["VALOR"], errors="coerce").sum()) if not df_convertible.empty else 0.0
+    st.info(f"💡 Saldo disponible en COP (esta carga): ${disponible_total_cop:,.0f}")
+
+    # detalle por día (si hay varios días)
+    if not df_convertible.empty:
+        disp_por_dia = df_convertible.groupby("FECHA_DATE")["VALOR"].sum()
+        if len(disp_por_dia.index) > 1 or (len(disp_por_dia.index) == 1):
+            meses = {1:"enero",2:"febrero",3:"marzo",4:"abril",5:"mayo",6:"junio",7:"julio",8:"agosto",9:"septiembre",10:"octubre",11:"noviembre",12:"diciembre"}
+            for fecha, valor in sorted(disp_por_dia.items()):
+                if valor > 0:
+                    st.caption(f"📅 {fecha.day} de {meses[fecha.month]}: ${valor:,.0f} COP disponibles")
+
+    # ===================== TRM por rango (serie diaria) =====================
+    try:
+        fecha_max_dt = (df_convertible["FECHA"].max() if not df_convertible.empty else df["FECHA"].max())
+        fecha_max_dt = None if pd.isna(fecha_max_dt) else fecha_max_dt.date()
+
+        if fecha_max_dt is None:
             df_trm_para_joins = pd.DataFrame(columns=["Fecha", "TRM"])
         else:
-            trm_df = pd.DataFrame(lista_trm)
-            if "vigenciadesde" not in trm_df.columns or "valor" not in trm_df.columns:
-                st.warning("La API de TRM no devolvió los campos esperados.")
+            punto_corte = f"{fecha_max_dt:%Y-%m-%d}T00:00:00.000"
+            url = (
+                "https://www.datos.gov.co/resource/mcec-87by.json?"
+                f"$where=vigenciadesde <= '{punto_corte}'&$order=vigenciadesde DESC"
+            )
+            respuesta = requests.get(url)
+            respuesta.raise_for_status()
+            lista_trm = respuesta.json()
+
+            if not lista_trm:
                 df_trm_para_joins = pd.DataFrame(columns=["Fecha", "TRM"])
             else:
-                trm_df["vigenciadesde"] = pd.to_datetime(trm_df["vigenciadesde"]).dt.date
-                trm_df["valor"] = trm_df["valor"].astype(float)
-                trm_df = trm_df.rename(columns={"vigenciadesde": "Fecha", "valor": "TRM"})
-                trm_df = trm_df.drop_duplicates(subset="Fecha", keep="first")
-                trm_df = trm_df.sort_values("Fecha", ascending=False).set_index("Fecha")
+                trm_df = pd.DataFrame(lista_trm)
+                if "vigenciadesde" not in trm_df.columns or "valor" not in trm_df.columns:
+                    df_trm_para_joins = pd.DataFrame(columns=["Fecha", "TRM"])
+                else:
+                    trm_df["vigenciadesde"] = pd.to_datetime(trm_df["vigenciadesde"]).dt.date
+                    trm_df["valor"] = trm_df["valor"].astype(float)
+                    trm_df = trm_df.rename(columns={"vigenciadesde": "Fecha", "valor": "TRM"})
+                    trm_df = trm_df.drop_duplicates(subset="Fecha", keep="first")
+                    trm_df = trm_df.sort_values("Fecha", ascending=False).set_index("Fecha")
 
-                # 3) Rango de fechas para ffill
-                fecha_min_trm = trm_df.index.min()
-                fecha_min_tx = df["FECHA"].dt.date.min()
-                fecha_inicio_rango = min(fecha_min_trm, fecha_min_tx)
-                fecha_fin_rango = fecha_max_dt
+                    fecha_min_trm = trm_df.index.min()
+                    fecha_min_tx = (df_convertible["FECHA"].dt.date.min()
+                                    if not df_convertible.empty else fecha_max_dt)
+                    fecha_inicio_rango = min(fecha_min_trm, fecha_min_tx)
+                    fecha_fin_rango = fecha_max_dt
 
-                rango_fechas = pd.date_range(start=fecha_inicio_rango, end=fecha_fin_rango, freq="D").date
-                df_trm_full = pd.DataFrame(index=rango_fechas, columns=["TRM"])
-
-                # 7) Colocar TRM conocida en días disponibles
-                for dia in trm_df.index:
-                    df_trm_full.loc[dia, "TRM"] = trm_df.loc[dia, "TRM"]
-
-                # 8) Rellenar hacia adelante
-                df_trm_full["TRM"] = df_trm_full["TRM"].ffill()
-
-                # 9) Preparar para merge
-                df_trm_para_joins = df_trm_full.reset_index().rename(columns={"index": "Fecha"})
-    except Exception as e:
-        st.warning(f"No se pudo obtener TRM: {e}")
+                    rango_fechas = pd.date_range(start=fecha_inicio_rango, end=fecha_fin_rango, freq="D").date
+                    df_trm_full = pd.DataFrame(index=rango_fechas, columns=["TRM"])
+                    for dia in trm_df.index:
+                        df_trm_full.loc[dia, "TRM"] = trm_df.loc[dia, "TRM"]
+                    df_trm_full["TRM"] = df_trm_full["TRM"].ffill()
+                    df_trm_para_joins = df_trm_full.reset_index().rename(columns={"index": "Fecha"})
+    except Exception:
         df_trm_para_joins = pd.DataFrame(columns=["Fecha", "TRM"])
-    # =========================================================
 
-    # Preparar columna Fecha (date) y merge con TRM
-    df["Fecha"] = df["FECHA"].dt.date
-    df = df.merge(df_trm_para_joins, on="Fecha", how="left")
+    # ===================== Conversión a USD =====================
+    if df_convertible.empty:
+        # Guardar log (si hay) y devolver vacío
+        if log_rows:
+            log_df = pd.DataFrame(log_rows).sort_values("Fecha").reset_index(drop=True)
+            if not df_trm_para_joins.empty:
+                log_df = log_df.merge(df_trm_para_joins, on="Fecha", how="left")
+                log_df["TRM_del_dia"] = log_df["TRM"]; log_df.drop(columns=["TRM"], inplace=True, errors="ignore")
+            st.session_state["1444_movimientos_cop"] = log_df
+            with st.expander("📄 1444 movimientos en COP", expanded=False):
+                st.dataframe(log_df, use_container_width=True)
+        cols = ["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Estado de Orden","Nombre del producto","TRM"]
+        return pd.DataFrame(columns=cols)
 
-    # Calcular VALOR en USD (como en tu ejemplo, usando TRM + 100) y evitar división por nulo
-    # Si TRM es NaN, el resultado será NaN; puedes decidir si llenar con 0 u otro valor.
-    df["VALOR_USD"] = df["TRM"]
-    df.loc[df["TRM"].notna(), "VALOR_USD"] = df.loc[df["TRM"].notna(), "VALOR"] / (df.loc[df["TRM"].notna(), "TRM"] + 100)
+    df_convertible["Fecha"] = df_convertible["FECHA"].dt.date
+    df_convertible = df_convertible.merge(df_trm_para_joins, on="Fecha", how="left")
 
-    # Asignar columnas estándar
-    df["Tipo"] = "Ingreso"
-    df["Orden"] = ""
-    df["Usuario"] = usuario
-    df["Casillero"] = casillero
-    df["Estado de Orden"] = ""
+    df_convertible["VALOR_USD"] = None
+    mask_trm = df_convertible["TRM"].notna()
+    df_convertible.loc[mask_trm, "VALOR_USD"] = (
+        df_convertible.loc[mask_trm, "VALOR"] / (df_convertible.loc[mask_trm, "TRM"] + 100.0)
+    )
 
-    # Construcción final
-    out = df.rename(columns={
+    # Armar OUT estándar
+    df_convertible["Tipo"] = "Ingreso"
+    df_convertible["Orden"] = ""
+    df_convertible["Usuario"] = usuario
+    df_convertible["Casillero"] = casillero
+    df_convertible["Estado de Orden"] = ""
+
+    out = df_convertible.rename(columns={
         "VALOR_USD": "Monto",
         "REFERENCIA": "Nombre del producto"
-    })[["Fecha", "Tipo", "Monto", "Orden", "Usuario", "Casillero", "Estado de Orden", "Nombre del producto", "TRM"]]
+    })[["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Estado de Orden","Nombre del producto","TRM"]]
 
-    # Filtros de negocio
-    out = out[out["Nombre del producto"] != "ABONO INTERESES AHORROS"]
-    out = out[out["Monto"] > 0]
+    out = out[out["Nombre del producto"].astype(str).str.strip().str.upper() != "ABONO INTERESES AHORROS"]
+    out = out[pd.to_numeric(out["Monto"], errors="coerce").fillna(0) > 0].reset_index(drop=True)
+
+    # Completar log (opcional)
+    if log_rows:
+        log_df = pd.DataFrame(log_rows).sort_values("Fecha").reset_index(drop=True)
+        if not df_trm_para_joins.empty:
+            log_df = log_df.merge(df_trm_para_joins, on="Fecha", how="left")
+            log_df["TRM_del_dia"] = log_df["TRM"]; log_df.drop(columns=["TRM"], inplace=True, errors="ignore")
+        usd_por_fecha = out.groupby("Fecha")["Monto"].sum().rename("USD_generado")
+        log_df = log_df.merge(usd_por_fecha, on="Fecha", how="left")
+        st.session_state["1444_movimientos_cop"] = log_df
+        with st.expander("📄 1444 movimientos en COP", expanded=False):
+            st.dataframe(log_df, use_container_width=True)
 
     return out.reset_index(drop=True)
+
+
+
+
 
 
 def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> pd.DataFrame:
@@ -665,18 +899,17 @@ def aplicar_cobro_contabilidad_mensual(historico, hoja, casillero, usuario, fech
     historico[hoja] = dfh
     return historico
 
-
-
-def send_mail_gmail(subject: str, body: str, to_addrs) -> bool:
-    """SMTP Gmail con App Password. Sin adjuntos."""
+def send_mail_zoho(subject: str, body: str, to_addrs) -> bool:
+    """SMTP Zoho Mail con App Password. Sin adjuntos."""
     try:
-        cfg = st.secrets["gmail"]
+        cfg = st.secrets["zoho"]
         sender = cfg["address"]
         app_pw = cfg["app_password"]
-        smtp_server = cfg.get("smtp_server", "smtp.gmail.com")
-        smtp_port = int(cfg.get("smtp_port", 465))
+        smtp_server = cfg.get("smtp_server", "smtp.zoho.com")   # o "smtppro.zoho.com" según tu plan
+        smtp_port = int(cfg.get("smtp_port", 465))              # 465 SSL ó 587 STARTTLS
+        security = str(cfg.get("security", "SSL")).upper()      # "SSL" o "STARTTLS"
     except Exception as e:
-        st.error("❌ Falta configuración gmail en st.secrets['gmail']: " + str(e))
+        st.error("❌ Falta configuración zoho en st.secrets['zoho']: " + str(e))
         return False
 
     if isinstance(to_addrs, str):
@@ -690,19 +923,26 @@ def send_mail_gmail(subject: str, body: str, to_addrs) -> bool:
 
     try:
         context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(smtp_server, smtp_port, context=context) as server:
-            server.login(sender, app_pw)
-            server.send_message(msg)
+        if security == "STARTTLS":
+            with smtplib.SMTP(smtp_server, 587) as server:
+                server.ehlo()
+                server.starttls(context=context)
+                server.login(sender, app_pw)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP_SSL(smtp_server, smtp_port, context=context) as server:
+                server.login(sender, app_pw)
+                server.send_message(msg)
         return True
     except Exception as e:
-        st.error(f"❌ Error enviando email: {e}")
+        st.error(f"❌ Error enviando email (Zoho): {e}")
         return False
 
 
 def obtener_y_enviar_alerta_saldo(historico: dict, casillero: str, fecha_carga: str) -> None:
     """
     Toma el último 'Total' del casillero en 'historico' y envía un correo SOLO
-    al destinatario configurado para ese casillero. No usa default_to.
+    al destinatario configurado para ese casillero (Zoho).
     """
     # 1) hallar la hoja del casillero
     hoja = next((h for h in historico if h.startswith(str(casillero))), None)
@@ -713,7 +953,7 @@ def obtener_y_enviar_alerta_saldo(historico: dict, casillero: str, fecha_carga: 
     if dfh.empty:
         return
 
-    # 2) filtrar Totales y tomar el más reciente por Fecha
+    # 2) último Total por fecha
     dfh["Tipo"] = dfh["Tipo"].astype(str)
     df_tot = dfh[dfh["Tipo"].str.upper() == "TOTAL"].copy()
     if df_tot.empty:
@@ -724,16 +964,14 @@ def obtener_y_enviar_alerta_saldo(historico: dict, casillero: str, fecha_carga: 
     if df_tot.empty:
         return
 
-    df_tot = df_tot.sort_values("Fecha")
-    fila = df_tot.iloc[-1]
+    fila = df_tot.sort_values("Fecha").iloc[-1]
     saldo = pd.to_numeric(fila["Monto"], errors="coerce")
     fecha_saldo = fila["Fecha"].date()
-
     if pd.isna(saldo):
         return
 
-    # 3) destinatario SOLO si está mapeado
-    recipients_map = st.secrets.get("gmail", {}).get("recipients", {})
+    # 3) destinatario SOLO si está mapeado (Zoho)
+    recipients_map = st.secrets.get("zoho", {}).get("recipients", {})
     destino = recipients_map.get(str(casillero))
     if not destino:
         return  # no enviar si no hay correo configurado para ese casillero
@@ -748,9 +986,10 @@ def obtener_y_enviar_alerta_saldo(historico: dict, casillero: str, fecha_carga: 
         "Saludos,\nEncargomio"
     )
 
-    ok = send_mail_gmail(subject, body, destino)
+    ok = send_mail_zoho(subject, body, destino)
     if ok:
         st.success(f"📧 Alerta enviada a {destino} (casillero {casillero})")
+
 
 
 
@@ -798,9 +1037,32 @@ def main():
         st.info("📂 Aún no subes Ingresos Extra")
 
     st.markdown("---")
+    
+    
+    st.markdown("---")
+    st.header("3) Devoluciones")
+    dev_file = st.file_uploader("Sube archivo de DEVOLUCIONES", type=["xls","xlsx"])
+    devoluciones = {}
+    if dev_file:
+        hojas_dev = pd.read_excel(dev_file, sheet_name=None)
+        devoluciones = procesar_devoluciones(hojas_dev)
+        tabs_dev = st.tabs(list(devoluciones.keys()))
+        for tab, key in zip(tabs_dev, devoluciones):
+            with tab:
+                df = devoluciones[key]
+                if df.empty:
+                    st.info("Sin devoluciones")
+                else:
+                    st.dataframe(df, use_container_width=True)
+    else:
+        st.info("📂 Aún no subes Devoluciones")
+
+    
+    
+    
 
     # 3) Ingresos Nathalia Ospina (CA1633)
-    st.header("3) Ingresos Nathalia Ospina (CA1633)")
+    st.header("4) Ingresos Nathalia Ospina (CA1633)")
     nat_files = st.file_uploader(
         "Sube archivos .xls y .csv de Nathalia",
         type=["xls", "xlsx", "csv"],
@@ -840,7 +1102,7 @@ def main():
     st.markdown("---")
 
     # 4) Ingresos Elvis (CA11591)
-    st.header("4) Ingresos Elvis (CA11591)")
+    st.header("5) Ingresos Elvis (CA11591)")
     elv_files = st.file_uploader(
         "Sube archivos .xls y .csv de Elvis",
         type=["xls", "xlsx", "csv"],
@@ -882,7 +1144,7 @@ def main():
     st.markdown("---")
         
         # 3) Ingresos Julian Sanchez (CA13608)
-    st.header("5) Ingresos Julian Sanchez (CA13608)")
+    st.header("6) Ingresos Julian Sanchez (CA13608)")
     jul_files = st.file_uploader(
         "Sube archivos .xls y .csv de Julian",
         type=["xls", "xlsx", "csv"],
@@ -921,7 +1183,7 @@ def main():
         
     st.markdown("---")
     
-    st.header("6) Ingresos Maria Moises (CA1444)")
+    st.header("7) Ingresos Maria Moises (CA1444)")
     moises_files = st.file_uploader(
         "Sube archivos .csv de Maria Moises (Bancolombia o Davivienda)", 
         type=["xls", "xlsx", "csv"], 
@@ -985,8 +1247,8 @@ def main():
     
     # 5) Conciliaciones
     # 5) Conciliaciones Finales
-    st.header("7) Conciliaciones Finales")
-    
+    st.header("8) Conciliaciones Finales")
+
     casilleros = ["9444", "14856", "11591", "1444", "1633", "13608"]
     conciliaciones = {}
     
@@ -1009,27 +1271,26 @@ def main():
             inc = ing_m
         else:
             inc = None
-            
-            
-            # ------------------ NUEVO: GMF 4x1000 SOLO PARA 1633 ------------------
+    
+        # ------------------ NUEVO: GMF 4x1000 SOLO PARA 1633 ------------------
         gmf_df = None
         if cas == "1633":
             # Elegir de qué DF calcular el GMF (preferimos el ingreso real que se usó)
             base_ing = inc if (inc is not None and not inc.empty) else ing_n  # fallback a Nath si inc viene de otra persona
             if base_ing is not None and not base_ing.empty:
                 tmp = base_ing.copy()
-        
+    
                 # Asegurar numérico
                 tmp["Monto"] = pd.to_numeric(tmp["Monto"], errors="coerce").fillna(0)
-        
+    
                 # Tomar SOLO movimientos de tipo Ingreso (por si en 'inc' vienen también Egresos)
                 if "Tipo" in tmp.columns:
                     tmp = tmp[tmp["Tipo"].astype(str).str.strip().str.lower() == "ingreso"]
-        
+    
                 # Evitar doble conteo si ya agregaste una fila GMF en otro paso
                 if "Nombre del producto" in tmp.columns:
                     tmp = tmp[~tmp["Nombre del producto"].astype(str).str.contains("4x1000", case=False, na=False)]
-        
+    
                 gmf_total = round(0.004 * tmp["Monto"].sum(), 2)  # 4x1000 = 0.4%
                 
                 # calcular la fecha a usar
@@ -1044,7 +1305,7 @@ def main():
                     # Construir la fila con las columnas que maneja tu pipeline
                     cols = list(base_ing.columns)
                     fila = {c: None for c in cols}
-        
+    
                     fila.update({
                         "Fecha": pd.Timestamp.today().normalize(),     # o pd.to_datetime(base_ing["Fecha"]).max()
                         "Tipo": "Egreso",                              # <<< CLAVE
@@ -1055,19 +1316,16 @@ def main():
                         "Estado de Orden": "",
                         "Nombre del producto": "GMF 4x1000 acumulado",
                     })
-        
+    
                     # Si existe TRM, puedes heredar el último
                     if "TRM" in cols:
                         try:
                             fila["TRM"] = pd.to_numeric(base_ing["TRM"], errors="coerce").dropna().iloc[-1]
                         except Exception:
                             fila["TRM"] = None
-        
+    
                     gmf_df = pd.DataFrame([fila])
-# ----------------------------------------------------------------------
-            
-            
-            
+        # ----------------------------------------------------------------------
     
         # EGRESOS
         egr = egresos.get(f"egresos_{cas}")
@@ -1075,16 +1333,22 @@ def main():
         # EXTRA (ingresos extra)
         ext = ingresos_extra.get(f"extra_{cas}")
     
+        # <<< NUEVO: DEVOLUCIONES (ingresos por devolución)
+        key_dev = f"devoluciones_{cas}"
+        dev = devoluciones.get(key_dev) if 'devoluciones' in locals() else None  # guard contra que no exista el dict
+    
         # 3) Armar la lista de DataFrames válidos
         frames = []
         for df in (inc, egr, ext):
             if df is not None and not df.empty:
                 frames.append(df)
-                
-        
+    
         if gmf_df is not None and not gmf_df.empty:
             frames.append(gmf_df)
-        
+    
+        # <<< NUEVO: agregar devoluciones si hay
+        if dev is not None and not dev.empty:
+            frames.append(dev)
     
         # 4) Guardar la conciliación (si no hay nada, vacío)
         if frames:
@@ -1101,8 +1365,9 @@ def main():
                 st.info("⛔ Sin movimientos para este casillero")
             else:
                 st.dataframe(dfc, use_container_width=True)
-
+    
     st.markdown("---")
+
 
 
 
@@ -1114,12 +1379,14 @@ def main():
 
     # 6) Histórico: carga y actualización
     # 6) Histórico: carga y actualización
-    st.header("8) Actualizar Histórico") 
+    st.header("9) Actualizar Histórico") 
     hist_file = st.file_uploader("Sube tu archivo HISTÓRICO EXISTENTE", type=["xls","xlsx"])
     if hist_file:
         historico = pd.read_excel(hist_file, sheet_name=None)
         fecha_carga = pd.Timestamp.today().strftime("%Y-%m-%d")
     
+    # <<< NUEVO: acumulador de errores de validación
+        errores_validacion = []
         # actualizar cada conciliación
         for clave, df_nuevo in conciliaciones.items():
             cas = clave.replace("conciliacion_", "")
@@ -1332,6 +1599,96 @@ def main():
             # -------------------------------------------------------------------------
 
 
+            # ---------- VALIDACIÓN DE DEVOLUCIONES vs EGRESOS (por Orden) ----------
+            df_valid = historico[hoja].copy()
+
+            df_valid["Tipo"] = df_valid["Tipo"].astype(str).str.upper()
+            df_valid["Orden"] = df_valid["Orden"].astype(str).str.strip()
+            df_valid["Monto"] = pd.to_numeric(df_valid["Monto"], errors="coerce")
+
+            egresos_por_orden = (
+                df_valid[df_valid["Tipo"] == "EGRESO"]
+                .groupby("Orden")["Monto"].sum(min_count=1)
+            )
+
+            if "Motivo" in df_valid.columns:
+                mask_dev = (df_valid["Tipo"] == "INGRESO") & (df_valid["Motivo"].astype(str).str.lower() == "devolucion")
+            else:
+                mask_dev = (df_valid["Tipo"] == "INGRESO") & (df_valid["Nombre del producto"].astype(str).str.lower().str.contains("devoluc"))
+
+            devoluciones_por_orden = (
+                df_valid[mask_dev]
+                .groupby("Orden")["Monto"].sum(min_count=1)
+            )
+
+            ordenes = sorted(set(devoluciones_por_orden.index) | set(egresos_por_orden.index))
+            for o in ordenes:
+                eg = float(egresos_por_orden.get(o, 0.0) or 0.0)
+                dv = float(devoluciones_por_orden.get(o, 0.0) or 0.0)
+                if dv > eg and eg > 0:
+                    exceso = dv - eg
+                    msg = f"Devolución excedida en casillero {cas} — Orden {o}: devuelto ${dv:,.2f} > egresado ${eg:,.2f}. Exceso ${exceso:,.2f}."
+                    st.error(f"🚨 {msg}")
+                    errores_validacion.append(msg)   # <<< acumula para bloquear exportación
+                if eg == 0 and dv > 0:
+                    msg = f"Devolución sin egreso asociado en casillero {cas} — Orden {o}: devuelto ${dv:,.2f}. Revisa la Orden."
+                    st.warning(f"⚠️ {msg}")
+                    errores_validacion.append(msg)   # <<< también bloquea
+            # ---------- /VALIDACIÓN ----------
+
+
+        # <<< NUEVO: si hubo errores, no generar archivo ni enviar correos
+        if errores_validacion:
+            st.error("⛔ No se generó el histórico porque hay devoluciones inválidas. Corrige y vuelve a ejecutar.")
+            with st.expander("Ver detalles"):
+                for m in errores_validacion:
+                    st.write("•", m)
+            st.stop()  # <<< BLOQUEA exportación y resto del flujo
+
+
+
+        # --- Anexar hoja con log COP de 1444 (crear o concatenar) ---
+        sheet_name_cop = "1444 - Maria Moises COP"
+        
+        # Recuperar el log desde la sesión (si existe)
+        try:
+            log_df = st.session_state.get("1444_movimientos_cop", None)
+        except Exception:
+            log_df = None
+        
+        if isinstance(log_df, pd.DataFrame) and not log_df.empty:
+            df_log = log_df.copy()
+        
+            # Normalizar Fecha a date (evita tz/datetime raros en Excel)
+            if "Fecha" in df_log.columns:
+                df_log["Fecha"] = pd.to_datetime(df_log["Fecha"], errors="coerce").dt.date
+        
+            if sheet_name_cop in historico:
+                # Concatenar al final sin deduplicar
+                old_df = historico[sheet_name_cop].copy()
+        
+                # Alinear columnas: mantener primero las existentes y luego cualquier columna nueva del log
+                cols_old = list(old_df.columns)
+                cols_log = list(df_log.columns)
+                cols_extra = [c for c in cols_log if c not in cols_old]
+                cols_final = cols_old + cols_extra
+        
+                # Asegurar que ambos DFs tengan todas las columnas del set final
+                for c in cols_final:
+                    if c not in old_df.columns:
+                        old_df[c] = pd.NA
+                    if c not in df_log.columns:
+                        df_log[c] = pd.NA
+        
+                historico[sheet_name_cop] = pd.concat(
+                    [old_df[cols_final], df_log[cols_final]],
+                    ignore_index=True
+                )
+            else:
+                # Crear la hoja por primera vez
+                historico[sheet_name_cop] = df_log
+        # --- /fin anexar hoja COP 1444 ---
+        
         # generar excel en memoria
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -1353,7 +1710,7 @@ def main():
         
         if modo_prueba == "No":
             # Enviar correos por casillero (solo a los configurados)
-            for cas in st.secrets["gmail"]["recipients"].keys():
+            for cas in st.secrets["zoho"]["recipients"].keys():
                 obtener_y_enviar_alerta_saldo(historico, str(cas), fecha_carga)
         else:
             st.info("Modo prueba activo: no se enviaron correos.")
@@ -1368,7 +1725,7 @@ def main():
         )
     
         # 2) Subida automática a Dropbox (DESACTIVADA mientras probamos)
-        upload_to_dropbox(data_bytes)
+        #upload_to_dropbox(data_bytes)
     else:
         st.info("📂 Aún no subes tu histórico")
 
