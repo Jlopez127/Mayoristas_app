@@ -330,12 +330,12 @@ def procesar_ingresos_clientes_csv(files: list[bytes], usuario: str, casillero: 
     return out.reset_index(drop=True)
 
 # 3) Pipeline común (extrae tu lógica de post-procesamiento)
-
 def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: str, casillero: str) -> pd.DataFrame:
     """
     1444 (María Moises)
     - Lee CSVs bancarios.
     - (Opcional) Netea egresos extra en COP por fecha (cargados por el usuario).
+    - Aplica GMF 4x1000 diario (0.4%) sobre los COP del día ANTES de convertir a USD.
     - AVISOS:
         * Total: 'Saldo disponible en COP (esta carga): $X'
         * Detalle diario: '📅 <día> de <mes>: $Y COP disponibles' (si hay varios días).
@@ -359,7 +359,7 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
             def file_uploader(self, *a, **k): return None
             def data_editor(self, *a, **k): return pd.DataFrame()
             def expander(self, *a, **k):
-                class _E: 
+                class _E:
                     def __enter__(selfi): return selfi
                     def __exit__(selfi, *x): return False
                 return _E()
@@ -515,17 +515,95 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
         # Eliminar filas que quedaron en 0
         df_neteo = df_neteo[df_neteo["VALOR"].fillna(0.0) > 0.0].copy()
 
-    # Base neteada que sí se convierte
+    # ========= GMF 4x1000 (COP) por día (aplicar ANTES de convertir a USD) =========
+    GMF_RATE = 0.004
+
+    gmf_por_dia = {}
+    ingresos_pre_gmf = pd.Series(dtype="float64")
+    if not df_neteo.empty:
+        # Total del día ANTES de GMF (para log)
+        ingresos_pre_gmf = (
+            pd.to_numeric(df_neteo["VALOR"], errors="coerce")
+            .groupby(df_neteo["FECHA_DATE"])
+            .sum(min_count=1)
+            .fillna(0.0)
+        )
+
+        # Restar GMF del total del día, repartiendo sobre las filas del día
+        for fecha, total_cop in ingresos_pre_gmf.items():
+            total_cop = float(total_cop or 0.0)
+            if total_cop <= 0:
+                continue
+
+            gmf = round(total_cop * GMF_RATE, 2)  # 0.4%
+            restante = gmf
+            idxs = df_neteo.index[df_neteo["FECHA_DATE"] == fecha].tolist()
+            for idx in idxs:
+                if restante <= 0:
+                    break
+                val = float(df_neteo.at[idx, "VALOR"] or 0.0)
+                if val <= 0:
+                    continue
+                if val <= restante:
+                    restante -= val
+                    df_neteo.at[idx, "VALOR"] = 0.0
+                else:
+                    df_neteo.at[idx, "VALOR"] = val - restante
+                    restante = 0.0
+
+            gmf_por_dia[fecha] = gmf
+
+        # Quita filas que quedaron en 0 por el GMF
+        df_neteo = df_neteo[pd.to_numeric(df_neteo["VALOR"], errors="coerce").fillna(0.0) > 0.0].copy()
+
+    # Para el log: total del día DESPUÉS de GMF (lo que sí se convierte a USD)
+    ingresos_post_gmf = (
+        pd.to_numeric(df_neteo["VALOR"], errors="coerce")
+        .groupby(df_neteo["FECHA_DATE"])
+        .sum(min_count=1)
+        .fillna(0.0)
+        if not df_neteo.empty else pd.Series(dtype="float64")
+    )
+
+    # Asegura fila de log por cada fecha con ingresos (aunque no haya egresos extra)
+    if not ingresos_pre_gmf.empty:
+        fechas_log = {r["Fecha"] for r in log_rows} if log_rows else set()
+        for fecha in ingresos_pre_gmf.index:
+            if fecha not in fechas_log:
+                log_rows.append({
+                    "Fecha": fecha,
+                    "Egreso_extra_COP": 0.0,
+                    "Ingresos_COP_del_dia": float(ingresos_pre_gmf.get(fecha, 0.0)),
+                    "Neteo_aplicado_COP": 0.0,
+                    "COP_convertible_a_USD": float(ingresos_post_gmf.get(fecha, 0.0)),
+                    "Egreso_pendiente_COP": 0.0,
+                    "TRM_del_dia": None,
+                    "USD_generado": None,
+                    "Aviso": ""
+                })
+            else:
+                # Actualiza si ya existía
+                for r in log_rows:
+                    if r["Fecha"] == fecha:
+                        r["Ingresos_COP_del_dia"] = float(ingresos_pre_gmf.get(fecha, 0.0))
+                        r["COP_convertible_a_USD"] = float(ingresos_post_gmf.get(fecha, 0.0))
+                        break
+
+    # Añade el GMF al log (como egreso en COP)
+    for r in log_rows:
+        f = r["Fecha"]
+        r["GMF_4x1000_COP"] = float(gmf_por_dia.get(f, 0.0))
+
+    # ---------- Base neteada (extras + GMF) que SÍ se convierte ----------
     df_convertible = df_neteo.copy()
 
     # ======= AVISOS: Total y detalle por día =======
     disponible_total_cop = float(pd.to_numeric(df_convertible["VALOR"], errors="coerce").sum()) if not df_convertible.empty else 0.0
     st.info(f"💡 Saldo disponible en COP (esta carga): ${disponible_total_cop:,.0f}")
 
-    # detalle por día (si hay varios días)
     if not df_convertible.empty:
         disp_por_dia = df_convertible.groupby("FECHA_DATE")["VALOR"].sum()
-        if len(disp_por_dia.index) > 1 or (len(disp_por_dia.index) == 1):
+        if len(disp_por_dia.index) >= 1:
             meses = {1:"enero",2:"febrero",3:"marzo",4:"abril",5:"mayo",6:"junio",7:"julio",8:"agosto",9:"septiembre",10:"octubre",11:"noviembre",12:"diciembre"}
             for fecha, valor in sorted(disp_por_dia.items()):
                 if valor > 0:
@@ -632,13 +710,16 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
 
 
 
-
 def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> pd.DataFrame:
     """
     Procesa archivos Excel de Davivienda (UploadedFile de Streamlit).
     Toma “Descripción motivo” (columna REFERENCIA) como Nombre del producto, 
     pero si está vacía o nula, utiliza “Referencia 1” como fallback.
     Devuelve un DataFrame con la misma estructura que la función de Bancolombia.
+
+    EXTRA (solo casillero 1444):
+    - Calcula GMF 4x1000 diario sobre los COP positivos (excluye 'ABONO INTERESES AHORROS')
+      y lo agrega al log compartido: st.session_state["1444_movimientos_cop"].
     """
     dfs = []
     for up in files:
@@ -652,8 +733,8 @@ def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> p
         # 2) Renombrar columnas clave
         mapeo = {
             "Fecha de Sistema":   "FECHA",
-            "Valor Total":         "VALOR",
-            "Descripción motivo":  "REFERENCIA"
+            "Valor Total":        "VALOR",
+            "Descripción motivo": "REFERENCIA"
         }
         df_excel = df_excel.rename(columns=mapeo)
 
@@ -699,19 +780,16 @@ def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> p
         )
         df_excel.loc[mask_debito, "VALOR"] *= -1
 
-        # 7) Construir “Nombre del producto”:
-        #    - Si REFERENCIA no está vacía (ni NaN), usarla.
-        #    - Si REFERENCIA está vacía/NaN, usar “Referencia 1”.
+        # 7) Construir “Nombre del producto”
         def elegir_nombre(row):
             ref = str(row["REFERENCIA"]).strip()
             if ref and ref.upper() != "NAN":
                 return ref
-            # Si REF vacío o “nan”, caemos en Referencia 1:
             return str(row["Referencia 1"]).strip()
 
         df_excel["Nombre del producto"] = df_excel.apply(elegir_nombre, axis=1)
 
-        # 8) Crear DataFrame temporal para merge_asof
+        # 8) Selección base (COP y fecha)
         df_sel = pd.DataFrame({
             "Fecha": df_excel["FECHA"],
             "ValorCOP": df_excel["VALOR"],
@@ -793,7 +871,87 @@ def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> p
     out = out[out["Nombre del producto"] != "ABONO INTERESES AHORROS"]
     out = out[out["Monto"] > 0]
 
+    # === GMF 4x1000 -> agregar al MISMO log que 1444 (solo si casillero == "1444") ===
+ # === APORTAR INGRESOS COP DE DAVIVIENDA AL MISMO LOG (solo 1444) ===
+    # === DAVIVIENDA → aportar al log 1444_movimientos_cop (solo casillero 1444) ===
+    if str(casillero) == "1444":
+        try:
+            # 1) COP positivos por fecha (ignora intereses)
+            tmp = df_trans.copy()
+            tmp["Fecha"] = pd.to_datetime(tmp["Fecha"], errors="coerce").dt.date
+            tmp["ValorCOP"] = pd.to_numeric(tmp["ValorCOP"], errors="coerce")
+            mask_valid = (
+                (tmp["ValorCOP"] > 0) &
+                (tmp["Nombre del producto"].astype(str).str.upper() != "ABONO INTERESES AHORROS")
+            )
+            ing_por_fecha = (
+                tmp[mask_valid]
+                .groupby("Fecha")["ValorCOP"]
+                .sum(min_count=1)
+            )
+
+            if not ing_por_fecha.empty:
+                # 2) Armar bloque con el MISMO esquema del log
+                dav = ing_por_fecha.reset_index().rename(columns={"ValorCOP": "Ingresos_COP_del_dia"})
+
+                # TRM del día (si existe)
+                trm_map = trm_df.copy()
+                trm_map["Fecha"] = pd.to_datetime(trm_map["Fecha"], errors="coerce").dt.date
+                dav = dav.merge(trm_map[["Fecha", "TRM"]], on="Fecha", how="left").rename(columns={"TRM": "TRM_del_dia"})
+
+                # GMF 4x1000 y neto convertible
+                dav["GMF_4x1000_COP"]   = (dav["Ingresos_COP_del_dia"] * 0.004).round(2)
+                dav["Egreso_extra_COP"] = 0.0
+                dav["Neteo_aplicado_COP"] = 0.0
+                dav["Egreso_pendiente_COP"] = 0.0
+                dav["Aviso"] = ""
+                dav["COP_convertible_a_USD"] = (dav["Ingresos_COP_del_dia"] - dav["GMF_4x1000_COP"]).clip(lower=0)
+
+                # USD estimado
+                dav["USD_generado"] = dav.apply(
+                    lambda r: (r["COP_convertible_a_USD"] / (r["TRM_del_dia"] + 100.0))
+                              if pd.notna(r["TRM_del_dia"]) else None,
+                    axis=1
+                )
+
+                # Orden definitivo de columnas
+                cols_log = [
+                    "Fecha","Egreso_extra_COP","Ingresos_COP_del_dia","Neteo_aplicado_COP",
+                    "COP_convertible_a_USD","Egreso_pendiente_COP","TRM_del_dia",
+                    "USD_generado","Aviso","GMF_4x1000_COP"
+                ]
+                dav = dav[cols_log]
+
+                # 3) Unir con el log existente sin crear _x/_y
+                log_df = st.session_state.get("1444_movimientos_cop", None)
+                if isinstance(log_df, pd.DataFrame) and not log_df.empty:
+                    log_df = log_df.copy()
+                    log_df["Fecha"] = pd.to_datetime(log_df["Fecha"], errors="coerce").dt.date
+                    # Alinear columnas en ambos lados
+                    for c in cols_log:
+                        if c not in log_df.columns: log_df[c] = pd.NA
+                    for c in log_df.columns:
+                        if c not in dav.columns: dav[c] = pd.NA
+                    comb = pd.concat([log_df[cols_log], dav[cols_log]], ignore_index=True)
+
+                    # Agregar por día (sumar numéricos; concatenar avisos)
+                    num_cols = ["Egreso_extra_COP","Ingresos_COP_del_dia","Neteo_aplicado_COP",
+                                "COP_convertible_a_USD","Egreso_pendiente_COP","TRM_del_dia",
+                                "USD_generado","GMF_4x1000_COP"]
+                    for c in num_cols:
+                        comb[c] = pd.to_numeric(comb[c], errors="coerce")
+                    agg = comb.groupby("Fecha", as_index=False).agg(
+                        {**{c: "sum" for c in num_cols}, **{"Aviso": lambda s: " | ".join([x for x in s.astype(str) if x and x != "nan"])}}
+                    )
+                    st.session_state["1444_movimientos_cop"] = agg.sort_values("Fecha").reset_index(drop=True)
+                else:
+                    st.session_state["1444_movimientos_cop"] = dav.sort_values("Fecha").reset_index(drop=True)
+        except Exception as e:
+            st.warning(f"No se pudieron registrar los ingresos de Davivienda en el log: {e}")
+    # === /fin aporte Davivienda al log ===
+
     return out.reset_index(drop=True)
+
 
 
 
@@ -1725,7 +1883,7 @@ def main():
         )
     
         # 2) Subida automática a Dropbox (DESACTIVADA mientras probamos)
-        #upload_to_dropbox(data_bytes)
+        upload_to_dropbox(data_bytes)
     else:
         st.info("📂 Aún no subes tu histórico")
 
