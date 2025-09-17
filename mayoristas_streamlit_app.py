@@ -426,6 +426,10 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
         .replace({"": None})
         .astype(float)
     )
+    # ===== Filtro INICIAL (ANTES de netear/GMF) =====
+    mask_interes = df["REFERENCIA"].astype(str).str.strip().str.upper().eq("ABONO INTERESES AHORROS")
+    mask_pos     = pd.to_numeric(df["VALOR"], errors="coerce").fillna(0) > 0
+    df_base = df.loc[~mask_interes & mask_pos].copy()
 
     # ========= Egresos extra (opcionales) =========
     egresos_extra = pd.DataFrame(columns=["Fecha", "Monto_COP", "Descripcion"])
@@ -467,8 +471,8 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
                     egresos_extra = egresos_extra.dropna(subset=["Fecha", "Monto_COP"])
 
     # ========= Neteo diario en COP =========
-    mask_interes = df["REFERENCIA"].astype(str).str.strip().str.upper().eq("ABONO INTERESES AHORROS")
-    df_neteo = df[~mask_interes].copy()
+    df_neteo = df_base.copy()
+
     df_neteo["FECHA_DATE"] = df_neteo["FECHA"].dt.date
 
     ingresos_por_dia = df_neteo.groupby("FECHA_DATE")["VALOR"].sum(min_count=1).fillna(0.0)
@@ -611,7 +615,7 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
 
     # ===================== TRM por rango (serie diaria) =====================
     try:
-        fecha_max_dt = (df_convertible["FECHA"].max() if not df_convertible.empty else df["FECHA"].max())
+        fecha_max_dt = (df_convertible["FECHA"].max() if not df_convertible.empty else df_base["FECHA"].max())
         fecha_max_dt = None if pd.isna(fecha_max_dt) else fecha_max_dt.date()
 
         if fecha_max_dt is None:
@@ -689,8 +693,7 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
         "REFERENCIA": "Nombre del producto"
     })[["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Estado de Orden","Nombre del producto","TRM"]]
 
-    out = out[out["Nombre del producto"].astype(str).str.strip().str.upper() != "ABONO INTERESES AHORROS"]
-    out = out[pd.to_numeric(out["Monto"], errors="coerce").fillna(0) > 0].reset_index(drop=True)
+
 
     # Completar log (opcional)
     if log_rows:
