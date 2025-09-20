@@ -49,7 +49,7 @@ def procesar_egresos(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     df["Fecha Compra"] = df["Fecha Compra"].dt.tz_convert(None)
     df["Casillero"] = df["Casillero"].astype(str)
     df = df[df["Casillero"].isin(casilleros)]
-    cutoff = pd.Timestamp("2025-08-25")
+    cutoff = pd.Timestamp("2025-09-18")
     df = df[(df["Casillero"] != "13608") | (df["Fecha Compra"] >= cutoff)]
     df["Fecha Compra"] = df["Fecha Compra"].dt.strftime("%Y-%m-%d")
     df["Tipo"] = "Egreso"
@@ -965,7 +965,7 @@ COBROS_MENSUALES_CONF = {
     # casillero : {"inicio": "YYYY-MM-01", "monto": int}
     "1633": {"inicio": "2024-02-01", "monto": 711_750}
     #,
-   # "1444": {"inicio": "2024-10-01", "monto": 100},
+   # "13608": {"inicio": "2025-11-01", "monto": 500000},
 }
 
 def aplicar_cobro_contabilidad_mensual(historico, hoja, casillero, usuario, fecha_carga, inicio_yyyymm, monto, etiqueta_base="cobro contabilidad"):
@@ -1435,7 +1435,7 @@ def main():
     
         # ------------------ NUEVO: GMF 4x1000 SOLO PARA 1633 ------------------
         gmf_df = None
-        if cas == "1633":
+        if cas in ("1633", "13608"):
             # Elegir de qué DF calcular el GMF (preferimos el ingreso real que se usó)
             base_ing = inc if (inc is not None and not inc.empty) else ing_n  # fallback a Nath si inc viene de otra persona
             if base_ing is not None and not base_ing.empty:
@@ -1453,6 +1453,8 @@ def main():
                     tmp = tmp[~tmp["Nombre del producto"].astype(str).str.contains("4x1000", case=False, na=False)]
     
                 gmf_total = round(0.004 * tmp["Monto"].sum(), 2)  # 4x1000 = 0.4%
+                usuario = "Nathalia Ospina" if cas == "1633" else "Julian Sanchez"
+                casillero_val = cas  #
                 
                 # calcular la fecha a usar
                 fecha_base = pd.to_datetime(base_ing.get("Fecha", pd.NaT), errors="coerce")
@@ -1472,8 +1474,8 @@ def main():
                         "Tipo": "Egreso",                              # <<< CLAVE
                         "Monto": gmf_total,                            # <<< POSITIVO
                         "Orden": orden_gmf,
-                        "Usuario": "Nathalia Ospina",
-                        "Casillero": "1633",
+                        "Usuario":usuario,
+                        "Casillero": casillero_val,
                         "Estado de Orden": "",
                         "Nombre del producto": "GMF 4x1000 acumulado",
                     })
