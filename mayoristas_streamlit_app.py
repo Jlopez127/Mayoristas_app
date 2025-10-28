@@ -79,22 +79,38 @@ def procesar_ingresos_extra(hojas: dict[str, pd.DataFrame]) -> dict[str, pd.Data
     resultado = {}
     for hoja, df in (hojas or {}).items():
         cas = hoja.split("-")[0].strip()
-        if not cas.isdigit(): continue
+        if not cas.isdigit():
+            continue
+
+        # Copia y elimina/omite la columna 'Revision' si existe
         df2 = df.copy()
+        df2.drop(columns=["Revision"], errors="ignore", inplace=True)
+
+        # Casillero
         if "Casillero" in df2.columns:
             df2["Casillero"] = df2["Casillero"].astype(str)
         else:
             df2["Casillero"] = cas
+
+        # TRM según fecha máxima (si existe 'Fecha')
+        trm = None
         if "Fecha" in df2.columns:
             try:
-                fmax = pd.to_datetime(df2["Fecha"]).max().strftime("%Y-%m-%d")
-                url = f"https://www.datos.gov.co/resource/mcec-87by.json?vigenciadesde={fmax}T00:00:00.000"
-                data = requests.get(url).json()
-                trm = float(data[0]["valor"]) if data and "valor" in data[0] else None
-            except:
+                fmax = pd.to_datetime(df2["Fecha"], errors="coerce").max()
+                if pd.notna(fmax):
+                    fmax_str = fmax.strftime("%Y-%m-%d")
+                    url = f"https://www.datos.gov.co/resource/mcec-87by.json?vigenciadesde={fmax_str}T00:00:00.000"
+                    resp = requests.get(url, timeout=10)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if data and isinstance(data, list) and "valor" in data[0]:
+                        trm = float(data[0]["valor"])
+            except Exception:
                 trm = None
-            df2["TRM"] = trm
+
+        df2["TRM"] = trm
         resultado[f"extra_{cas}"] = df2.reset_index(drop=True)
+
     return resultado
 
 
