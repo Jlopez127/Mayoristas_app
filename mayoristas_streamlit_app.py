@@ -115,6 +115,72 @@ def procesar_ingresos_extra(hojas: dict[str, pd.DataFrame]) -> dict[str, pd.Data
 
 
 
+
+
+
+@st.cache_data
+def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """
+    Lee la hoja 'Mayoristas' (Envios mayoristas) y devuelve un dict con un DF por casillero.
+    Normaliza Fecha de dd-mm-YYYY -> YYYY-MM-DD para que sea consistente con el resto.
+    """
+    casilleros_validos = {"9444", "14856", "11591", "1444", "1633", "13608"}
+
+    df2 = df.copy()
+    df2.columns = [str(c).strip() for c in df2.columns]
+
+    # Asegurar columnas mínimas
+    for c in ["Tipo","Fecha","Orden","Monto","Usuario","Casillero","Motivo","Nombre del producto"]:
+        if c not in df2.columns:
+            df2[c] = ""
+
+    # Normalizaciones
+    df2["Tipo"] = df2["Tipo"].astype(str).str.strip().replace({"": "Egreso"})
+    df2["Orden"] = df2["Orden"].astype(str).str.strip()
+    df2["Usuario"] = df2["Usuario"].astype(str).str.strip()
+    df2["Casillero"] = df2["Casillero"].astype(str).str.strip()
+    df2["Motivo"] = df2["Motivo"].astype(str).str.strip().replace({"": "Envio"})
+    df2["Nombre del producto"] = df2["Nombre del producto"].astype(str).str.strip()
+
+    # >>> Fecha dd-mm-YYYY -> YYYY-MM-DD (string consistente con el resto de la app)
+    df2["Fecha"] = pd.to_datetime(
+        df2["Fecha"].astype(str).str.strip(),
+        format="%d-%m-%Y", errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+
+    # Monto numérico (acepta $ . ,)
+    df2["Monto"] = (
+        df2["Monto"].astype(str)
+            .str.replace("$", "", regex=False)
+            .str.replace(" ", "", regex=False)
+            .str.replace(".", "", regex=False)   # miles
+            .str.replace(",", ".", regex=False)  # decimal
+    )
+    df2["Monto"] = pd.to_numeric(df2["Monto"], errors="coerce")
+
+    # Filtrar filas válidas y casilleros conocidos
+    df2 = df2.dropna(subset=["Fecha", "Monto"])
+    df2 = df2[df2["Casillero"].isin(casilleros_validos)].copy()
+
+    # Orden de columnas alineado a tu esquema (manteniendo Motivo)
+    cols = ["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Motivo","Nombre del producto"]
+    df2 = df2[cols]
+
+    # Dict por casillero
+    salida = {}
+    for cas in sorted(df2["Casillero"].unique()):
+        salida[f"envios_{cas}"] = df2[df2["Casillero"] == cas].reset_index(drop=True)
+
+    return salida
+
+
+
+
+
+
+
+
+
 @st.cache_data
 
 def procesar_devoluciones(hojas: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
@@ -1237,6 +1303,37 @@ def main():
     
     
     
+    st.markdown("---")
+    st.header("3.1) Envios mayoristas (nuevo archivo unificado)")
+
+    envios_may_file = st.file_uploader(
+        "Sube el archivo 'Envios mayoristas' (hoja: 'Mayoristas')",
+        type=["xls","xlsx"],
+        key="envios_mayoristas_uploader"
+    )
+
+    envios_may = {}  # dict global para usar después en conciliaciones
+
+    if envios_may_file:
+        try:
+            df_env = pd.read_excel(envios_may_file, sheet_name="Mayoristas")
+        except Exception as e:
+            st.error(f"❌ No se pudo leer la hoja 'Mayoristas': {e}")
+            df_env = None
+
+        if df_env is not None:
+            envios_may = procesar_envios_mayoristas(df_env)
+            if not envios_may:
+                st.info("No se encontraron filas válidas o casilleros conocidos.")
+            else:
+                tabs_env = st.tabs(list(envios_may.keys()))
+                for tab, key in zip(tabs_env, envios_may):
+                    with tab:
+                        st.dataframe(envios_may[key], use_container_width=True)
+    else:
+        st.info("📂 Aún no subes 'Envios mayoristas'")
+
+    
 
     # 3) Ingresos Nathalia Ospina (CA1633)
     st.header("4) Ingresos Nathalia Ospina (CA1633)")
@@ -1428,16 +1525,15 @@ def main():
 
     casilleros = ["9444", "14856", "11591", "1444", "1633", "13608"]
     conciliaciones = {}
-    
+
     for cas in casilleros:
         key_ing = f"ingresos_{cas}"
-    
-        # 2) Obtener cada fuente de ingresos en orden de prioridad
+
         ing_j = ingresos_jul.get(key_ing)
         ing_n = ingresos_nath.get(key_ing)
         ing_e = ingresos_elv.get(key_ing)
         ing_m = ingresos_moises.get(key_ing)
-    
+
         if ing_j is not None and not ing_j.empty:
             inc = ing_j
         elif ing_n is not None and not ing_n.empty:
@@ -1516,24 +1612,27 @@ def main():
         key_dev = f"devoluciones_{cas}"
         dev = devoluciones.get(key_dev) if 'devoluciones' in locals() else None  # guard contra que no exista el dict
     
+        # >>> NUEVO: ENVIOS MAYORISTAS por casillero <<<
+        env = envios_may.get(f"envios_{cas}") if 'envios_may' in locals() else None
+
         # 3) Armar la lista de DataFrames válidos
         frames = []
-        for df in (inc, egr, ext):
+        for df in (inc, egr, ext, env):  # << añade env aquí
             if df is not None and not df.empty:
                 frames.append(df)
-    
+
         if gmf_df is not None and not gmf_df.empty:
             frames.append(gmf_df)
-    
-        # <<< NUEVO: agregar devoluciones si hay
+
         if dev is not None and not dev.empty:
             frames.append(dev)
-    
+
         # 4) Guardar la conciliación (si no hay nada, vacío)
         if frames:
             conciliaciones[f"conciliacion_{cas}"] = pd.concat(frames, ignore_index=True)
         else:
             conciliaciones[f"conciliacion_{cas}"] = pd.DataFrame()
+
     
     # 5) Mostrar en pestañas
     tabs5 = st.tabs(list(conciliaciones.keys()))
