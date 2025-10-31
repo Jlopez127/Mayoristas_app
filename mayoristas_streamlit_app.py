@@ -142,27 +142,21 @@ def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     df2["Motivo"] = df2["Motivo"].astype(str).str.strip().replace({"": "Envio"})
     df2["Nombre del producto"] = df2["Nombre del producto"].astype(str).str.strip()
 
-    # >>> Fecha dd-mm-YYYY -> YYYY-MM-DD (string consistente con el resto de la app)
+    # Fecha dd-mm-YYYY -> YYYY-MM-DD
     df2["Fecha"] = pd.to_datetime(
         df2["Fecha"].astype(str).str.strip(),
-        format="%d-%m-%Y", errors="coerce"
+        format="%d-%m-%Y",
+        errors="coerce"
     ).dt.strftime("%Y-%m-%d")
 
-    # Monto numérico (acepta $ . ,)
-    df2["Monto"] = (
-        df2["Monto"].astype(str)
-            .str.replace("$", "", regex=False)
-            .str.replace(" ", "", regex=False)
-            .str.replace(".", "", regex=False)   # miles
-            .str.replace(",", ".", regex=False)  # decimal
-    )
-    df2["Monto"] = pd.to_numeric(df2["Monto"], errors="coerce")
+    # 🚩 AQUÍ el cambio: monto viene limpio → solo convertir a entero
+    df2["Monto"] = pd.to_numeric(df2["Monto"], errors="coerce").astype(int)
 
     # Filtrar filas válidas y casilleros conocidos
     df2 = df2.dropna(subset=["Fecha", "Monto"])
     df2 = df2[df2["Casillero"].isin(casilleros_validos)].copy()
 
-    # Orden de columnas alineado a tu esquema (manteniendo Motivo)
+    # Orden de columnas
     cols = ["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Motivo","Nombre del producto"]
     df2 = df2[cols]
 
