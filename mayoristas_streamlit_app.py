@@ -271,129 +271,130 @@ def procesar_devoluciones(hojas: dict[str, pd.DataFrame]) -> dict[str, pd.DataFr
 
 
 
-# 1) Tu función original para los .xls (TSV renombrado)
-def procesar_ingresos_clientes_xls(files: list[bytes], usuario: str, casillero: str) -> pd.DataFrame:
-      dfs = []
-      for up in files:
-          df = pd.read_csv(up, sep="\t", encoding="latin-1", engine="python")
-          df["Archivo_Origen"] = up.name
-          dfs.append(df)
-      if not dfs:
-          return pd.DataFrame()
-      df = pd.concat(dfs, ignore_index=True)
-      df["REFERENCIA"] = df["REFERENCIA"].fillna(df.get("DESCRIPCIÓN",""))
-      df = df.dropna(how="all", axis=1)
-      df["FECHA"] = pd.to_datetime(df["FECHA"], format="%Y/%m/%d", errors="coerce")
-      df["VALOR"] = df["VALOR"].astype(str).str.replace(",","").astype(float)
-      df["Tipo"] = "Ingreso"
-      df["Orden"] = ""
-      df["Usuario"] = usuario
-      df["Casillero"] = casillero
-      df["Estado de Orden"] = ""
-      out = df.rename(columns={
-          "FECHA":"Fecha",
-          "VALOR":"Monto",
-          "REFERENCIA":"Nombre del producto"
-      })[["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Estado de Orden","Nombre del producto"]]
-      out = out[out["Nombre del producto"]!="ABONO INTERESES AHORROS"]
-      out = out[out["Monto"]>0]
-      try:
-          fmax = out["Fecha"].max().strftime("%Y-%m-%d")
-          url = f"https://www.datos.gov.co/resource/mcec-87by.json?vigenciadesde={fmax}T00:00:00.000"
-          data = requests.get(url).json()
-          trm = float(data[0]["valor"]) if data and "valor" in data[0] else None
-      except:
-          trm = None
-      out["TRM"] = trm
-      return out.reset_index(drop=True)
+from pathlib import Path
+import pandas as pd
+import requests
+import hashlib
 
-# 2) Nueva función para CSV “reales”
-def procesar_ingresos_clientes_csv(files: list[bytes], usuario: str, casillero: str) -> pd.DataFrame:
-    dfs = []
-    for up in files:
-        contenido = up.read() if hasattr(up, "read") else up
-        fname = getattr(up, "name", "archivo_sin_nombre")
-        
-        texto = None
-        for codec in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
-            try:
-                texto = contenido.decode(codec)
-                break
-            except UnicodeDecodeError:
-                continue
-        
-        if texto is None:
-            import streamlit as st
-            st.warning(f"⚠️ No se pudo decodificar '{fname}' con utf-8 / utf-8-sig / latin-1 / cp1252. Se omite.")
-            continue
-        
-        buf = io.StringIO(texto)
-        df = pd.read_csv(buf, header=None, sep=",")  # <- ya no pases 'encoding'
+def leer_ingresos_archivo(up) -> pd.DataFrame:
+    """Lee el archivo subido (tsv renombrado) y aplica el filtro por fecha en el nombre si existe."""
+    df = pd.read_csv(up, sep="\t", encoding="latin-1", engine="python")
 
-        # Normalizar a 10 columnas (acepta 9 o 10)
-        if df.shape[1] == 9:
-            df["DESCONOCIDA_6"] = None  # agrega columna vacía al final
-        elif df.shape[1] != 10:
-            import streamlit as st
-            fname = getattr(up, "name", "archivo_sin_nombre")
-            st.warning(f"⚠️ '{fname}' tiene {df.shape[1]} columnas (esperaba 9 o 10). Se omite.")
-            continue
+    # nombre del archivo
+    nombre_archivo = up.name if hasattr(up, "name") else "desconocido"
+    stem = Path(nombre_archivo).stem
+    partes = stem.split()
 
-        # Esquema fijo de 10 columnas
-        df.columns = [
-            "DESCRIPCIÓN", "DESCONOCIDA_1", "DESCONOCIDA_2", "FECHA",
-            "DESCONOCIDA_3", "VALOR", "DESCONOCIDA_4", "REFERENCIA",
-            "DESCONOCIDA_5", "DESCONOCIDA_6"
-        ]
-        df["Archivo_Origen"] = getattr(up, "name", "archivo_sin_nombre")
-        dfs.append(df)
+    # 1) fecha del nombre
+    fecha_archivo = None
+    if partes:
+        posible_fecha = partes[0]   # '20251030'
+        try:
+            fecha_archivo = pd.to_datetime(posible_fecha, format="%Y%m%d").date()
+        except Exception:
+            fecha_archivo = None
 
-    if not dfs:
-        return pd.DataFrame()
+    # 2) banco (última palabra)
+    banco = partes[-1] if len(partes) >= 2 else "desconocido"
 
-    df = pd.concat(dfs, ignore_index=True)
+    # parsear fecha de la columna
+    df["FECHA"] = pd.to_datetime(df["FECHA"], format="%Y/%m/%d", errors="coerce").dt.date
 
-    # Completar REFERENCIA con DESCRIPCIÓN si viene vacía
+    # FILTRO: si el nombre traía fecha → solo esas filas
+    if fecha_archivo is not None:
+        df = df[df["FECHA"] == fecha_archivo].copy()
+
+    # guardar origen
+    df["Archivo_Origen"] = nombre_archivo
+    df["Banco_Origen"] = banco
+
+    # opcional: número de línea para hacer ID más estable
+    df["Linea_Origen"] = df.reset_index().index
+
+    return df
+
+
+def normalizar_ingresos(df: pd.DataFrame, usuario: str, casillero: str) -> pd.DataFrame:
+    """Lleva el df leído al formato estándar tuyo."""
+    # completar referencia
     df["REFERENCIA"] = df["REFERENCIA"].fillna(df.get("DESCRIPCIÓN", ""))
 
-    # Eliminar columnas completamente vacías
+    # quitar columnas vacías
     df = df.dropna(how="all", axis=1)
 
-    # ---- Fecha con fallback por fila ----
-    fechas_raw = df["FECHA"].astype(str).str.strip().str.zfill(8)
-    f1 = pd.to_datetime(fechas_raw, format="%Y%m%d", errors="coerce")   # nuevo formato
-    f2 = pd.to_datetime(fechas_raw, format="%d%m%Y", errors="coerce")   # formato viejo
-    df["FECHA"] = f1.fillna(f2)
-    # ------------------------------------
+    # volver a datetime normal
+    df["Fecha"] = pd.to_datetime(df["FECHA"], errors="coerce")
 
-    # LIMPIEZA DE VALOR
-    df["VALOR"] = (
-        df["VALOR"]
-        .astype(str)
-        .str.replace(",", "", regex=False)  # elimina separador de miles si aparece
-        .str.strip()
-        .astype(float)
+    # monto
+    df["Monto"] = (
+        df["VALOR"].astype(str).str.replace(",", "", regex=False).astype(float)
     )
 
-    # Enriquecimiento
     df["Tipo"] = "Ingreso"
-    df["Orden"] = ""
+    df["Orden"] = ""   # lo llenamos luego si quieres
     df["Usuario"] = usuario
     df["Casillero"] = casillero
     df["Estado de Orden"] = ""
 
-    # Renombrar y seleccionar columnas finales
-    out = df.rename(columns={
-        "FECHA": "Fecha",
-        "VALOR": "Monto",
+    out = df[[
+        "Fecha",
+        "Tipo",
+        "Monto",
+        "Orden",
+        "Usuario",
+        "Casillero",
+        "Estado de Orden",
+        "REFERENCIA",
+        "Archivo_Origen",
+        "Banco_Origen",
+        "Linea_Origen",
+    ]].rename(columns={
         "REFERENCIA": "Nombre del producto"
-    })[["Fecha", "Tipo", "Monto", "Orden", "Usuario", "Casillero", "Estado de Orden", "Nombre del producto"]]
+    })
 
-    # Filtros de negocio
+    # tus filtros
     out = out[out["Nombre del producto"] != "ABONO INTERESES AHORROS"]
     out = out[out["Monto"] > 0]
 
-    # TRM desde datos.gov.co (si posible)
+    return out
+
+
+def generar_id_ingreso(df: pd.DataFrame) -> pd.DataFrame:
+    """Genera un ID determinista por fila usando archivo + línea + fecha + monto + banco."""
+    fecha_str = df["Fecha"].dt.strftime("%Y%m%d").fillna("")
+    monto_str = df["Monto"].round(2).astype(str)
+    banco_str = df["Banco_Origen"].astype(str).str.strip()
+    arch_str  = df["Archivo_Origen"].astype(str)
+    linea_str = df["Linea_Origen"].astype(str)
+
+    bases = (
+        arch_str + "|" +
+        linea_str + "|" +
+        fecha_str + "|" +
+        monto_str + "|" +
+        banco_str
+    )
+
+    df["ID_INGRESO"] = bases.apply(lambda x: hashlib.sha1(x.encode("utf-8")).hexdigest())
+    return df
+
+
+def procesar_ingresos_clientes_xls(files: list, usuario: str, casillero: str) -> pd.DataFrame:
+    dfs = []
+    for up in files:
+        df_raw  = leer_ingresos_archivo(up)
+        df_norm = normalizar_ingresos(df_raw, usuario, casillero)
+        dfs.append(df_norm)
+
+    if not dfs:
+        return pd.DataFrame()
+
+    out = pd.concat(dfs, ignore_index=True)
+
+    # generar IDs
+    out = generar_id_ingreso(out)
+
+    # traer TRM (como lo hacías)
     try:
         fmax = out["Fecha"].max().strftime("%Y-%m-%d")
         url = f"https://www.datos.gov.co/resource/mcec-87by.json?vigenciadesde={fmax}T00:00:00.000"
@@ -401,29 +402,188 @@ def procesar_ingresos_clientes_csv(files: list[bytes], usuario: str, casillero: 
         trm = float(data[0]["valor"]) if data and "valor" in data[0] else None
     except Exception:
         trm = None
-
     out["TRM"] = trm
+
     return out.reset_index(drop=True)
 
-# 3) Pipeline común (extrae tu lógica de post-procesamiento)
-def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: str, casillero: str) -> pd.DataFrame:
+
+
+from pathlib import Path
+import io
+import pandas as pd
+import streamlit as st
+import requests
+
+def procesar_ingresos_clientes_csv(files: list, usuario: str, casillero: str) -> pd.DataFrame:
+    dfs = []
+    for up in files:
+        # ---------- 1. Nombre, fecha y banco desde el nombre ----------
+        fname = getattr(up, "name", "archivo_sin_nombre")
+        stem = Path(fname).stem                  # ej. '20251030 Julian Bancolombia'
+        partes = stem.split()
+
+        # fecha del nombre
+        fecha_archivo = None
+        if partes:
+            posible_fecha = partes[0]            # '20251030'
+            try:
+                fecha_archivo = pd.to_datetime(posible_fecha, format="%Y%m%d").date()
+            except Exception:
+                fecha_archivo = None
+
+        # banco (última palabra)
+        banco_archivo = partes[-1] if len(partes) >= 2 else "desconocido"
+
+        # ---------- 2. Leer el CSV en memoria con distintos encodings ----------
+        contenido = up.read() if hasattr(up, "read") else up
+
+        texto = None
+        for codec in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+            try:
+                texto = contenido.decode(codec)
+                break
+            except UnicodeDecodeError:
+                continue
+
+        if texto is None:
+            st.warning(f"⚠️ No se pudo decodificar '{fname}'. Se omite.")
+            continue
+
+        buf = io.StringIO(texto)
+        df = pd.read_csv(buf, header=None, sep=",")
+
+        # ---------- 3. Normalizar a 10 columnas ----------
+        if df.shape[1] == 9:
+            df["DESCONOCIDA_6"] = None
+        elif df.shape[1] != 10:
+            st.warning(f"⚠️ '{fname}' tiene {df.shape[1]} columnas (esperaba 9 o 10). Se omite.")
+            continue
+
+        df.columns = [
+            "DESCRIPCIÓN", "DESCONOCIDA_1", "DESCONOCIDA_2", "FECHA",
+            "DESCONOCIDA_3", "VALOR", "DESCONOCIDA_4", "REFERENCIA",
+            "DESCONOCIDA_5", "DESCONOCIDA_6"
+        ]
+
+        # ---------- 4. Parsear fechas de la columna FECHA ----------
+        fechas_raw = df["FECHA"].astype(str).str.strip().str.zfill(8)
+        f1 = pd.to_datetime(fechas_raw, format="%Y%m%d", errors="coerce")
+        f2 = pd.to_datetime(fechas_raw, format="%d%m%Y", errors="coerce")
+        df["FECHA"] = f1.fillna(f2).dt.date
+
+        # ---------- 5. FILTRO por la fecha del nombre ----------
+        if fecha_archivo is not None:
+            df = df[df["FECHA"] == fecha_archivo].copy()
+
+        # ---------- 6. Guardar origen ----------
+        df["Archivo_Origen"] = fname
+        df["Banco_Origen"] = banco_archivo
+        df["Linea_Origen"] = df.reset_index().index  # lo dejamos por si lo quieres usar luego
+
+        dfs.append(df)
+
+    if not dfs:
+        return pd.DataFrame()
+
+    df = pd.concat(dfs, ignore_index=True)
+
+    # ---------- 7. Completar referencia ----------
+    df["REFERENCIA"] = df["REFERENCIA"].fillna(df.get("DESCRIPCIÓN", ""))
+
+    # ---------- 8. Limpiar ----------
+    df = df.dropna(how="all", axis=1)
+
+    df["Fecha"] = pd.to_datetime(df["FECHA"], errors="coerce")
+
+    # LIMPIEZA DE VALOR
+    df["VALOR"] = (
+        df["VALOR"]
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+        .astype(float)
+    )
+
+    # ---------- 9. Crear ID legible con consecutivo ----------
+    fecha_str  = df["Fecha"].dt.strftime("%Y%m%d").fillna("")
+    monto_str  = df["VALOR"].round(2).astype(str)
+    usuario_str = str(usuario).strip()
+    banco_str  = df["Banco_Origen"].astype(str).str.strip()
+
+    df["ID_BASE"] = (
+        fecha_str + "-" +
+        monto_str + "-" +
+        usuario_str + "-" +
+        banco_str
+    )
+
+    contadores = {}
+    ids = []
+    for base in df["ID_BASE"]:
+        n = contadores.get(base, 0) + 1
+        contadores[base] = n
+        ids.append(f"{base}-{n}")
+
+    df["ID_INGRESO"] = ids
+    df["Orden"] = df["ID_INGRESO"]
+
+    # ---------- 10. Armar salida ----------
+    df["Tipo"] = "Ingreso"
+    df["Usuario"] = usuario
+    df["Casillero"] = casillero
+    df["Estado de Orden"] = ""
+
+    out = df.rename(columns={
+        "VALOR": "Monto",
+        "REFERENCIA": "Nombre del producto"
+    })[[
+        "Fecha",
+        "Tipo",
+        "Monto",
+        "Orden",
+        "Usuario",
+        "Casillero",
+        "Estado de Orden",
+        "Nombre del producto",
+        "Archivo_Origen",
+        "Banco_Origen",
+        "ID_INGRESO"
+    ]]
+
+    # ---------- 11. Filtros de negocio ----------
+    out = out[out["Nombre del producto"] != "ABONO INTERESES AHORROS"]
+    out = out[out["Monto"] > 0]
+
+    # ---------- 12. TRM ----------
+    try:
+        fmax = out["Fecha"].max().strftime("%Y-%m-%d")
+        url = f"https://www.datos.gov.co/resource/mcec-87by.json?vigenciadesde={fmax}T00:00:00.000"
+        data = requests.get(url).json()
+        trm = float(data[0]["valor"]) if data and "valor" in data[0] else None
+    except Exception:
+        trm = None
+    out["TRM"] = trm
+
+    return out.reset_index(drop=True)
+
+
+from pathlib import Path
+import io
+import pandas as pd
+import requests
+
+def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casillero: str) -> pd.DataFrame:
     """
     1444 (María Moises)
     - Lee CSVs bancarios.
-    - (Opcional) Netea egresos extra en COP por fecha (cargados por el usuario).
-    - Aplica GMF 4x1000 diario (0.4%) sobre los COP del día ANTES de convertir a USD.
-    - AVISOS:
-        * Total: 'Saldo disponible en COP (esta carga): $X'
-        * Detalle diario: '📅 <día> de <mes>: $Y COP disponibles' (si hay varios días).
-    - Convierte SOLO el neto a USD con TRM diaria (TRM+100).
-    - Si falta COP para cubrir egresos extra del día, muestra advertencia.
-    - Guarda un log paralelo en st.session_state["1444_movimientos_cop"].
+    - Filtra por la fecha que viene en el nombre del archivo (ej. '20251030 Maria Bancolombia.csv').
+    - Genera un ID legible: YYYYMMDD-monto-usuario-banco-n.
+    - (Opcional) Netea egresos extra en COP por fecha.
+    - Aplica GMF 4x1000 por día.
+    - Convierte a USD con TRM diaria (TRM+100).
+    - Deja log en st.session_state["1444_movimientos_cop"].
     """
-    import io
-    import pandas as pd
-    import requests
-
-    # ---- Streamlit (stub si no hay) ----
+    # ---- Streamlit (stub si no hay, para que no reviente en modo script) ----
     try:
         import streamlit as st
     except Exception:
@@ -443,12 +603,29 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
             def caption(self, *a, **k): pass
         st = _Stub()
 
-    # ------------------ Lectura robusta CSV (Bancolombia) ------------------
+    # =========================================================
+    # 1) LECTURA DE LOS CSVs (Bancolombia) + FILTRO POR FECHA
+    # =========================================================
     dfs = []
     for up in files:
         contenido = up.read() if hasattr(up, "read") else up
         fname = getattr(up, "name", "archivo_sin_nombre")
 
+        # --- detectar fecha y banco del nombre ---
+        stem = Path(fname).stem                # ej. '20251030 Maria Bancolombia'
+        partes = stem.split()
+
+        fecha_archivo = None
+        if partes:
+            posible_fecha = partes[0]
+            try:
+                fecha_archivo = pd.to_datetime(posible_fecha, format="%Y%m%d").date()
+            except Exception:
+                fecha_archivo = None
+
+        banco_archivo = partes[-1] if len(partes) >= 2 else "desconocido"
+
+        # --- decodificación robusta ---
         texto = None
         for codec in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
             try:
@@ -463,6 +640,7 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
         buf = io.StringIO(texto)
         df = pd.read_csv(buf, header=None, sep=",")
 
+        # --- normalizar a 10 columnas ---
         if df.shape[1] == 9:
             df["DESCONOCIDA_6"] = None
         elif df.shape[1] != 10:
@@ -474,27 +652,46 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
             "DESCONOCIDA_3", "VALOR", "DESCONOCIDA_4", "REFERENCIA",
             "DESCONOCIDA_5", "DESCONOCIDA_6"
         ]
+
+        # --- parsear fecha interna del CSV ---
+        fechas_raw = (
+            df["FECHA"].astype(str).str.strip()
+            .str.replace(r"[^\d]", "", regex=True)
+            .str.zfill(8)
+        )
+        f1 = pd.to_datetime(fechas_raw, format="%Y%m%d", errors="coerce")
+        f2 = pd.to_datetime(fechas_raw, format="%d%m%Y", errors="coerce")
+        df["FECHA"] = f1.fillna(f2)
+
+        # --- FILTRO por la fecha del NOMBRE ---
+        if fecha_archivo is not None:
+            df = df[df["FECHA"].dt.date == fecha_archivo].copy()
+
+        # --- guardar origen ---
         df["Archivo_Origen"] = fname
+        df["Banco_Origen"] = banco_archivo
+
         dfs.append(df)
 
+    # si no hubo nada legible
     if not dfs:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=[
+            "Fecha","Tipo","Monto","Orden","Usuario","Casillero",
+            "Estado de Orden","Nombre del producto","TRM",
+            "Archivo_Origen","Banco_Origen","ID_INGRESO"
+        ])
 
+    # =========================================================
+    # 2) CONCATENAR Y CREAR ID LE-GI-BLE  (ANTES DE NETEOS)
+    # =========================================================
     df = pd.concat(dfs, ignore_index=True)
+
+    # completar referencia
     df["REFERENCIA"] = df["REFERENCIA"].fillna(df.get("DESCRIPCIÓN", ""))
+    # limpiar columnas vacías
     df = df.dropna(how="all", axis=1)
 
-    # ---- Fecha ----
-    fechas_raw = (
-        df["FECHA"].astype(str).str.strip()
-        .str.replace(r"[^\d]", "", regex=True)
-        .str.zfill(8)
-    )
-    f1 = pd.to_datetime(fechas_raw, format="%Y%m%d", errors="coerce")
-    f2 = pd.to_datetime(fechas_raw, format="%d%m%Y", errors="coerce")
-    df["FECHA"] = f1.fillna(f2)
-
-    # ---- Valor COP ----
+    # valor COP
     df["VALOR"] = (
         df["VALOR"].astype(str)
         .str.replace(",", "", regex=False)
@@ -502,6 +699,34 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
         .replace({"": None})
         .astype(float)
     )
+
+    # ---- ID legible ----
+    # fecha, monto, usuario, banco
+    fecha_str   = df["FECHA"].dt.strftime("%Y%m%d").fillna("")
+    monto_str   = df["VALOR"].round(2).astype(str)
+    usuario_str = str(usuario).strip()
+    banco_str   = df["Banco_Origen"].astype(str).str.strip()
+
+    df["ID_BASE"] = (
+        fecha_str + "-" +
+        monto_str + "-" +
+        usuario_str + "-" +
+        banco_str
+    )
+
+    # consecutivo sin groupby (rápido)
+    contadores = {}
+    ids = []
+    for base in df["ID_BASE"]:
+        n = contadores.get(base, 0) + 1
+        contadores[base] = n
+        ids.append(f"{base}-{n}")
+    df["ID_INGRESO"] = ids
+
+    # =========================================================
+    # 3) A PARTIR DE AQUÍ ES TU PIPELINE 1444
+    # =========================================================
+
     # ===== Filtro INICIAL (ANTES de netear/GMF) =====
     mask_interes = df["REFERENCIA"].astype(str).str.strip().str.upper().eq("ABONO INTERESES AHORROS")
     mask_pos     = pd.to_numeric(df["VALOR"], errors="coerce").fillna(0) > 0
@@ -516,9 +741,18 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
         pass
 
     if usar_extras:
-        modo = st.radio("Cómo cargar egresos extra", ["Escribir manualmente", "Subir CSV"], index=0, horizontal=True, key="eg_extra_1444_modo")
+        modo = st.radio(
+            "Cómo cargar egresos extra",
+            ["Escribir manualmente", "Subir CSV"],
+            index=0, horizontal=True,
+            key="eg_extra_1444_modo"
+        )
         if modo == "Subir CSV":
-            up_ex = st.file_uploader("CSV con columnas: Fecha, Monto (o Valor), Descripcion (opcional)", type=["csv"], key="eg_extras_1444_csv")
+            up_ex = st.file_uploader(
+                "CSV con columnas: Fecha, Monto (o Valor), Descripcion (opcional)",
+                type=["csv"],
+                key="eg_extras_1444_csv"
+            )
             if up_ex is not None:
                 try:
                     tmp = pd.read_csv(up_ex)
@@ -538,8 +772,17 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
                     st.warning(f"⚠️ No se pudo leer el CSV de egresos extra: {e}")
         else:
             with st.expander("➕ Egresos extra manuales (COP)", expanded=True):
-                plantilla = pd.DataFrame({"Fecha": [pd.Timestamp.today().date()], "Monto_COP": [0.0], "Descripcion": [""]})
-                egresos_extra = st.data_editor(plantilla, num_rows="dynamic", use_container_width=True, key="eg_extra_1444_editor")
+                plantilla = pd.DataFrame({
+                    "Fecha": [pd.Timestamp.today().date()],
+                    "Monto_COP": [0.0],
+                    "Descripcion": [""]
+                })
+                egresos_extra = st.data_editor(
+                    plantilla,
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    key="eg_extra_1444_editor"
+                )
                 if not egresos_extra.empty:
                     egresos_extra["Fecha"] = pd.to_datetime(egresos_extra["Fecha"], errors="coerce").dt.date
                     egresos_extra["Monto_COP"] = pd.to_numeric(egresos_extra["Monto_COP"], errors="coerce").abs()
@@ -548,11 +791,17 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
 
     # ========= Neteo diario en COP =========
     df_neteo = df_base.copy()
-
     df_neteo["FECHA_DATE"] = df_neteo["FECHA"].dt.date
 
-    ingresos_por_dia = df_neteo.groupby("FECHA_DATE")["VALOR"].sum(min_count=1).fillna(0.0)
-    extras_por_dia = egresos_extra.groupby("Fecha")["Monto_COP"].sum().astype(float) if not egresos_extra.empty else pd.Series(dtype="float64")
+    ingresos_por_dia = (
+        df_neteo.groupby("FECHA_DATE")["VALOR"]
+        .sum(min_count=1)
+        .fillna(0.0)
+    )
+    extras_por_dia = (
+        egresos_extra.groupby("Fecha")["Monto_COP"].sum().astype(float)
+        if not egresos_extra.empty else pd.Series(dtype="float64")
+    )
 
     log_rows = []
     if not extras_por_dia.empty:
@@ -562,14 +811,16 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
             cop_convertible = float(max(0.0, ingreso_dia - egreso_cop))
             egreso_pendiente = float(max(0.0, egreso_cop - ingreso_dia))
 
-            # Netear filas del día
+            # netear filas del día
             if ingreso_dia > 0.0:
                 idxs = df_neteo.index[df_neteo["FECHA_DATE"] == fecha].tolist()
                 restante = egreso_cop
                 for idx in idxs:
-                    if restante <= 0: break
+                    if restante <= 0:
+                        break
                     val = float(df_neteo.at[idx, "VALOR"] or 0.0)
-                    if val <= 0: continue
+                    if val <= 0:
+                        continue
                     if val <= restante:
                         restante -= val
                         df_neteo.at[idx, "VALOR"] = 0.0
@@ -589,19 +840,21 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
                 "Egreso_pendiente_COP": egreso_pendiente,
                 "TRM_del_dia": None,
                 "USD_generado": None,
-                "Aviso": ("DEBE ${:,.0f} COP — Cargar mañana".format(egreso_pendiente) if egreso_pendiente > 0 else "")
+                "Aviso": (
+                    f"DEBE ${egreso_pendiente:,.0f} COP — Cargar mañana"
+                    if egreso_pendiente > 0 else ""
+                )
             })
 
-        # Eliminar filas que quedaron en 0
+        # quitar filas en 0
         df_neteo = df_neteo[df_neteo["VALOR"].fillna(0.0) > 0.0].copy()
 
-    # ========= GMF 4x1000 (COP) por día (aplicar ANTES de convertir a USD) =========
+    # ========= GMF 4x1000 =========
     GMF_RATE = 0.004
-
     gmf_por_dia = {}
     ingresos_pre_gmf = pd.Series(dtype="float64")
+
     if not df_neteo.empty:
-        # Total del día ANTES de GMF (para log)
         ingresos_pre_gmf = (
             pd.to_numeric(df_neteo["VALOR"], errors="coerce")
             .groupby(df_neteo["FECHA_DATE"])
@@ -609,13 +862,12 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
             .fillna(0.0)
         )
 
-        # Restar GMF del total del día, repartiendo sobre las filas del día
         for fecha, total_cop in ingresos_pre_gmf.items():
             total_cop = float(total_cop or 0.0)
             if total_cop <= 0:
                 continue
 
-            gmf = round(total_cop * GMF_RATE, 2)  # 0.4%
+            gmf = round(total_cop * GMF_RATE, 2)
             restante = gmf
             idxs = df_neteo.index[df_neteo["FECHA_DATE"] == fecha].tolist()
             for idx in idxs:
@@ -633,10 +885,12 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
 
             gmf_por_dia[fecha] = gmf
 
-        # Quita filas que quedaron en 0 por el GMF
-        df_neteo = df_neteo[pd.to_numeric(df_neteo["VALOR"], errors="coerce").fillna(0.0) > 0.0].copy()
+        # limpiar ceros
+        df_neteo = df_neteo[
+            pd.to_numeric(df_neteo["VALOR"], errors="coerce").fillna(0.0) > 0.0
+        ].copy()
 
-    # Para el log: total del día DESPUÉS de GMF (lo que sí se convierte a USD)
+    # después del GMF
     ingresos_post_gmf = (
         pd.to_numeric(df_neteo["VALOR"], errors="coerce")
         .groupby(df_neteo["FECHA_DATE"])
@@ -645,7 +899,7 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
         if not df_neteo.empty else pd.Series(dtype="float64")
     )
 
-    # Asegura fila de log por cada fecha con ingresos (aunque no haya egresos extra)
+    # asegurar filas de log
     if not ingresos_pre_gmf.empty:
         fechas_log = {r["Fecha"] for r in log_rows} if log_rows else set()
         for fecha in ingresos_pre_gmf.index:
@@ -662,34 +916,38 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
                     "Aviso": ""
                 })
             else:
-                # Actualiza si ya existía
                 for r in log_rows:
                     if r["Fecha"] == fecha:
                         r["Ingresos_COP_del_dia"] = float(ingresos_pre_gmf.get(fecha, 0.0))
                         r["COP_convertible_a_USD"] = float(ingresos_post_gmf.get(fecha, 0.0))
                         break
 
-    # Añade el GMF al log (como egreso en COP)
+    # añadir GMF al log
     for r in log_rows:
         f = r["Fecha"]
         r["GMF_4x1000_COP"] = float(gmf_por_dia.get(f, 0.0))
 
-    # ---------- Base neteada (extras + GMF) que SÍ se convierte ----------
+    # ---------- Base neteada que sí se convierte ----------
     df_convertible = df_neteo.copy()
 
-    # ======= AVISOS: Total y detalle por día =======
-    disponible_total_cop = float(pd.to_numeric(df_convertible["VALOR"], errors="coerce").sum()) if not df_convertible.empty else 0.0
+    # ======= AVISOS =======
+    disponible_total_cop = float(
+        pd.to_numeric(df_convertible["VALOR"], errors="coerce").sum()
+    ) if not df_convertible.empty else 0.0
     st.info(f"💡 Saldo disponible en COP (esta carga): ${disponible_total_cop:,.0f}")
 
     if not df_convertible.empty:
         disp_por_dia = df_convertible.groupby("FECHA_DATE")["VALOR"].sum()
         if len(disp_por_dia.index) >= 1:
-            meses = {1:"enero",2:"febrero",3:"marzo",4:"abril",5:"mayo",6:"junio",7:"julio",8:"agosto",9:"septiembre",10:"octubre",11:"noviembre",12:"diciembre"}
+            meses = {
+                1:"enero",2:"febrero",3:"marzo",4:"abril",5:"mayo",6:"junio",
+                7:"julio",8:"agosto",9:"septiembre",10:"octubre",11:"noviembre",12:"diciembre"
+            }
             for fecha, valor in sorted(disp_por_dia.items()):
                 if valor > 0:
                     st.caption(f"📅 {fecha.day} de {meses[fecha.month]}: ${valor:,.0f} COP disponibles")
 
-    # ===================== TRM por rango (serie diaria) =====================
+    # ===================== TRM por rango =====================
     try:
         fecha_max_dt = (df_convertible["FECHA"].max() if not df_convertible.empty else df_base["FECHA"].max())
         fecha_max_dt = None if pd.isna(fecha_max_dt) else fecha_max_dt.date()
@@ -735,31 +993,39 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
         df_trm_para_joins = pd.DataFrame(columns=["Fecha", "TRM"])
 
     # ===================== Conversión a USD =====================
+    # si quedó vacío después de netear/GMF
     if df_convertible.empty:
-        # Guardar log (si hay) y devolver vacío
         if log_rows:
             log_df = pd.DataFrame(log_rows).sort_values("Fecha").reset_index(drop=True)
             if not df_trm_para_joins.empty:
                 log_df = log_df.merge(df_trm_para_joins, on="Fecha", how="left")
-                log_df["TRM_del_dia"] = log_df["TRM"]; log_df.drop(columns=["TRM"], inplace=True, errors="ignore")
+                log_df["TRM_del_dia"] = log_df["TRM"]
+                log_df.drop(columns=["TRM"], inplace=True, errors="ignore")
             st.session_state["1444_movimientos_cop"] = log_df
             with st.expander("📄 1444 movimientos en COP", expanded=False):
                 st.dataframe(log_df, use_container_width=True)
-        cols = ["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Estado de Orden","Nombre del producto","TRM"]
+        cols = [
+            "Fecha","Tipo","Monto","Orden","Usuario","Casillero",
+            "Estado de Orden","Nombre del producto","TRM",
+            "Archivo_Origen","Banco_Origen","ID_INGRESO"
+        ]
         return pd.DataFrame(columns=cols)
 
+    # merge TRM
     df_convertible["Fecha"] = df_convertible["FECHA"].dt.date
     df_convertible = df_convertible.merge(df_trm_para_joins, on="Fecha", how="left")
 
+    # convertir a USD
     df_convertible["VALOR_USD"] = None
     mask_trm = df_convertible["TRM"].notna()
     df_convertible.loc[mask_trm, "VALOR_USD"] = (
         df_convertible.loc[mask_trm, "VALOR"] / (df_convertible.loc[mask_trm, "TRM"] + 100.0)
     )
 
-    # Armar OUT estándar
+    # ========= ARMAR OUT FINAL =========
     df_convertible["Tipo"] = "Ingreso"
-    df_convertible["Orden"] = ""
+    # aquí sí usamos el ID que creamos al inicio 👇
+    df_convertible["Orden"] = df_convertible["ID_INGRESO"]
     df_convertible["Usuario"] = usuario
     df_convertible["Casillero"] = casillero
     df_convertible["Estado de Orden"] = ""
@@ -767,16 +1033,28 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list[bytes], usuario: st
     out = df_convertible.rename(columns={
         "VALOR_USD": "Monto",
         "REFERENCIA": "Nombre del producto"
-    })[["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Estado de Orden","Nombre del producto","TRM"]]
+    })[[
+        "Fecha",
+        "Tipo",
+        "Monto",
+        "Orden",
+        "Usuario",
+        "Casillero",
+        "Estado de Orden",
+        "Nombre del producto",
+        "TRM",
+        "Archivo_Origen",
+        "Banco_Origen",
+        "ID_INGRESO"
+    ]]
 
-
-
-    # Completar log (opcional)
+    # ========= LOG PARA 1444 =========
     if log_rows:
         log_df = pd.DataFrame(log_rows).sort_values("Fecha").reset_index(drop=True)
         if not df_trm_para_joins.empty:
             log_df = log_df.merge(df_trm_para_joins, on="Fecha", how="left")
-            log_df["TRM_del_dia"] = log_df["TRM"]; log_df.drop(columns=["TRM"], inplace=True, errors="ignore")
+            log_df["TRM_del_dia"] = log_df["TRM"]
+            log_df.drop(columns=["TRM"], inplace=True, errors="ignore")
         usd_por_fecha = out.groupby("Fecha")["Monto"].sum().rename("USD_generado")
         log_df = log_df.merge(usd_por_fecha, on="Fecha", how="left")
         st.session_state["1444_movimientos_cop"] = log_df
@@ -1039,9 +1317,8 @@ def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> p
 # === Config de cobros mensuales por casillero (fácil de cambiar) ===
 COBROS_MENSUALES_CONF = {
     # casillero : {"inicio": "YYYY-MM-01", "monto": int}
-    "1633": {"inicio": "2024-02-01", "monto": 711_750}
-    #,
-   # "13608": {"inicio": "2025-11-01", "monto": 500000},
+    "1633": {"inicio": "2024-02-01", "monto": 711_750},
+    "13608": {"inicio": "2025-11-01", "monto": 500000},
 }
 
 def aplicar_cobro_contabilidad_mensual(historico, hoja, casillero, usuario, fecha_carga, inicio_yyyymm, monto, etiqueta_base="cobro contabilidad"):
@@ -1688,17 +1965,31 @@ def main():
             egrs   = combinado[mask_e].drop_duplicates(subset=["Orden", "Tipo"])
             otros  = combinado[~mask_e]
             combinado = pd.concat([otros, egrs], ignore_index=True)
-    
-            # normalizar Monto
-            combinado["Monto"] = pd.to_numeric(combinado["Monto"], errors="coerce")
-    
-            # eliminar duplicados extra (si aplica)
+            
+
+            
+            # eliminar duplicados ingresos (pero NO los Ingreso_extra)
             if "Motivo" in combinado.columns:
-                mask_x = combinado["Motivo"] == "Ingreso_extra"
-                iex    = combinado[mask_x].drop_duplicates(subset=["Orden", "Motivo"])
-                ot     = combinado[~mask_x]
-                combinado = pd.concat([ot, iex], ignore_index=True)
-    
+                mask_ing_base = (combinado["Tipo"] == "Ingreso") & (combinado["Motivo"] != "Ingreso_extra")
+            else:
+                mask_ing_base = (combinado["Tipo"] == "Ingreso")
+            
+            ingr   = combinado[mask_ing_base].drop_duplicates(subset=["Orden", "Tipo"])
+            otros  = combinado[~mask_ing_base]
+            combinado = pd.concat([otros, ingr], ignore_index=True)
+            
+                        # --- deduplicar únicamente Ingreso_extra (si existe 'Motivo') ---
+            if "Motivo" in combinado.columns:
+                mask_x = (combinado["Tipo"].eq("Ingreso") &
+                          combinado["Motivo"].eq("Ingreso_extra"))
+                # conserva un solo registro por Orden–Motivo
+                iex = (combinado.loc[mask_x]
+                       .drop_duplicates(subset=["Orden", "Motivo"]))
+                combinado = pd.concat([combinado.loc[~mask_x], iex], ignore_index=True)
+            
+                        
+            
+                
             # completar ingresos nulos desde egresos por Orden (cuando aplique)
             mask_n = (combinado["Tipo"] == "Ingreso") & combinado["Monto"].isna()
             for i, row in combinado[mask_n].iterrows():
@@ -1729,6 +2020,9 @@ def main():
             min_date = combinado_tx["Fecha"].min()
             today    = pd.Timestamp.today().date()
             days_full = pd.date_range(start=min_date, end=today, freq="D").date
+    
+    
+    
     
             # D) Agregados por día sobre TODO el histórico (global)
             ingresos_d = (combinado_tx[combinado_tx["Tipo"] == "Ingreso"]
