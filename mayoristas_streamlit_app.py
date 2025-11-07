@@ -1221,6 +1221,10 @@ def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> p
     # === SNAPSHOT CRUDO PRE-TRM/GMF/USD para "Ingresos Correal" (Davivienda) ===
     try:
         raw_correal_dav = df_trans.copy()
+        
+        raw_correal_dav = raw_correal_dav[
+            pd.to_numeric(raw_correal_dav["ValorCOP"], errors="coerce").fillna(0) > 0
+        ].copy()
         raw_correal_out_dav = pd.DataFrame({
             "Fecha": pd.to_datetime(raw_correal_dav["Fecha"], errors="coerce").dt.date,
             "Tipo": "Ingreso",
