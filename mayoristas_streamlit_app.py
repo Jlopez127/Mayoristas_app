@@ -725,8 +725,17 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casi
     
     
    # === SNAPSHOT CRUDO PRE-NETEO/GMF/USD para "Ingresos Correal" ===
+# === SNAPSHOT CRUDO PRE-NETEO/GMF/USD para "Ingresos Correal" ===
     try:
         raw_correal = df.copy()
+    
+        # === FILTROS AQUÍ MISMO ===
+        mask_interes = (
+            raw_correal["REFERENCIA"].astype(str).str.strip().str.upper()
+            .eq("ABONO INTERESES AHORROS")
+        )
+        mask_pos = pd.to_numeric(raw_correal["VALOR"], errors="coerce").fillna(0) > 0
+        raw_correal = raw_correal.loc[~mask_interes & mask_pos].copy()
     
         # Normalizar columnas de salida para la hoja “Ingresos Correal”
         raw_correal_out = pd.DataFrame({
@@ -754,12 +763,11 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casi
             else:
                 st.session_state[key_correal] = raw_correal_out
     except Exception as _e:
-        # No bloquear el flujo si algo falla en el snapshot
         try:
             st.warning(f"⚠️ No se pudo preparar snapshot 'Ingresos Correal': {_e}")
         except Exception:
             pass
-        
+            
         
     
 
