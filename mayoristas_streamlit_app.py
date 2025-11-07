@@ -722,6 +722,46 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casi
         contadores[base] = n
         ids.append(f"{base}-{n}")
     df["ID_INGRESO"] = ids
+    
+    
+   # === SNAPSHOT CRUDO PRE-NETEO/GMF/USD para "Ingresos Correal" ===
+    try:
+        raw_correal = df.copy()
+    
+        # Normalizar columnas de salida para la hoja “Ingresos Correal”
+        raw_correal_out = pd.DataFrame({
+            "Fecha": pd.to_datetime(raw_correal["FECHA"], errors="coerce").dt.date,
+            "Tipo": "Ingreso",
+            "MontoCOP": pd.to_numeric(raw_correal["VALOR"], errors="coerce"),
+            "Orden": raw_correal["ID_INGRESO"].astype(str),
+            "Usuario": str(usuario),
+            "Casillero": str(casillero),
+            "Estado de Orden": "",
+            "Nombre del producto": raw_correal["REFERENCIA"].astype(str),
+            "Archivo_Origen": raw_correal["Archivo_Origen"].astype(str),
+            "Banco_Origen": raw_correal["Banco_Origen"].astype(str),
+            "ID_INGRESO": raw_correal["ID_INGRESO"].astype(str)
+        }).dropna(subset=["Fecha", "MontoCOP"])
+    
+        # Acumular en sesión para anexar luego al histórico
+        if hasattr(st, "session_state"):
+            key_correal = "1444_ingresos_correal_raw"
+            if key_correal in st.session_state and isinstance(st.session_state[key_correal], pd.DataFrame):
+                st.session_state[key_correal] = pd.concat(
+                    [st.session_state[key_correal], raw_correal_out],
+                    ignore_index=True
+                )
+            else:
+                st.session_state[key_correal] = raw_correal_out
+    except Exception as _e:
+        # No bloquear el flujo si algo falla en el snapshot
+        try:
+            st.warning(f"⚠️ No se pudo preparar snapshot 'Ingresos Correal': {_e}")
+        except Exception:
+            pass
+        
+        
+    
 
     # =========================================================
     # 3) A PARTIR DE AQUÍ ES TU PIPELINE 1444
@@ -1069,25 +1109,20 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casi
 
 def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> pd.DataFrame:
     """
-    Procesa archivos Excel de Davivienda (UploadedFile de Streamlit).
-    Toma “Descripción motivo” (columna REFERENCIA) como Nombre del producto, 
-    pero si está vacía o nula, utiliza “Referencia 1” como fallback.
-    Devuelve un DataFrame con la misma estructura que la función de Bancolombia.
-
-    EXTRA (solo casillero 1444):
-    - Calcula GMF 4x1000 diario sobre los COP positivos (excluye 'ABONO INTERESES AHORROS')
-      y lo agrega al log compartido: st.session_state["1444_movimientos_cop"].
+    Lee Excels de Davivienda.
+    Genera ID legible: YYYYMMDD-monto-usuario-Davivienda-n (antes de TRM/GMF).
+    Convierte a USD con TRM diaria (+100).
+    Devuelve columnas homogéneas a Bancolombia, con Orden = ID_INGRESO.
     """
     dfs = []
     for up in files:
         try:
-            # 1) Leer Excel directamente
             df_excel = pd.read_excel(up)
         except Exception as e:
             st.warning(f"❌ No se pudo leer '{up.name}' como Excel: {e}")
             continue
 
-        # 2) Renombrar columnas clave
+        # Renombrar columnas clave
         mapeo = {
             "Fecha de Sistema":   "FECHA",
             "Valor Total":        "VALOR",
@@ -1095,123 +1130,162 @@ def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> p
         }
         df_excel = df_excel.rename(columns=mapeo)
 
-        # 3) Verificar columnas mínimas
-        faltantes = [
-            c for c in ["FECHA", "VALOR", "REFERENCIA", "Transacción", "Referencia 1"]
-            if c not in df_excel.columns
-        ]
+        faltantes = [c for c in ["FECHA","VALOR","REFERENCIA","Transacción","Referencia 1"] if c not in df_excel.columns]
         if faltantes:
             st.warning(f"⚠️ En '{up.name}' faltan columnas: {faltantes}. Se omitirá este archivo.")
             continue
 
-        # 4) Convertir FECHA a datetime
-        df_excel["FECHA"] = pd.to_datetime(
-            df_excel["FECHA"],
-            format="%d/%m/%Y",
-            errors="coerce"
-        )
+        # Fecha
+        df_excel["FECHA"] = pd.to_datetime(df_excel["FECHA"], format="%d/%m/%Y", errors="coerce")
         n_nat = int(df_excel["FECHA"].isna().sum())
         if n_nat > 0:
             st.warning(f"⚠️ En '{up.name}', {n_nat} filas tienen FECHA inválida y serán NaT.")
 
-        # 5) Limpiar VALOR: quitar "$", espacios, separador de miles y coma decimal → punto
+        # Valor COP (limpieza)
         df_excel["VALOR"] = (
-            df_excel["VALOR"]
-            .astype(str)
-            .str.replace("$", "",     regex=False)
-            .str.replace(" ", "",     regex=False)
-            .str.replace(".", "",     regex=False)
-            .str.replace(",", ".",    regex=False)
+            df_excel["VALOR"].astype(str)
+            .str.replace("$","",regex=False)
+            .str.replace(" ","",regex=False)
+            .str.replace(".","",regex=False)
+            .str.replace(",",".",regex=False)
         )
         df_excel["VALOR"] = pd.to_numeric(df_excel["VALOR"], errors="coerce")
         n_nanval = int(df_excel["VALOR"].isna().sum())
         if n_nanval > 0:
             st.warning(f"⚠️ En '{up.name}', {n_nanval} filas tienen VALOR inválido (NaN).")
 
-        # 6) Ajustar signo: “Nota Débito” → valor negativo
+        # Nota débito → negativo
         mask_debito = (
-            df_excel["Transacción"]
-            .astype(str)
-            .str.strip()
-            .str.upper() == "NOTA DÉBITO"
+            df_excel["Transacción"].astype(str).str.strip().str.upper() == "NOTA DÉBITO"
         )
         df_excel.loc[mask_debito, "VALOR"] *= -1
 
-        # 7) Construir “Nombre del producto”
+        # Nombre del producto
         def elegir_nombre(row):
             ref = str(row["REFERENCIA"]).strip()
             if ref and ref.upper() != "NAN":
                 return ref
             return str(row["Referencia 1"]).strip()
-
         df_excel["Nombre del producto"] = df_excel.apply(elegir_nombre, axis=1)
 
-        # 8) Selección base (COP y fecha)
+        # Selección base
         df_sel = pd.DataFrame({
             "Fecha": df_excel["FECHA"],
             "ValorCOP": df_excel["VALOR"],
             "Nombre del producto": df_excel["Nombre del producto"],
-            "Archivo_Origen": up.name
-        }).dropna(subset=["Fecha", "ValorCOP"])
+            "Archivo_Origen": up.name,
+        }).dropna(subset=["Fecha","ValorCOP"])
+
+        # Banco fijo para Davivienda
+        df_sel["Banco_Origen"] = "Davivienda"
 
         dfs.append(df_sel)
 
-    # 9) Si no hay nada válido, retornar vacío
     if not dfs:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=[
+            "Fecha","Tipo","Monto","Orden","Usuario","Casillero","Estado de Orden",
+            "Nombre del producto","TRM","Archivo_Origen","Banco_Origen","ID_INGRESO"
+        ])
 
-    # 10) Concatenar transacciones Davivienda limpias
+    # CONCAT
     df_trans = pd.concat(dfs, ignore_index=True)
 
-    # 11) Obtener TRM histórica (misma lógica que Bancolombia)
+    # ====== ID legible (ANTES de TRM/GMF), igual a 1444 Bancolombia ======
+    # YYYYMMDD - monto(COP, 2 dec) - usuario - Davivienda - n
+    fecha_str   = pd.to_datetime(df_trans["Fecha"], errors="coerce").dt.strftime("%Y%m%d").fillna("")
+    monto_str   = pd.to_numeric(df_trans["ValorCOP"], errors="coerce").round(2).astype(str)
+    usuario_str = str(usuario).strip()
+    banco_str   = "Davivienda"
+
+    df_trans["ID_BASE"] = fecha_str + "-" + monto_str + "-" + usuario_str + "-" + banco_str
+
+    contadores = {}
+    ids = []
+    for base in df_trans["ID_BASE"]:
+        n = contadores.get(base, 0) + 1
+        contadores[base] = n
+        ids.append(f"{base}-{n}")
+    df_trans["ID_INGRESO"] = ids
+    # ===============================================================
+    
+    
+    
+    # === SNAPSHOT CRUDO PRE-TRM/GMF/USD para "Ingresos Correal" (Davivienda) ===
     try:
-        fecha_max_tx = df_trans["Fecha"].max().date()
+        raw_correal_dav = df_trans.copy()
+        raw_correal_out_dav = pd.DataFrame({
+            "Fecha": pd.to_datetime(raw_correal_dav["Fecha"], errors="coerce").dt.date,
+            "Tipo": "Ingreso",
+            "MontoCOP": pd.to_numeric(raw_correal_dav["ValorCOP"], errors="coerce"),
+            "Orden": raw_correal_dav["ID_INGRESO"].astype(str),
+            "Usuario": str(usuario),
+            "Casillero": str(casillero),
+            "Estado de Orden": "",
+            "Nombre del producto": raw_correal_dav["Nombre del producto"].astype(str),
+            "Archivo_Origen": raw_correal_dav["Archivo_Origen"].astype(str),
+            "Banco_Origen": "Davivienda",
+            "ID_INGRESO": raw_correal_dav["ID_INGRESO"].astype(str),
+        }).dropna(subset=["Fecha","MontoCOP"])
+    
+        if hasattr(st, "session_state"):
+            key_correal = "1444_ingresos_correal_raw"
+            if key_correal in st.session_state and isinstance(st.session_state[key_correal], pd.DataFrame):
+                st.session_state[key_correal] = pd.concat(
+                    [st.session_state[key_correal], raw_correal_out_dav],
+                    ignore_index=True
+                )
+            else:
+                st.session_state[key_correal] = raw_correal_out_dav
+    except Exception as _e:
+        try:
+            st.warning(f"⚠️ No se pudo preparar snapshot 'Ingresos Correal' (Davivienda): {_e}")
+        except Exception:
+            pass
+    # === /SNAPSHOT CRUDO ===
+
+    
+    
+    
+
+    # TRM histórica
+    try:
+        fecha_max_tx = pd.to_datetime(df_trans["Fecha"], errors="coerce").max().date()
         punto_corte = fecha_max_tx.strftime("%Y-%m-%dT00:00:00.000")
         url = (
             "https://www.datos.gov.co/resource/mcec-87by.json?"
-            f"$where=vigenciadesde <= '{punto_corte}'"
-            "&$order=vigenciadesde DESC"
+            f"$where=vigenciadesde <= '{punto_corte}'&$order=vigenciadesde DESC"
         )
         respuesta = requests.get(url)
         respuesta.raise_for_status()
         lista_trm = respuesta.json()
-
         if not lista_trm:
             st.warning("No se encontraron registros de TRM anteriores o iguales a la fecha máxima.")
-            trm_df = pd.DataFrame(columns=["Fecha", "TRM"])
+            trm_df = pd.DataFrame(columns=["Fecha","TRM"])
         else:
             trm_df = pd.DataFrame(lista_trm)
             trm_df["Fecha"] = pd.to_datetime(trm_df["vigenciadesde"], errors="coerce")
             trm_df["TRM"]   = trm_df["valor"].astype(float)
-            trm_df = trm_df[["Fecha", "TRM"]]
-            trm_df = trm_df.drop_duplicates(subset="Fecha", keep="first")
-            trm_df = trm_df.sort_values("Fecha").reset_index(drop=True)
+            trm_df = trm_df[["Fecha","TRM"]].drop_duplicates(subset="Fecha", keep="first").sort_values("Fecha").reset_index(drop=True)
     except Exception as e:
         st.warning(f"No se pudo obtener TRM: {e}")
-        trm_df = pd.DataFrame(columns=["Fecha", "TRM"])
+        trm_df = pd.DataFrame(columns=["Fecha","TRM"])
 
-    # 12) Merge_asof para asignar TRM a cada transacción
+    # merge_asof TRM
     df_trans = df_trans.sort_values("Fecha").reset_index(drop=True)
     trm_df   = trm_df.sort_values("Fecha").reset_index(drop=True)
+    df_merged = pd.merge_asof(df_trans, trm_df, on="Fecha", direction="backward")
 
-    df_merged = pd.merge_asof(
-        df_trans,
-        trm_df,
-        on="Fecha",
-        direction="backward"
-    )
-
-    # 13) Calcular Monto (en USD)
+    # Monto (USD) usando TRM+100
     df_merged["Monto"] = df_merged["ValorCOP"] / (df_merged["TRM"] + 100)
 
-    # 14) Añadir columnas fijas para homogeneizar con Bancolombia
-    df_merged["Tipo"] = "Ingreso"
-    df_merged["Orden"] = ""
-    df_merged["Usuario"] = usuario
-    df_merged["Casillero"] = casillero
+    # Fijos homogéneos
+    df_merged["Tipo"]        = "Ingreso"
+    df_merged["Orden"]       = df_merged["ID_INGRESO"]   # 👈 igual que Bancolombia 1444
+    df_merged["Usuario"]     = usuario
+    df_merged["Casillero"]   = casillero
     df_merged["Estado de Orden"] = ""
 
-    # 15) DataFrame final con mismas columnas que Bancolombia
+    # Salida con columnas adicionales para consistencia
     out = df_merged[[
         "Fecha",
         "Tipo",
@@ -1221,12 +1295,17 @@ def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> p
         "Casillero",
         "Estado de Orden",
         "Nombre del producto",
-        "TRM"
+        "TRM",
+        "Archivo_Origen",
+        "Banco_Origen",
+        "ID_INGRESO",
     ]]
 
-    # 16) Filtrar movimientos no deseados: “ABONO INTERESES AHORROS” y montos ≤ 0
+    # Filtros de negocio
     out = out[out["Nombre del producto"] != "ABONO INTERESES AHORROS"]
     out = out[out["Monto"] > 0]
+
+
 
     # === GMF 4x1000 -> agregar al MISMO log que 1444 (solo si casillero == "1444") ===
  # === APORTAR INGRESOS COP DE DAVIVIENDA AL MISMO LOG (solo 1444) ===
@@ -2254,6 +2333,81 @@ def main():
                 # Crear la hoja por primera vez
                 historico[sheet_name_cop] = df_log
         # --- /fin anexar hoja COP 1444 ---
+        
+        
+        
+        
+                # --- Anexar/actualizar hoja con snapshot crudo unificado "ingresos_correal_completo" ---
+        SHEET_CORREAL = "ingresos_correal_completo"
+        
+        # 1) Recuperar el acumulado en sesión (Bancolombia + Davivienda), construido en cada función bancaria
+        try:
+            correal_df = st.session_state.get("1444_ingresos_correal_raw", None)
+        except Exception:
+            correal_df = None
+        
+        if isinstance(correal_df, pd.DataFrame) and not correal_df.empty:
+            df_cor = correal_df.copy()
+        
+            # 2) Normalizaciones de tipos y nombres
+            df_cor["Fecha"] = pd.to_datetime(df_cor["Fecha"], errors="coerce").dt.date
+            df_cor["MontoCOP"] = pd.to_numeric(df_cor["MontoCOP"], errors="coerce")
+            for c in ["Tipo","Orden","Usuario","Casillero","Estado de Orden",
+                      "Nombre del producto","Archivo_Origen","Banco_Origen","ID_INGRESO"]:
+                if c in df_cor.columns:
+                    df_cor[c] = df_cor[c].astype(str)
+        
+            # 3) Asegurar columnas base (por si alguna vino ausente en el snapshot)
+            base_cols = [
+                "Fecha","Tipo","MontoCOP","Orden","Usuario","Casillero",
+                "Estado de Orden","Nombre del producto","Archivo_Origen",
+                "Banco_Origen","ID_INGRESO"
+            ]
+            for c in base_cols:
+                if c not in df_cor.columns:
+                    df_cor[c] = pd.NA
+            df_cor = df_cor[base_cols]
+        
+            # 4) Si la hoja ya existe, concatenar y deduplicar por ID_INGRESO
+            if SHEET_CORREAL in historico:
+                old_cor = historico[SHEET_CORREAL].copy()
+        
+                # Alinear columnas (unión), respetando el orden de base_cols
+                all_cols = list(dict.fromkeys(base_cols + [c for c in old_cor.columns if c not in base_cols]))
+                for c in all_cols:
+                    if c not in old_cor.columns:
+                        old_cor[c] = pd.NA
+                    if c not in df_cor.columns:
+                        df_cor[c] = pd.NA
+        
+                merged = pd.concat([old_cor[all_cols], df_cor[all_cols]], ignore_index=True)
+        
+                # 🔑 Deduplicación por ID_INGRESO
+                if "ID_INGRESO" in merged.columns:
+                    merged = merged.drop_duplicates(subset=["ID_INGRESO"], keep="first")
+        
+                # Orden sugerido: por Fecha y luego ID
+                if "Fecha" in merged.columns:
+                    merged = merged.sort_values(["Fecha","ID_INGRESO"], kind="mergesort")
+        
+                historico[SHEET_CORREAL] = merged[all_cols]
+            else:
+                # Crear hoja desde cero (ya deduplicada y ordenada)
+                if "ID_INGRESO" in df_cor.columns:
+                    df_cor = df_cor.drop_duplicates(subset=["ID_INGRESO"], keep="first")
+                if "Fecha" in df_cor.columns:
+                    df_cor = df_cor.sort_values(["Fecha","ID_INGRESO"], kind="mergesort")
+        
+                historico[SHEET_CORREAL] = df_cor
+        # --- /fin ingresos_correal_completo ---
+        
+                
+            
+        
+        
+        
+        
+        
         
         # generar excel en memoria
         buf = io.BytesIO()
