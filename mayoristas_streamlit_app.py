@@ -43,35 +43,63 @@ def upload_to_dropbox(data: bytes):
 # — 1) Egresos (Compras) —
 @st.cache_data
 def procesar_egresos(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    casilleros = ["9444", "14856", "11591", "1444", "1633", "13608"]
+    casilleros = ["9444", "14856", "11591", "1444", "1633", "13608", "9680"]
     df = df.copy()
-    df["Fecha Compra"] = pd.to_datetime(df["Fecha Compra"], errors="coerce", utc=True)
-    df["Fecha Compra"] = df["Fecha Compra"].dt.tz_convert(None)
+
+    # Fechas y tipos
+    df["Fecha Compra"] = pd.to_datetime(df["Fecha Compra"], errors="coerce", utc=True).dt.tz_convert(None)
     df["Casillero"] = df["Casillero"].astype(str)
+
+    # Filtrar casilleros manejados
     df = df[df["Casillero"].isin(casilleros)]
-    cutoff = pd.Timestamp("2025-09-18")
-    df = df[(df["Casillero"] != "13608") | (df["Fecha Compra"] >= cutoff)]
+
+    # Cortes por casillero
+    cutoff_13608 = pd.Timestamp("2025-09-18")
+    cutoff_9680  = pd.Timestamp("2025-11-11")
+
+    # Mantener 13608 solo desde 2025-09-18 y 9680 solo desde 2025-11-11
+    df = df[
+        ((df["Casillero"] != "13608") | (df["Fecha Compra"] >= cutoff_13608)) &
+        ((df["Casillero"] != "9680")  | (df["Fecha Compra"] >= cutoff_9680))
+    ]
+
+    # Formatos y normalizaciones
     df["Fecha Compra"] = df["Fecha Compra"].dt.strftime("%Y-%m-%d")
     df["Tipo"] = "Egreso"
     df["Total de Pago COP"] = pd.to_numeric(df["Total de Pago COP"], errors="coerce")
     df["Valor de compra COP"] = pd.to_numeric(df["Valor de compra COP"], errors="coerce")
+
+    # Si está cancelada y sin Total de Pago COP, usar Valor de compra COP
     mask = (df["Estado de Orden"] == "Cancelada") & df["Total de Pago COP"].isna()
     df.loc[mask, "Total de Pago COP"] = df.loc[mask, "Valor de compra COP"]
+
+    # Orden como entero estable y luego string
     df["Orden"] = pd.to_numeric(df["Orden"], errors="coerce").astype("Int64")
     df = df.sort_values("Orden")
     df["Orden"] = df["Orden"].astype(str)
+
+    # Monto: USD solo para 1444 y 14856; demás (incluye 9680) en COP
     df["Monto"] = df.apply(
-    lambda row: row["Valor de compra USD"] if row["Casillero"] in ["1444", "14856"] else row["Valor de compra COP"],
-    axis=1
+        lambda row: row.get("Valor de compra USD", None) if row["Casillero"] in ["1444", "14856"]
+        else row["Valor de compra COP"],
+        axis=1
     )
-    df = df.rename(columns={
-        "Fecha Compra": "Fecha"
-    })[["Fecha","Tipo","Monto","Orden","TRM","Usuario","Casillero","Estado de Orden","Nombre del producto"]]
-    df.loc[df["Casillero"]=="9444","Usuario"] = "Maira Alejandra Paez"
+
+    # Renombrar y seleccionar columnas finales
+    df = df.rename(columns={"Fecha Compra": "Fecha"})[
+        ["Fecha","Tipo","Monto","Orden","TRM","Usuario","Casillero","Estado de Orden","Nombre del producto"]
+    ]
+
+    # Alias de usuario conocido
+    df.loc[df["Casillero"] == "9444", "Usuario"] = "Maira Alejandra Paez"
+    df.loc[df["Casillero"] == "9680", "Usuario"] = "Juan Felipe Laverde"
+    # Salida por casillero
     salida = {}
     for cas in casilleros:
-        salida[f"egresos_{cas}"] = df[df["Casillero"]==cas].reset_index(drop=True)
+        salida[f"egresos_{cas}"] = df[df["Casillero"] == cas].reset_index(drop=True)
+
     return salida
+
 
 # — 2) Ingresos Extra —
 @st.cache_data
@@ -124,7 +152,7 @@ def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     Lee la hoja 'Mayoristas' (Envios mayoristas) y devuelve un dict con un DF por casillero.
     Normaliza Fecha de dd-mm-YYYY -> YYYY-MM-DD para que sea consistente con el resto.
     """
-    casilleros_validos = {"9444", "14856", "11591", "1444", "1633", "13608"}
+    casilleros_validos = {"9444", "14856", "11591", "1444", "1633", "13608", "9680"}
 
     df2 = df.copy()
     df2.columns = [str(c).strip() for c in df2.columns]
@@ -1839,6 +1867,49 @@ def main():
         
     st.markdown("---")
     
+    
+    
+    # 6) Ingresos Juan Felipe Laverde (CA9680)
+    st.header("6) Ingresos Juan Felipe Laverde (CA9680)")
+    laverde_files = st.file_uploader(
+        "Sube archivos .xls y .csv de Juan Felipe Laverde",
+        type=["xls", "xlsx", "csv"],
+        accept_multiple_files=True,
+        key="uploader_ingresos_9680"
+    )
+    ingresos_9680 = {}
+    
+    if laverde_files:
+        # Separar por extensiones
+        xls_files = [f for f in laverde_files if f.name.lower().endswith((".xls", ".xlsx"))]
+        csv_files = [f for f in laverde_files if f.name.lower().endswith(".csv")]
+    
+        dfs = []
+        if xls_files:
+            df_xls = procesar_ingresos_clientes_xls(xls_files, "Juan Felipe Laverde", "9680")
+            dfs.append(df_xls)
+        if csv_files:
+            df_csv = procesar_ingresos_clientes_csv(csv_files, "Juan Felipe Laverde", "9680")
+            dfs.append(df_csv)
+    
+        # Concatenar resultados o DataFrame vacío
+        df_9680 = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    
+        ingresos_9680["ingresos_9680"] = df_9680
+    
+        # Mostrar en la app
+        if df_9680.empty:
+            st.info("Sin movimientos válidos")
+        else:
+            st.dataframe(df_9680, use_container_width=True)
+    else:
+        st.info("📂 No subes archivos de Juan Felipe Laverde")
+    
+    st.markdown("---")
+
+    
+    
+    
     st.header("7) Ingresos Maria Moises (CA1444)")
     moises_files = st.file_uploader(
         "Sube archivos .csv de Maria Moises (Bancolombia o Davivienda)", 
@@ -1905,17 +1976,20 @@ def main():
     # 5) Conciliaciones Finales
     st.header("8) Conciliaciones Finales")
 
-    casilleros = ["9444", "14856", "11591", "1444", "1633", "13608"]
+    # asegúrate de que la lista incluya el nuevo casillero
+    casilleros = ["9444", "14856", "11591", "1444", "1633", "13608", "9680"]
     conciliaciones = {}
-
+    
     for cas in casilleros:
         key_ing = f"ingresos_{cas}"
-
-        ing_j = ingresos_jul.get(key_ing)
-        ing_n = ingresos_nath.get(key_ing)
-        ing_e = ingresos_elv.get(key_ing)
-        ing_m = ingresos_moises.get(key_ing)
-
+    
+        # tomar de cada fuente (si existe el dict y la clave)
+        ing_j = ingresos_jul.get(key_ing)       if isinstance(ingresos_jul, dict)       else None
+        ing_n = ingresos_nath.get(key_ing)      if isinstance(ingresos_nath, dict)      else None
+        ing_e = ingresos_elv.get(key_ing)       if isinstance(ingresos_elv, dict)       else None
+        ing_m = ingresos_moises.get(key_ing)    if isinstance(ingresos_moises, dict)    else None
+        ing_9 = ingresos_9680.get(key_ing)      if isinstance(ingresos_9680, dict)      else None  # NUEVO
+    
         if ing_j is not None and not ing_j.empty:
             inc = ing_j
         elif ing_n is not None and not ing_n.empty:
@@ -1924,9 +1998,13 @@ def main():
             inc = ing_e
         elif ing_m is not None and not ing_m.empty:
             inc = ing_m
+        elif ing_9 is not None and not ing_9.empty:  # NUEVO
+            inc = ing_9
         else:
             inc = None
     
+        # ... (resto del loop: gmf_df, egr, ext, env, dev, frames, etc.)
+
         # ------------------ NUEVO: GMF 4x1000 SOLO PARA 1633 ------------------
         gmf_df = None
         if cas in ("1633", "13608"):
