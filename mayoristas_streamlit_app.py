@@ -1596,6 +1596,26 @@ def obtener_y_enviar_alerta_saldo(historico: dict, casillero: str, fecha_carga: 
         st.success(f"📧 Alerta enviada a {destino} (casillero {casillero})")
 
 
+def _safe_orden_fecha_id(df: pd.DataFrame, fecha_col="Fecha", id_col="ID_INGRESO") -> pd.DataFrame:
+    """
+    Orden robusto:
+      - Fuerza Fecha a datetime64[ns].
+      - Mapea a int64 (ns desde epoch); NaT al final.
+      - Fuerza ID a str.
+      - Evita el camino interno de Categorical que dispara el TypeError.
+    """
+    d = df.copy()
+    d[fecha_col] = pd.to_datetime(d[fecha_col], errors="coerce")
+    d[id_col] = d[id_col].astype(str)
+
+    i8 = d[fecha_col].astype("datetime64[ns]").view("i8")
+    i8 = np.where(i8 == np.iinfo("int64").min, np.iinfo("int64").max, i8)  # NaT al final
+
+    d["_k_fecha"] = i8
+    d["_k_id"] = d[id_col]
+
+    d = d.sort_values(["_k_fecha", "_k_id"], kind="mergesort")
+    return d.drop(columns=["_k_fecha", "_k_id"])
 
 
 
@@ -2347,12 +2367,12 @@ def main():
         # --- /fin anexar hoja COP 1444 ---
         
         
-        
-        
-                # --- Anexar/actualizar hoja con snapshot crudo unificado "ingresos_correal_completo" ---
+         
+                
+        # --- Anexar/actualizar hoja con snapshot crudo unificado "ingresos_correal_completo" ---
+# --- Anexar/actualizar hoja con snapshot crudo unificado "ingresos_correal_completo" ---
         SHEET_CORREAL = "ingresos_correal_completo"
         
-        # 1) Recuperar el acumulado en sesión (Bancolombia + Davivienda), construido en cada función bancaria
         try:
             correal_df = st.session_state.get("1444_ingresos_correal_raw", None)
         except Exception:
@@ -2361,15 +2381,14 @@ def main():
         if isinstance(correal_df, pd.DataFrame) and not correal_df.empty:
             df_cor = correal_df.copy()
         
-            # 2) Normalizaciones de tipos y nombres
-            df_cor["Fecha"] = pd.to_datetime(df_cor["Fecha"], errors="coerce").dt.date
+            # Tipos consistentes
+            df_cor["Fecha"] = pd.to_datetime(df_cor["Fecha"], errors="coerce")
             df_cor["MontoCOP"] = pd.to_numeric(df_cor["MontoCOP"], errors="coerce")
             for c in ["Tipo","Orden","Usuario","Casillero","Estado de Orden",
                       "Nombre del producto","Archivo_Origen","Banco_Origen","ID_INGRESO"]:
                 if c in df_cor.columns:
                     df_cor[c] = df_cor[c].astype(str)
         
-            # 3) Asegurar columnas base (por si alguna vino ausente en el snapshot)
             base_cols = [
                 "Fecha","Tipo","MontoCOP","Orden","Usuario","Casillero",
                 "Estado de Orden","Nombre del producto","Archivo_Origen",
@@ -2380,11 +2399,10 @@ def main():
                     df_cor[c] = pd.NA
             df_cor = df_cor[base_cols]
         
-            # 4) Si la hoja ya existe, concatenar y deduplicar por ID_INGRESO
             if SHEET_CORREAL in historico:
                 old_cor = historico[SHEET_CORREAL].copy()
         
-                # Alinear columnas (unión), respetando el orden de base_cols
+                # Alinear columnas
                 all_cols = list(dict.fromkeys(base_cols + [c for c in old_cor.columns if c not in base_cols]))
                 for c in all_cols:
                     if c not in old_cor.columns:
@@ -2392,31 +2410,38 @@ def main():
                     if c not in df_cor.columns:
                         df_cor[c] = pd.NA
         
+                # Normalizar tipos antes de unir
+                old_cor["Fecha"] = pd.to_datetime(old_cor["Fecha"], errors="coerce")
+                if "ID_INGRESO" in old_cor.columns:
+                    old_cor["ID_INGRESO"] = old_cor["ID_INGRESO"].astype(str)
+        
                 merged = pd.concat([old_cor[all_cols], df_cor[all_cols]], ignore_index=True)
         
-                # 🔑 Deduplicación por ID_INGRESO
+                # Dedup por ID
                 if "ID_INGRESO" in merged.columns:
+                    merged["ID_INGRESO"] = merged["ID_INGRESO"].astype(str)
                     merged = merged.drop_duplicates(subset=["ID_INGRESO"], keep="first")
         
-                # Orden sugerido: por Fecha y luego ID
-                if "Fecha" in merged.columns:
-                    merged = merged.sort_values(["Fecha","ID_INGRESO"], kind="mergesort")
+                # 🚫 NO USAR sort_values(["Fecha","ID_INGRESO"])
+                merged = _safe_orden_fecha_id(merged, fecha_col="Fecha", id_col="ID_INGRESO")
         
                 historico[SHEET_CORREAL] = merged[all_cols]
             else:
-                # Crear hoja desde cero (ya deduplicada y ordenada)
                 if "ID_INGRESO" in df_cor.columns:
+                    df_cor["ID_INGRESO"] = df_cor["ID_INGRESO"].astype(str)
                     df_cor = df_cor.drop_duplicates(subset=["ID_INGRESO"], keep="first")
-                if "Fecha" in df_cor.columns:
-                    df_cor = df_cor.sort_values(["Fecha","ID_INGRESO"], kind="mergesort")
+        
+                df_cor = _safe_orden_fecha_id(df_cor, fecha_col="Fecha", id_col="ID_INGRESO")
         
                 historico[SHEET_CORREAL] = df_cor
         # --- /fin ingresos_correal_completo ---
         
+                # --- /fin ingresos_correal_completo ---
+        
+                                
+                            
                 
-            
-        
-        
+                
         
         
         
