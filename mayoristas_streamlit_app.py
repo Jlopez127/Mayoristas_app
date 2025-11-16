@@ -2082,9 +2082,19 @@ def main():
         type=["xls", "xlsx", "csv"],
         accept_multiple_files=True
     )
+    
+    # Confirmación antes de procesar
+    confirm_nat = st.radio(
+        "¿Estás seguro de que los archivos de Nathalia son los correctos?",
+        ["No, quiero revisar", "Sí, procesar"],
+        index=0,  # por defecto "No"
+        horizontal=True,
+        key="conf_nat"
+    )
+    
     ingresos_nath = {}
     
-    if nat_files:
+    if nat_files and confirm_nat == "Sí, procesar":
         # Separar por extensiones
         xls_files = [f for f in nat_files if f.name.lower().endswith((".xls", ".xlsx"))]
         csv_files = [f for f in nat_files if f.name.lower().endswith(".csv")]
@@ -2098,10 +2108,7 @@ def main():
             dfs.append(df_csv)
     
         # Concatenar resultados o crear DataFrame vacío
-        if dfs:
-            df_nat = pd.concat(dfs, ignore_index=True)
-        else:
-            df_nat = pd.DataFrame()
+        df_nat = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
     
         ingresos_nath["ingresos_1633"] = df_nat
     
@@ -2110,21 +2117,34 @@ def main():
             st.info("Sin movimientos válidos")
         else:
             st.dataframe(df_nat, use_container_width=True)
+    
+    elif nat_files and confirm_nat == "No, quiero revisar":
+        st.warning("👀 Aún no se procesan los archivos de Nathalia. Revisa y luego marca 'Sí, procesar'.")
     else:
         st.info("📂 No subes archivos de Nathalia")
     
     st.markdown("---")
 
-    # 4) Ingresos Elvis (CA11591)
+
+     # 4) Ingresos Elvis (CA11591)
     st.header("5) Ingresos Elvis (CA11591)")
     elv_files = st.file_uploader(
         "Sube archivos .xls y .csv de Elvis",
         type=["xls", "xlsx", "csv"],
         accept_multiple_files=True
     )
+    
+    confirm_elv = st.radio(
+        "¿Estás seguro de que los archivos de Elvis son los correctos?",
+        ["No, quiero revisar", "Sí, procesar"],
+        index=0,
+        horizontal=True,
+        key="conf_elv"
+    )
+    
     ingresos_elv = {}
     
-    if elv_files:
+    if elv_files and confirm_elv == "Sí, procesar":
         # Separar por extensión
         xls_files = [f for f in elv_files if f.name.lower().endswith((".xls", ".xlsx"))]
         csv_files = [f for f in elv_files if f.name.lower().endswith(".csv")]
@@ -2137,37 +2157,41 @@ def main():
             df_csv = procesar_ingresos_clientes_csv(csv_files, "Elvis", "11591")
             dfs.append(df_csv)
     
-        # Concatenar resultados o crear DataFrame vacío
-        if dfs:
-            df_elv = pd.concat(dfs, ignore_index=True)
-        else:
-            df_elv = pd.DataFrame()
-    
+        df_elv = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
         ingresos_elv["ingresos_11591"] = df_elv
     
-        # Mostrar en la app
         if df_elv.empty:
             st.info("Sin movimientos válidos")
         else:
             st.dataframe(df_elv, use_container_width=True)
+    
+    elif elv_files and confirm_elv == "No, quiero revisar":
+        st.warning("👀 Aún no se procesan los archivos de Elvis. Revisa y luego marca 'Sí, procesar'.")
     else:
         st.info("📂 No subes archivos de Elvis")
-        
-        
-        
+    
     st.markdown("---")
+
         
-        # 3) Ingresos Julian Sanchez (CA13608)
+    # Ingresos Julian Sanchez (CA13608)
     st.header("6) Ingresos Julian Sanchez (CA13608)")
     jul_files = st.file_uploader(
         "Sube archivos .xls y .csv de Julian",
         type=["xls", "xlsx", "csv"],
         accept_multiple_files=True
     )
+    
+    confirm_jul = st.radio(
+        "¿Estás seguro de que los archivos de Julian son los correctos?",
+        ["No, quiero revisar", "Sí, procesar"],
+        index=0,
+        horizontal=True,
+        key="conf_jul"
+    )
+    
     ingresos_jul = {}
     
-    if jul_files:
-        # Separar por extensiones
+    if jul_files and confirm_jul == "Sí, procesar":
         xls_files = [f for f in jul_files if f.name.lower().endswith((".xls", ".xlsx"))]
         csv_files = [f for f in jul_files if f.name.lower().endswith(".csv")]
     
@@ -2179,24 +2203,21 @@ def main():
             df_csv = procesar_ingresos_clientes_csv(csv_files, "Julian Sanchez", "13608")
             dfs.append(df_csv)
     
-        # Concatenar resultados o crear DataFrame vacío
-        if dfs:
-            df_jul = pd.concat(dfs, ignore_index=True)
-        else:
-            df_jul = pd.DataFrame()
-    
+        df_jul = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
         ingresos_jul["ingresos_13608"] = df_jul
     
-        # Mostrar en la app
         if df_jul.empty:
             st.info("Sin movimientos válidos")
         else:
             st.dataframe(df_jul, use_container_width=True)
+    
+    elif jul_files and confirm_jul == "No, quiero revisar":
+        st.warning("👀 Aún no se procesan los archivos de Julian. Revisa y luego marca 'Sí, procesar'.")
     else:
         st.info("📂 No subes archivos de Julian")
-        
-    st.markdown("---")
     
+    st.markdown("---")
+
     
     
     # 6) Ingresos Juan Felipe Laverde (CA9680)
@@ -2207,10 +2228,18 @@ def main():
         accept_multiple_files=True,
         key="uploader_ingresos_9680"
     )
+    
+    confirm_9680 = st.radio(
+        "¿Estás seguro de que los archivos de Juan Felipe Laverde son los correctos?",
+        ["No, quiero revisar", "Sí, procesar"],
+        index=0,
+        horizontal=True,
+        key="conf_9680"
+    )
+    
     ingresos_9680 = {}
     
-    if laverde_files:
-        # Separar por extensiones
+    if laverde_files and confirm_9680 == "Sí, procesar":
         xls_files = [f for f in laverde_files if f.name.lower().endswith((".xls", ".xlsx"))]
         csv_files = [f for f in laverde_files if f.name.lower().endswith(".csv")]
     
@@ -2219,19 +2248,19 @@ def main():
             df_xls = procesar_ingresos_clientes_xls(xls_files, "Juan Felipe Laverde", "9680")
             dfs.append(df_xls)
         if csv_files:
-            df_csv = procesar_ingresos_clientes_csv(csv_files, "Juan Felipe Laverde", "9680")
+            df_csv = procesar_ingresos_clientes_csv(laverde_files, "Juan Felipe Laverde", "9680")
             dfs.append(df_csv)
     
-        # Concatenar resultados o DataFrame vacío
         df_9680 = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-    
         ingresos_9680["ingresos_9680"] = df_9680
     
-        # Mostrar en la app
         if df_9680.empty:
             st.info("Sin movimientos válidos")
         else:
             st.dataframe(df_9680, use_container_width=True)
+    
+    elif laverde_files and confirm_9680 == "No, quiero revisar":
+        st.warning("👀 Aún no se procesan los archivos de Juan Felipe. Revisa y luego marca 'Sí, procesar'.")
     else:
         st.info("📂 No subes archivos de Juan Felipe Laverde")
     
@@ -2247,56 +2276,57 @@ def main():
         accept_multiple_files=True
     )
     
-
+    confirm_moises = st.radio(
+        "¿Estás seguro de que los archivos de Maria Moises son los correctos?",
+        ["No, quiero revisar", "Sí, procesar"],
+        index=0,
+        horizontal=True,
+        key="conf_moises"
+    )
     
     ingresos_moises = {}
-
-    if moises_files:
+    
+    if moises_files and confirm_moises == "Sí, procesar":
         csv_banco   = []
-        excel_davi  = []  # antes se llamaba csv_davi
-
+        excel_davi  = []
+    
         for file in moises_files:
-          nombre = file.name.lower()
-          # Si es un CSV lo metemos en Bancolombia:
-          if nombre.endswith(".csv"):
-              csv_banco.append(file)
-
-          # Si es un Excel (.xlsx o .xls), lo metemos en Davivienda:
-          elif nombre.endswith(".xlsx") or nombre.endswith(".xls"):
-              excel_davi.append(file)
-
-          else:
-              st.warning(f"⚠️ '{file.name}' no es ni CSV ni Excel válido, se omitirá.")
-
+            nombre = file.name.lower()
+            if nombre.endswith(".csv"):
+                csv_banco.append(file)
+            elif nombre.endswith(".xlsx") or nombre.endswith(".xls"):
+                excel_davi.append(file)
+            else:
+                st.warning(f"⚠️ '{file.name}' no es ni CSV ni Excel válido, se omitirá.")
+    
         dfs = []
         if csv_banco:
-          df_banco = procesar_ingresos_clientes_csv_casillero1444(
-              csv_banco, "Maria Moises", "1444"
-          )
-          dfs.append(df_banco)
-
+            df_banco = procesar_ingresos_clientes_csv_casillero1444(
+                csv_banco, "Maria Moises", "1444"
+            )
+            dfs.append(df_banco)
+    
         if excel_davi:
-          # Llamamos ahora a la función procesar_ingresos_davivienda para los Excel
-          df_davi = procesar_ingresos_davivienda(
-              excel_davi, "Maria Moises", "1444"
-          )
-          dfs.append(df_davi)
-
-        if dfs:
-          df_moises = pd.concat(dfs, ignore_index=True)
-        else:
-          df_moises = pd.DataFrame()
-
+            df_davi = procesar_ingresos_davivienda(
+                excel_davi, "Maria Moises", "1444"
+            )
+            dfs.append(df_davi)
+    
+        df_moises = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
         ingresos_moises["ingresos_1444"] = df_moises
-
+    
         if df_moises.empty:
-          st.info("Sin movimientos válidos")
+            st.info("Sin movimientos válidos")
         else:
-          st.dataframe(df_moises, use_container_width=True)
+            st.dataframe(df_moises, use_container_width=True)
+    
+    elif moises_files and confirm_moises == "No, quiero revisar":
+        st.warning("👀 Aún no se procesan los archivos de Maria Moises. Revisa y luego marca 'Sí, procesar'.")
     else:
-      st.info("📂 No subes archivos de Maria Moises")
-
+        st.info("📂 No subes archivos de Maria Moises")
+    
     st.markdown("---")
+    
 
     
     
