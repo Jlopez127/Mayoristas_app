@@ -15,7 +15,7 @@ import dropbox
 import numpy as np
 import smtplib, ssl
 from email.message import EmailMessage
-
+from pathlib import Path, PurePosixPath
 
 st.set_page_config(page_title="Conciliaciones Mayoristas", layout="wide")
 # Crea un cliente de Dropbox usando tu token de Secrets
@@ -442,6 +442,96 @@ import pandas as pd
 import streamlit as st
 import requests
 
+
+def exportar_ingresos_csv_a_dropbox(out: pd.DataFrame, casillero: str):
+    """
+    Toma el DataFrame `out` (ingresos ya normalizados, con ID_INGRESO)
+    y lo acumula en un archivo de Dropbox:
+
+        ingresos_<casillero}_bancolombia.xlsx
+
+    - Usa la misma carpeta de st.secrets["dropbox"]["remote_path"].
+    - Concatena lo viejo + lo nuevo.
+    - Elimina duplicados por ID_INGRESO, quedándose con el PRIMERO.
+      (prioriza los que tengan Id_cliente / Factura llenos).
+    - Asegura que existan las columnas: Id_cliente y Factura.
+    """
+    # Nada que hacer si no hay datos
+    if out is None or out.empty:
+        return
+
+    if "ID_INGRESO" not in out.columns:
+        st.warning(f"⚠️ No se encontró 'ID_INGRESO' para casillero {casillero}; no se exporta a Dropbox.")
+        return
+
+    # 1) Carpeta base tomada del histórico
+    cfg = st.secrets["dropbox"]
+    base_remote = cfg["remote_path"]  # ej: "/Conciliacion/Historico_mayoristas.xlsx"
+    base_dir = PurePosixPath(base_remote).parent
+
+    # Nombre final del archivo: ingresos_<casillero>_bancolombia.xlsx
+    remote_path_ingresos = str(base_dir / f"ingresos_{casillero}_bancolombia.xlsx")
+
+    # 2) Leer archivo existente (si no existe, se arranca vacío)
+    try:
+        md, res = dbx.files_download(remote_path_ingresos)
+        buf_in = io.BytesIO(res.content)
+        df_old = pd.read_excel(buf_in)
+    except Exception:
+        df_old = pd.DataFrame()
+
+    # 3) Alinear columnas entre viejo y nuevo
+    all_cols = list(df_old.columns)
+    for c in out.columns:
+        if c not in all_cols:
+            all_cols.append(c)
+
+    df_old = df_old.reindex(columns=all_cols)
+    df_new = out.reindex(columns=all_cols)
+
+    # 4) Concatenar
+    df_comb = pd.concat([df_old, df_new], ignore_index=True)
+    df_comb["ID_INGRESO"] = df_comb["ID_INGRESO"].astype(str)
+
+    # 4.1) Asegurar columnas Id_cliente y Factura
+    for col in ["Id_cliente", "Factura"]:
+        if col not in df_comb.columns:
+            df_comb[col] = ""
+
+    # 4.2) TU LÓGICA DE DEDUPLICACIÓN:
+    #     priorizamos filas que ya traigan Id_cliente o Factura llenos
+    df_comb["_tiene_info"] = (
+        df_comb["Id_cliente"].astype(str).str.strip().ne("") |
+        df_comb["Factura"].astype(str).str.strip().ne("")
+    )
+
+    # Primero las filas con info (_tiene_info = True), luego las vacías
+    df_comb = df_comb.sort_values(by="_tiene_info", ascending=False)
+
+    # Eliminar duplicados por ID_INGRESO quedándose con la primera
+    # (es decir, la que tiene info en Id_cliente/Factura si existe)
+    df_comb = df_comb.drop_duplicates(subset=["ID_INGRESO"], keep="first")
+
+    # Ya no necesitamos la columna auxiliar
+    df_comb = df_comb.drop(columns=["_tiene_info"])
+
+    # 5) Guardar a Excel en memoria y subir a Dropbox
+    buf_out = io.BytesIO()
+    with pd.ExcelWriter(buf_out, engine="openpyxl") as writer:
+        df_comb.to_excel(writer, sheet_name="Ingresos", index=False)
+    buf_out.seek(0)
+
+    dbx.files_upload(
+        buf_out.read(),
+        remote_path_ingresos,
+        mode=dropbox.files.WriteMode.overwrite
+    )
+
+    st.success(f"✅ Archivo 'ingresos_{casillero}_bancolombia.xlsx' actualizado en Dropbox.")
+
+
+
+
 def procesar_ingresos_clientes_csv(files: list, usuario: str, casillero: str) -> pd.DataFrame:
     dfs = []
     for up in files:
@@ -583,6 +673,7 @@ def procesar_ingresos_clientes_csv(files: list, usuario: str, casillero: str) ->
     out = out[out["Monto"] > 0]
 
     # ---------- 12. TRM ----------
+    # ---------- 12. TRM ----------
     try:
         fmax = out["Fecha"].max().strftime("%Y-%m-%d")
         url = f"https://www.datos.gov.co/resource/mcec-87by.json?vigenciadesde={fmax}T00:00:00.000"
@@ -592,6 +683,12 @@ def procesar_ingresos_clientes_csv(files: list, usuario: str, casillero: str) ->
         trm = None
     out["TRM"] = trm
 
+    # ---------- 13. Exportar a Dropbox por mayorista (casillero) ----------
+    try:
+        exportar_ingresos_csv_a_dropbox(out, casillero)
+    except Exception as e:
+        st.warning(f"⚠️ No se pudieron exportar ingresos del casillero {casillero} a Dropbox: {e}")
+
     return out.reset_index(drop=True)
 
 
@@ -599,6 +696,101 @@ from pathlib import Path
 import io
 import pandas as pd
 import requests
+
+
+
+
+def exportar_ingresos_correal_bancolombia_a_dropbox(df_raw: pd.DataFrame, casillero: str):
+    """
+    Exporta el snapshot crudo PRE-NETEO/GMF/USD de Bancolombia (en COP) a Dropbox:
+
+        ingresos_<casillero>_Bancolombia.xlsx
+
+    - Usa la misma carpeta de st.secrets["dropbox"]["remote_path"].
+    - Concatena histórico + nuevos.
+    - Asegura columnas Id_cliente y Factura.
+    - Deduplica por ID_INGRESO priorizando filas que ya tengan Id_cliente/Factura.
+    """
+    if df_raw is None or df_raw.empty:
+        return
+
+    if "ID_INGRESO" not in df_raw.columns:
+        st.warning(
+            f"⚠️ No se encontró 'ID_INGRESO' en snapshot Bancolombia para casillero {casillero}; "
+            "no se exporta a Dropbox."
+        )
+        return
+
+    # Carpeta base tomada del histórico
+    cfg = st.secrets["dropbox"]
+    base_remote = cfg["remote_path"]  # ej: "/Conciliacion/Historico_mayoristas.xlsx"
+    base_dir = PurePosixPath(base_remote).parent
+
+    # 👉 Nombre pedido: ingresos_<casillero>_Bancolombia.xlsx
+    remote_path_ingresos = str(base_dir / f"ingresos_{casillero}_Bancolombia.xlsx")
+
+    # 1) Leer archivo existente (si no existe, vacío)
+    try:
+        md, res = dbx.files_download(remote_path_ingresos)
+        buf_in = io.BytesIO(res.content)
+        df_old = pd.read_excel(buf_in)
+    except Exception:
+        df_old = pd.DataFrame()
+
+    # 2) Alinear columnas entre viejo y nuevo
+    all_cols = list(df_old.columns)
+    for c in df_raw.columns:
+        if c not in all_cols:
+            all_cols.append(c)
+
+    df_old = df_old.reindex(columns=all_cols)
+    df_new = df_raw.reindex(columns=all_cols)
+
+    # 3) Concatenar
+    df_comb = pd.concat([df_old, df_new], ignore_index=True)
+    df_comb["ID_INGRESO"] = df_comb["ID_INGRESO"].astype(str)
+
+    # 3.1) Asegurar columnas Id_cliente y Factura
+    for col in ["Id_cliente", "Factura"]:
+        if col not in df_comb.columns:
+            df_comb[col] = ""
+
+    # --- Priorizar filas que tengan info en Id_cliente o Factura ---
+    tiene_info = (
+        df_comb["Id_cliente"].astype(str).str.strip().ne("") |
+        df_comb["Factura"].astype(str).str.strip().ne("")
+    )
+
+    # Columna auxiliar para ordenar (1 = tiene info, 0 = vacío)
+    df_comb["TieneInfo"] = tiene_info.astype(int)
+
+    # Primero las filas con info, luego las vacías
+    df_comb = df_comb.sort_values(by="TieneInfo", ascending=False)
+
+    # Deduplicación final por ID_INGRESO (mantiene la mejor versión)
+    df_comb = df_comb.drop_duplicates(subset=["ID_INGRESO"], keep="first")
+
+    # Quitar columna auxiliar
+    df_comb = df_comb.drop(columns=["TieneInfo"])
+
+    # 4) Guardar a Excel en memoria y subir a Dropbox
+    buf_out = io.BytesIO()
+    with pd.ExcelWriter(buf_out, engine="openpyxl") as writer:
+        df_comb.to_excel(writer, sheet_name="Ingresos", index=False)
+    buf_out.seek(0)
+
+    dbx.files_upload(
+        buf_out.read(),
+        remote_path_ingresos,
+        mode=dropbox.files.WriteMode.overwrite
+    )
+
+    st.success(f"✅ Archivo 'ingresos_{casillero}_Bancolombia.xlsx' actualizado en Dropbox.")
+
+
+
+
+
 
 def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casillero: str) -> pd.DataFrame:
     """
@@ -754,6 +946,7 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casi
     
    # === SNAPSHOT CRUDO PRE-NETEO/GMF/USD para "Ingresos Correal" ===
 # === SNAPSHOT CRUDO PRE-NETEO/GMF/USD para "Ingresos Correal" ===
+    # === SNAPSHOT CRUDO PRE-NETEO/GMF/USD para "Ingresos Correal" ===
     try:
         raw_correal = df.copy()
     
@@ -790,11 +983,17 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casi
                 )
             else:
                 st.session_state[key_correal] = raw_correal_out
+
+        # 👇 NUEVO: exportar snapshot crudo a Dropbox como ingresos_<casillero>_Bancolombia.xlsx
+        exportar_ingresos_correal_bancolombia_a_dropbox(raw_correal_out, casillero)
+
     except Exception as _e:
         try:
             st.warning(f"⚠️ No se pudo preparar snapshot 'Ingresos Correal': {_e}")
         except Exception:
             pass
+    # === /SNAPSHOT CRUDO ===
+
             
         
     
@@ -1143,6 +1342,100 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casi
 
 
 
+
+
+
+def exportar_ingresos_correal_davivienda_a_dropbox(df_raw: pd.DataFrame, casillero: str):
+    """
+    Exporta el snapshot crudo PRE-TRM/GMF/USD de Davivienda (en COP) a Dropbox:
+
+        ingresos_<casillero>_Davivienda.xlsx
+
+    - Usa la misma carpeta de st.secrets["dropbox"]["remote_path"].
+    - Concatena histórico + nuevos.
+    - Asegura columnas Id_cliente y Factura.
+    - Deduplica por ID_INGRESO priorizando filas que ya tengan Id_cliente/Factura.
+    """
+    if df_raw is None or df_raw.empty:
+        return
+
+    if "ID_INGRESO" not in df_raw.columns:
+        st.warning(
+            f"⚠️ No se encontró 'ID_INGRESO' en snapshot Davivienda para casillero {casillero}; "
+            "no se exporta a Dropbox."
+        )
+        return
+
+    # Carpeta base tomada del histórico
+    cfg = st.secrets["dropbox"]
+    base_remote = cfg["remote_path"]  # ej: "/Conciliacion/Historico_mayoristas.xlsx"
+    base_dir = PurePosixPath(base_remote).parent
+
+    remote_path_ingresos = str(base_dir / f"ingresos_{casillero}_Davivienda.xlsx")
+
+    # 1) Leer archivo existente (si no existe, vacío)
+    try:
+        md, res = dbx.files_download(remote_path_ingresos)
+        buf_in = io.BytesIO(res.content)
+        df_old = pd.read_excel(buf_in)
+    except Exception:
+        df_old = pd.DataFrame()
+
+    # 2) Alinear columnas entre viejo y nuevo
+    all_cols = list(df_old.columns)
+    for c in df_raw.columns:
+        if c not in all_cols:
+            all_cols.append(c)
+
+    df_old = df_old.reindex(columns=all_cols)
+    df_new = df_raw.reindex(columns=all_cols)
+
+    # 3) Concatenar
+    df_comb = pd.concat([df_old, df_new], ignore_index=True)
+    df_comb["ID_INGRESO"] = df_comb["ID_INGRESO"].astype(str)
+
+    # 3.1) Asegurar columnas Id_cliente y Factura
+    for col in ["Id_cliente", "Factura"]:
+        if col not in df_comb.columns:
+            df_comb[col] = ""
+
+    # --- Priorizar filas que tengan info en Id_cliente o Factura ---
+    tiene_info = (
+        df_comb["Id_cliente"].astype(str).str.strip().ne("") |
+        df_comb["Factura"].astype(str).str.strip().ne("")
+    )
+
+    # Columna auxiliar para ordenar (1 = tiene info, 0 = vacío)
+    df_comb["TieneInfo"] = tiene_info.astype(int)
+
+    # Primero las filas con info, luego las vacías
+    df_comb = df_comb.sort_values(by="TieneInfo", ascending=False)
+
+    # Deduplicación final por ID_INGRESO (mantiene la mejor versión)
+    df_comb = df_comb.drop_duplicates(subset=["ID_INGRESO"], keep="first")
+
+    # Quitar columna auxiliar
+    df_comb = df_comb.drop(columns=["TieneInfo"])
+
+    # 4) Guardar a Excel en memoria y subir a Dropbox
+    buf_out = io.BytesIO()
+    with pd.ExcelWriter(buf_out, engine="openpyxl") as writer:
+        df_comb.to_excel(writer, sheet_name="Ingresos", index=False)
+    buf_out.seek(0)
+
+    dbx.files_upload(
+        buf_out.read(),
+        remote_path_ingresos,
+        mode=dropbox.files.WriteMode.overwrite
+    )
+
+    st.success(f"✅ Archivo 'ingresos_{casillero}_Davivienda.xlsx' actualizado en Dropbox.")
+
+
+
+
+
+
 def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> pd.DataFrame:
     """
     Lee Excels de Davivienda.
@@ -1276,6 +1569,10 @@ def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> p
                 )
             else:
                 st.session_state[key_correal] = raw_correal_out_dav
+    
+        # 👇 AQUI LLAMAMOS LA EXPORTACIÓN A DROPBOX
+        exportar_ingresos_correal_davivienda_a_dropbox(raw_correal_out_dav, casillero)
+    
     except Exception as _e:
         try:
             st.warning(f"⚠️ No se pudo preparar snapshot 'Ingresos Correal' (Davivienda): {_e}")
@@ -1283,37 +1580,70 @@ def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> p
             pass
     # === /SNAPSHOT CRUDO ===
 
+
     
     
     
 
     # TRM histórica
     try:
-        fecha_max_tx = pd.to_datetime(df_trans["Fecha"], errors="coerce").max().date()
-        punto_corte = fecha_max_tx.strftime("%Y-%m-%dT00:00:00.000")
-        url = (
-            "https://www.datos.gov.co/resource/mcec-87by.json?"
-            f"$where=vigenciadesde <= '{punto_corte}'&$order=vigenciadesde DESC"
-        )
-        respuesta = requests.get(url)
-        respuesta.raise_for_status()
-        lista_trm = respuesta.json()
-        if not lista_trm:
-            st.warning("No se encontraron registros de TRM anteriores o iguales a la fecha máxima.")
-            trm_df = pd.DataFrame(columns=["Fecha","TRM"])
+        # Aseguramos que Fecha en df_trans sea datetime
+        df_trans["Fecha"] = pd.to_datetime(df_trans["Fecha"], errors="coerce")
+    
+        fecha_max_tx = df_trans["Fecha"].max()
+        if pd.isna(fecha_max_tx):
+            trm_df = pd.DataFrame(columns=["Fecha", "TRM"])
         else:
-            trm_df = pd.DataFrame(lista_trm)
-            trm_df["Fecha"] = pd.to_datetime(trm_df["vigenciadesde"], errors="coerce")
-            trm_df["TRM"]   = trm_df["valor"].astype(float)
-            trm_df = trm_df[["Fecha","TRM"]].drop_duplicates(subset="Fecha", keep="first").sort_values("Fecha").reset_index(drop=True)
+            fecha_max_tx = fecha_max_tx.date()
+            punto_corte = fecha_max_tx.strftime("%Y-%m-%dT00:00:00.000")
+            url = (
+                "https://www.datos.gov.co/resource/mcec-87by.json?"
+                f"$where=vigenciadesde <= '{punto_corte}'&$order=vigenciadesde DESC"
+            )
+            respuesta = requests.get(url)
+            respuesta.raise_for_status()
+            lista_trm = respuesta.json()
+            if not lista_trm:
+                st.warning("No se encontraron registros de TRM anteriores o iguales a la fecha máxima.")
+                trm_df = pd.DataFrame(columns=["Fecha","TRM"])
+            else:
+                trm_df = pd.DataFrame(lista_trm)
+                trm_df["Fecha"] = pd.to_datetime(trm_df["vigenciadesde"], errors="coerce")
+                trm_df["TRM"]   = trm_df["valor"].astype(float)
+                trm_df = (
+                    trm_df[["Fecha","TRM"]]
+                    .drop_duplicates(subset="Fecha", keep="first")
+                    .sort_values("Fecha")
+                    .reset_index(drop=True)
+                )
     except Exception as e:
         st.warning(f"No se pudo obtener TRM: {e}")
         trm_df = pd.DataFrame(columns=["Fecha","TRM"])
-
-    # merge_asof TRM
-    df_trans = df_trans.sort_values("Fecha").reset_index(drop=True)
-    trm_df   = trm_df.sort_values("Fecha").reset_index(drop=True)
-    df_merged = pd.merge_asof(df_trans, trm_df, on="Fecha", direction="backward")
+    
+    # Normalizar tipos ANTES del merge_asof
+    df_trans["Fecha"] = pd.to_datetime(df_trans["Fecha"], errors="coerce")
+    trm_df["Fecha"]   = pd.to_datetime(trm_df["Fecha"], errors="coerce")
+    
+    # Quitamos filas sin fecha válida para no dejar TRM nula
+    df_trans = df_trans.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
+    trm_df   = trm_df.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
+    
+    # 🔒 TRM NUNCA NULA
+    if trm_df.empty:
+        # Fallback fijo (ajusta este valor a lo que quieras usar por defecto)
+        TRM_FIJA = 4000.0
+        st.warning(f"No se pudo emparejar TRM histórica. Se usará TRM fija = {TRM_FIJA}.")
+        df_merged = df_trans.copy()
+        df_merged["TRM"] = TRM_FIJA
+    else:
+        df_merged = pd.merge_asof(df_trans, trm_df, on="Fecha", direction="backward")
+        # Si por alguna razón quedara NaN en TRM (no debería, pero por si acaso),
+        # rellenamos con la última TRM conocida
+        ultima_trm = trm_df["TRM"].iloc[-1]
+        df_merged["TRM"] = df_merged["TRM"].fillna(ultima_trm)
+        
+        
+    
 
     # Monto (USD) usando TRM+100
     df_merged["Monto"] = df_merged["ValorCOP"] / (df_merged["TRM"] + 100)
