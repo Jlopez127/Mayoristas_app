@@ -1003,6 +1003,7 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casi
     # =========================================================
 
     # ===== Filtro INICIAL (ANTES de netear/GMF) =====
+    # ===== Filtro INICIAL (ANTES de netear/GMF) =====
     mask_interes = df["REFERENCIA"].astype(str).str.strip().str.upper().eq("ABONO INTERESES AHORROS")
     mask_pos     = pd.to_numeric(df["VALOR"], errors="coerce").fillna(0) > 0
     df_base = df.loc[~mask_interes & mask_pos].copy()
@@ -1011,7 +1012,11 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casi
     egresos_extra = pd.DataFrame(columns=["Fecha", "Monto_COP", "Descripcion"])
     usar_extras = False
     try:
-        usar_extras = st.checkbox("¿Tienes egresos extra en COP para netear (1444)?", value=False, key="eg_extra_1444_toggle")
+        usar_extras = st.checkbox(
+            "¿Tienes egresos extra en COP para netear (1444)?",
+            value=False,
+            key="eg_extra_1444_toggle"
+        )
     except Exception:
         pass
 
@@ -1019,7 +1024,8 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casi
         modo = st.radio(
             "Cómo cargar egresos extra",
             ["Escribir manualmente", "Subir CSV"],
-            index=0, horizontal=True,
+            index=0,
+            horizontal=True,
             key="eg_extra_1444_modo"
         )
         if modo == "Subir CSV":
@@ -1059,10 +1065,35 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casi
                     key="eg_extra_1444_editor"
                 )
                 if not egresos_extra.empty:
-                    egresos_extra["Fecha"] = pd.to_datetime(egresos_extra["Fecha"], errors="coerce").dt.date
-                    egresos_extra["Monto_COP"] = pd.to_numeric(egresos_extra["Monto_COP"], errors="coerce").abs()
+                    egresos_extra["Fecha"] = pd.to_datetime(
+                        egresos_extra["Fecha"], errors="coerce"
+                    ).dt.date
+                    egresos_extra["Monto_COP"] = pd.to_numeric(
+                        egresos_extra["Monto_COP"], errors="coerce"
+                    ).abs()
                     egresos_extra["Descripcion"] = egresos_extra.get("Descripcion", "").astype(str)
                     egresos_extra = egresos_extra.dropna(subset=["Fecha", "Monto_COP"])
+
+    # === SNAPSHOT DETALLE DE EGRESOS EXTRA (para hoja aparte) ===
+    egresos_detalle = pd.DataFrame(columns=["Fecha", "Monto_COP", "Descripcion"])
+    if not egresos_extra.empty:
+        egresos_detalle = egresos_extra.copy()
+        egresos_detalle["Fecha"] = pd.to_datetime(
+            egresos_detalle["Fecha"], errors="coerce"
+        ).dt.date
+        egresos_detalle["Monto_COP"] = pd.to_numeric(
+            egresos_detalle["Monto_COP"], errors="coerce"
+        )
+        egresos_detalle["Descripcion"] = egresos_detalle.get("Descripcion", "").astype(str)
+
+    try:
+        if hasattr(st, "session_state"):
+            st.session_state["1444_egresos_extra_detalle"] = egresos_detalle
+    except Exception:
+        pass
+    # === /SNAPSHOT DETALLE ===
+
+    # ========= Neteo diario en COP =========
 
     # ========= Neteo diario en COP =========
     df_neteo = df_base.copy()
@@ -1073,21 +1104,33 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casi
         .sum(min_count=1)
         .fillna(0.0)
     )
-    extras_por_dia = (
-        egresos_extra.groupby("Fecha")["Monto_COP"].sum().astype(float)
-        if not egresos_extra.empty else pd.Series(dtype="float64")
-    )
 
     log_rows = []
-    if not extras_por_dia.empty:
-        for fecha, egreso_cop in extras_por_dia.items():
-            ingreso_dia = float(ingresos_por_dia.get(fecha, 0.0))
-            neteo_aplicado = float(min(egreso_cop, ingreso_dia))
-            cop_convertible = float(max(0.0, ingreso_dia - egreso_cop))
-            egreso_pendiente = float(max(0.0, egreso_cop - ingreso_dia))
 
-            # netear filas del día
-            if ingreso_dia > 0.0:
+    if not egresos_extra.empty:
+        # Normalizar egresos_extra para estar seguros de tipos
+        egresos_extra_proc = egresos_extra.copy()
+        egresos_extra_proc["Fecha"] = pd.to_datetime(
+            egresos_extra_proc["Fecha"], errors="coerce"
+        ).dt.date
+        egresos_extra_proc["Monto_COP"] = pd.to_numeric(
+            egresos_extra_proc["Monto_COP"], errors="coerce"
+        ).fillna(0.0)
+        egresos_extra_proc["Descripcion"] = egresos_extra_proc.get("Descripcion", "").astype(str)
+        egresos_extra_proc = egresos_extra_proc.dropna(subset=["Fecha"])
+
+        for _, row_eg in egresos_extra_proc.iterrows():
+            fecha = row_eg["Fecha"]
+            egreso_cop = float(row_eg["Monto_COP"] or 0.0)
+            desc = str(row_eg.get("Descripcion", "")).strip()
+
+            ingreso_dia = float(ingresos_por_dia.get(fecha, 0.0))
+
+            neteo_aplicado = 0.0
+            egreso_pendiente = egreso_cop
+
+            # netear filas del día SOLO para este egreso
+            if ingreso_dia > 0.0 and egreso_cop > 0.0:
                 idxs = df_neteo.index[df_neteo["FECHA_DATE"] == fecha].tolist()
                 restante = egreso_cop
                 for idx in idxs:
@@ -1096,18 +1139,32 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casi
                     val = float(df_neteo.at[idx, "VALOR"] or 0.0)
                     if val <= 0:
                         continue
+
                     if val <= restante:
+                        # se consume la fila completa
                         restante -= val
+                        neteo_aplicado += val
                         df_neteo.at[idx, "VALOR"] = 0.0
                     else:
+                        # se consume parte de la fila
                         df_neteo.at[idx, "VALOR"] = val - restante
+                        neteo_aplicado += restante
                         restante = 0.0
 
+                egreso_pendiente = float(max(0.0, egreso_cop - neteo_aplicado))
+
+            cop_convertible = None  # se rellena después del GMF
+
+            aviso_texto = ""
             if egreso_pendiente > 0:
-                st.warning(f"AVISO (1444) {fecha}: Debes ${egreso_pendiente:,.0f} COP por netear. Cárgalo mañana.")
+                aviso_texto = f"DEBE ${egreso_pendiente:,.0f} COP — Cargar mañana"
+                st.warning(
+                    f"AVISO (1444) {fecha}: Debes ${egreso_pendiente:,.0f} COP por netear. Cárgalo mañana."
+                )
 
             log_rows.append({
                 "Fecha": fecha,
+                "Descripcion": desc,              # 👈 NUEVA COLUMNA
                 "Egreso_extra_COP": egreso_cop,
                 "Ingresos_COP_del_dia": ingreso_dia,
                 "Neteo_aplicado_COP": neteo_aplicado,
@@ -1115,14 +1172,15 @@ def procesar_ingresos_clientes_csv_casillero1444(files: list, usuario: str, casi
                 "Egreso_pendiente_COP": egreso_pendiente,
                 "TRM_del_dia": None,
                 "USD_generado": None,
-                "Aviso": (
-                    f"DEBE ${egreso_pendiente:,.0f} COP — Cargar mañana"
-                    if egreso_pendiente > 0 else ""
-                )
+                "Aviso": aviso_texto
             })
 
-        # quitar filas en 0
-        df_neteo = df_neteo[df_neteo["VALOR"].fillna(0.0) > 0.0].copy()
+        # quitar filas en 0 después de netear
+        df_neteo = df_neteo[
+            pd.to_numeric(df_neteo["VALOR"], errors="coerce").fillna(0.0) > 0.0
+        ].copy()
+
+
 
     # ========= GMF 4x1000 =========
     GMF_RATE = 0.004
