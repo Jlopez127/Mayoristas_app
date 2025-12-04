@@ -2367,7 +2367,7 @@ def main():
 
         # ------------------ NUEVO: GMF 4x1000 SOLO PARA 1633 ------------------
         gmf_df = None
-        if cas in ("1633", "13608"):
+        if cas in ("1633"):
             # Elegir de qué DF calcular el GMF (preferimos el ingreso real que se usó)
             base_ing = inc if (inc is not None and not inc.empty) else ing_n  # fallback a Nath si inc viene de otra persona
             if base_ing is not None and not base_ing.empty:
