@@ -43,7 +43,7 @@ def upload_to_dropbox(data: bytes):
 # — 1) Egresos (Compras) —
 @st.cache_data
 def procesar_egresos(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    casilleros = ["9444", "14856", "11591", "1444", "1633", "13608", "9680"]
+    casilleros = ["9444", "14856", "11591", "1444", "1633", "13608", "9680", "14825"]
     df = df.copy()
 
     # Fechas y tipos
@@ -56,12 +56,16 @@ def procesar_egresos(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     # Cortes por casillero
     cutoff_13608 = pd.Timestamp("2025-09-18")
     cutoff_9680  = pd.Timestamp("2025-11-11")
+    cutoff_14825 = pd.Timestamp("2026-02-11")
+
 
     # Mantener 13608 solo desde 2025-09-18 y 9680 solo desde 2025-11-11
     df = df[
         ((df["Casillero"] != "13608") | (df["Fecha Compra"] >= cutoff_13608)) &
-        ((df["Casillero"] != "9680")  | (df["Fecha Compra"] >= cutoff_9680))
+        ((df["Casillero"] != "9680")  | (df["Fecha Compra"] >= cutoff_9680)) &
+        ((df["Casillero"] != "14825") | (df["Fecha Compra"] >= cutoff_14825))
     ]
+
 
     # Formatos y normalizaciones
     df["Fecha Compra"] = df["Fecha Compra"].dt.strftime("%Y-%m-%d")
@@ -93,6 +97,7 @@ def procesar_egresos(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     # Alias de usuario conocido
     df.loc[df["Casillero"] == "9444", "Usuario"] = "Maira Alejandra Paez"
     df.loc[df["Casillero"] == "9680", "Usuario"] = "Juan Felipe Laverde"
+    df.loc[df["Casillero"] == "14825", "Usuario"] = "Cristian Javier Castro"
     # Salida por casillero
     salida = {}
     for cas in casilleros:
@@ -152,7 +157,7 @@ def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     Lee la hoja 'Mayoristas' (Envios mayoristas) y devuelve un dict con un DF por casillero.
     Normaliza Fecha de dd-mm-YYYY -> YYYY-MM-DD para que sea consistente con el resto.
     """
-    casilleros_validos = {"9444", "14856", "11591", "1444", "1633", "13608", "9680"}
+    casilleros_validos = {"9444", "14856", "11591", "1444", "1633", "13608", "9680", "14825"}
 
     df2 = df.copy()
     df2.columns = [str(c).strip() for c in df2.columns]
@@ -1824,8 +1829,8 @@ def procesar_ingresos_davivienda(files: list, usuario: str, casillero: str) -> p
 # === Config de cobros mensuales por casillero (fácil de cambiar) ===
 COBROS_MENSUALES_CONF = {
     # casillero : {"inicio": "YYYY-MM-01", "monto": int}
-    "1633": {"inicio": "2024-02-01", "monto": 711_750},
-    "13608": {"inicio": "2025-11-01", "monto": 500000},
+    "1633": {"inicio": "2024-02-01", "monto": 879_000},
+    "13608": {"inicio": "2025-11-01", "monto": 620000},
 }
 
 def aplicar_cobro_contabilidad_mensual(historico, hoja, casillero, usuario, fecha_carga, inicio_yyyymm, monto, etiqueta_base="cobro contabilidad"):
@@ -2184,6 +2189,60 @@ def main():
     st.markdown("---")
 
 
+    # 4) Ingresos Cristian Javier Castro (CA14825)
+    st.header("5) Ingresos Cristian Javier Castro (CA14825)")
+    cris_files = st.file_uploader(
+        "Sube archivos .xls y .csv de Cristian",
+        type=["xls", "xlsx", "csv"],
+        accept_multiple_files=True,
+        key="cris_files_14825"
+    )
+    
+    confirm_cris = st.radio(
+        "¿Estás seguro de que los archivos de Cristian son los correctos?",
+        ["No, quiero revisar", "Sí, procesar"],
+        index=0,
+        horizontal=True,
+        key="conf_cris"
+    )
+    
+    ingresos_cris = {}
+    
+    if cris_files and confirm_cris == "Sí, procesar":
+        xls_files = [f for f in cris_files if f.name.lower().endswith((".xls", ".xlsx"))]
+        csv_files = [f for f in cris_files if f.name.lower().endswith(".csv")]
+    
+        dfs = []
+        if xls_files:
+            df_xls = procesar_ingresos_clientes_xls(xls_files, "Cristian Javier Castro", "14825")
+            dfs.append(df_xls)
+        if csv_files:
+            df_csv = procesar_ingresos_clientes_csv(csv_files, "Cristian Javier Castro", "14825")
+            dfs.append(df_csv)
+    
+        df_cris = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        ingresos_cris["ingresos_14825"] = df_cris
+    
+        if df_cris.empty:
+            st.info("Sin movimientos válidos")
+        else:
+            st.dataframe(df_cris, use_container_width=True)
+    
+    elif cris_files and confirm_cris == "No, quiero revisar":
+        st.warning("👀 Aún no se procesan los archivos de Cristian. Revisa y luego marca 'Sí, procesar'.")
+    else:
+        st.info("📂 No subes archivos de Cristian")
+
+
+
+
+
+
+
+
+
+
+
      # 4) Ingresos Elvis (CA11591)
     st.header("5) Ingresos Elvis (CA11591)")
     elv_files = st.file_uploader(
@@ -2395,7 +2454,8 @@ def main():
     st.header("8) Conciliaciones Finales")
 
     # asegúrate de que la lista incluya el nuevo casillero
-    casilleros = ["9444", "14856", "11591", "1444", "1633", "13608", "9680"]
+    casilleros = ["9444", "14856", "11591", "1444", "1633", "13608", "9680", "14825"]
+
     conciliaciones = {}
     
     for cas in casilleros:
@@ -2407,19 +2467,25 @@ def main():
         ing_e = ingresos_elv.get(key_ing)       if isinstance(ingresos_elv, dict)       else None
         ing_m = ingresos_moises.get(key_ing)    if isinstance(ingresos_moises, dict)    else None
         ing_9 = ingresos_9680.get(key_ing)      if isinstance(ingresos_9680, dict)      else None  # NUEVO
+        ing_c = ingresos_cris.get(key_ing) if isinstance(ingresos_cris, dict) else None
+
+        
     
         if ing_j is not None and not ing_j.empty:
             inc = ing_j
         elif ing_n is not None and not ing_n.empty:
             inc = ing_n
+        elif ing_c is not None and not ing_c.empty:
+            inc = ing_c
         elif ing_e is not None and not ing_e.empty:
             inc = ing_e
         elif ing_m is not None and not ing_m.empty:
             inc = ing_m
-        elif ing_9 is not None and not ing_9.empty:  # NUEVO
+        elif ing_9 is not None and not ing_9.empty:
             inc = ing_9
         else:
             inc = None
+
     
         # ... (resto del loop: gmf_df, egr, ext, env, dev, frames, etc.)
 
