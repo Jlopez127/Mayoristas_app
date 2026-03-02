@@ -2642,27 +2642,33 @@ def main():
 
             
             # eliminar duplicados ingresos (pero NO los Ingreso_extra)
+            # --- deduplicar ingresos (pero NO devoluciones) ---
             if "Motivo" in combinado.columns:
-                mask_ing_base = (combinado["Tipo"] == "Ingreso") & (combinado["Motivo"] != "Ingreso_extra")
+                # Ingresos normales: excluir Ingreso_extra y excluir Devolucion
+                mask_ing_base = (
+                    (combinado["Tipo"] == "Ingreso") &
+                    (combinado["Motivo"] != "Ingreso_extra") &
+                    (combinado["Motivo"].astype(str).str.strip().str.lower() != "devolucion")
+                )
             else:
-                mask_ing_base = (combinado["Tipo"] == "Ingreso")
+                # Si no existe Motivo, mejor no deduplicar ingresos acá (para no borrar devoluciones)
+                mask_ing_base = pd.Series(False, index=combinado.index)
             
-            ingr   = combinado[mask_ing_base].drop_duplicates(subset=["Orden", "Tipo"])
-            otros  = combinado[~mask_ing_base]
+            # Dedup SOLO ingresos normales (no devoluciones)
+            ingr = combinado[mask_ing_base].drop_duplicates(subset=["Orden", "Tipo"], keep="last")
+            otros = combinado[~mask_ing_base]
             combinado = pd.concat([otros, ingr], ignore_index=True)
             
-                        # --- deduplicar únicamente Ingreso_extra (si existe 'Motivo') ---
+            # --- deduplicar únicamente Ingreso_extra (si existe 'Motivo') ---
             if "Motivo" in combinado.columns:
-                mask_x = (combinado["Tipo"].eq("Ingreso") &
-                          combinado["Motivo"].eq("Ingreso_extra"))
+                mask_x = (
+                    combinado["Tipo"].eq("Ingreso") &
+                    combinado["Motivo"].eq("Ingreso_extra")
+                )
                 # conserva un solo registro por Orden–Motivo
-                iex = (combinado.loc[mask_x]
-                       .drop_duplicates(subset=["Orden", "Motivo"]))
+                iex = combinado.loc[mask_x].drop_duplicates(subset=["Orden", "Motivo"], keep="last")
                 combinado = pd.concat([combinado.loc[~mask_x], iex], ignore_index=True)
             
-                        
-            
-                
             # completar ingresos nulos desde egresos por Orden (cuando aplique)
             mask_n = (combinado["Tipo"] == "Ingreso") & combinado["Monto"].isna()
             for i, row in combinado[mask_n].iterrows():
