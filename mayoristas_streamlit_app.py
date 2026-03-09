@@ -494,31 +494,19 @@ def exportar_ingresos_csv_a_dropbox(out: pd.DataFrame, casillero: str):
     df_old = df_old.reindex(columns=all_cols)
     df_new = out.reindex(columns=all_cols)
 
-    # 4) Concatenar
+    # 4) Concatenar: primero Dropbox, luego lo nuevo
     df_comb = pd.concat([df_old, df_new], ignore_index=True)
-    df_comb["ID_INGRESO"] = df_comb["ID_INGRESO"].astype(str)
-
+    df_comb["ID_INGRESO"] = df_comb["ID_INGRESO"].astype(str).str.strip()
+    
     # 4.1) Asegurar columnas Id_cliente y Factura
     for col in ["Id_cliente", "Factura"]:
         if col not in df_comb.columns:
             df_comb[col] = ""
-
-    # 4.2) TU LÓGICA DE DEDUPLICACIÓN:
-    #     priorizamos filas que ya traigan Id_cliente o Factura llenos
-    df_comb["_tiene_info"] = (
-        df_comb["Id_cliente"].astype(str).str.strip().ne("") |
-        df_comb["Factura"].astype(str).str.strip().ne("")
-    )
-
-    # Primero las filas con info (_tiene_info = True), luego las vacías
-    df_comb = df_comb.sort_values(by="_tiene_info", ascending=False)
-
-    # Eliminar duplicados por ID_INGRESO quedándose con la primera
-    # (es decir, la que tiene info en Id_cliente/Factura si existe)
-    df_comb = df_comb.drop_duplicates(subset=["ID_INGRESO"], keep="first")
-
-    # Ya no necesitamos la columna auxiliar
-    df_comb = df_comb.drop(columns=["_tiene_info"])
+    
+    # 4.2) NUEVA LÓGICA:
+    # Si el ID ya existía en Dropbox, se conserva el de Dropbox.
+    # Solo se agregan IDs nuevos.
+    df_comb = df_comb.drop_duplicates(subset=["ID_INGRESO"], keep="first").copy()
 
     # 5) Guardar a Excel en memoria y subir a Dropbox
     buf_out = io.BytesIO()
