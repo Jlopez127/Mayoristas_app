@@ -1957,7 +1957,31 @@ def recalcular_totales_diarios(df, usuario, cas):
     base = base[base["Fecha"].notna()].copy()
 
     # Normalizar tipo
-    tipo_upper = base["Tipo"].astype(str).str.upper()
+    # Blindaje final ANTES del cálculo:
+    # toda devolución debe sumar como ingreso positivo, sin importar cómo venga mezclada en combinado
+    base["Tipo"] = base["Tipo"].astype(str).str.strip()
+    base["Monto"] = pd.to_numeric(base["Monto"], errors="coerce").fillna(0)
+
+    if "Motivo" in base.columns:
+        motivo_norm = base["Motivo"].astype(str).str.strip().str.lower()
+    else:
+        motivo_norm = pd.Series("", index=base.index)
+
+    if "Nombre del producto" in base.columns:
+        nombre_norm = base["Nombre del producto"].astype(str).str.strip().str.lower()
+    else:
+        nombre_norm = pd.Series("", index=base.index)
+
+    mask_dev = (
+        motivo_norm.eq("devolucion") |
+        nombre_norm.str.contains("devoluc", na=False)
+    )
+
+    # TODA devolución se fuerza a ingreso positivo
+    base.loc[mask_dev, "Tipo"] = "Ingreso"
+    base.loc[mask_dev, "Monto"] = base.loc[mask_dev, "Monto"].abs()
+
+    tipo_upper = base["Tipo"].astype(str).str.strip().str.upper()
 
     ingresos_d = (
         base.loc[tipo_upper == "INGRESO"]
@@ -2737,33 +2761,47 @@ def main():
                 hoja = f"{cas} - sin_nombre"
                 
             # 2) Dedups y limpiezas
-            combinado["Orden"] = combinado["Orden"].astype(str)
-    
-            # eliminar duplicados egresos
-            mask_e = combinado["Tipo"] == "Egreso"
-            egrs   = combinado[mask_e].drop_duplicates(subset=["Orden", "Tipo"])
-            otros  = combinado[~mask_e]
-            combinado = pd.concat([otros, egrs], ignore_index=True)
+            combinado["Orden"] = (
+                combinado["Orden"]
+                .astype(str)
+                .str.strip()
+                .str.replace(".0", "", regex=False)
+            )
             
+            combinado["Tipo"] = combinado["Tipo"].astype(str).str.strip()
+            
+            # eliminar duplicados egresos (sin tocar devoluciones que comparten Orden)
+            mask_e = combinado["Tipo"].str.upper() == "EGRESO"
+            if "Motivo" in combinado.columns:
+                mask_dev_e = combinado["Motivo"].astype(str).str.strip().str.lower().str.contains("devoluc", na=False)
+            else:
+                mask_dev_e = pd.Series(False, index=combinado.index)
+            mask_e_dedup = mask_e & ~mask_dev_e
+            egrs   = combinado[mask_e_dedup].drop_duplicates(subset=["Orden"], keep="last")
+            otros  = combinado[~mask_e_dedup]
+            combinado = pd.concat([otros, egrs], ignore_index=True)
 
             
             # eliminar duplicados ingresos (pero NO los Ingreso_extra)
             # --- deduplicar ingresos (pero NO devoluciones) ---
             if "Motivo" in combinado.columns:
-                # Ingresos normales: excluir Ingreso_extra y excluir Devolucion
-                mask_ing_base = (
-                    (combinado["Tipo"] == "Ingreso") &
-                    (combinado["Motivo"] != "Ingreso_extra") &
-                    (combinado["Motivo"].astype(str).str.strip().str.lower() != "devolucion")
-                )
+                tipo_norm = combinado["Tipo"].astype(str).str.strip().str.upper()
+                motivo_norm = combinado["Motivo"].astype(str).str.strip().str.lower()
+            
+                es_ingreso = tipo_norm.eq("INGRESO")
+                es_ingreso_extra = motivo_norm.eq("ingreso_extra")
+                es_devolucion = motivo_norm.str.contains("devoluc", na=False)  # cubre Devolucion / Devolución
+            
+                # SOLO deduplica ingresos normales (no Ingreso_extra, no Devoluciones)
+                mask_ing_base = es_ingreso & ~es_ingreso_extra & ~es_devolucion
             else:
-                # Si no existe Motivo, mejor no deduplicar ingresos acá (para no borrar devoluciones)
+                # Sin Motivo, no deduplicar ingresos para evitar borrar devoluciones
                 mask_ing_base = pd.Series(False, index=combinado.index)
             
-            # Dedup SOLO ingresos normales (no devoluciones)
-            ingr = combinado[mask_ing_base].drop_duplicates(subset=["Orden", "Tipo"], keep="last")
-            otros = combinado[~mask_ing_base]
+            ingr = combinado.loc[mask_ing_base].drop_duplicates(subset=["Orden", "Tipo"], keep="last")
+            otros = combinado.loc[~mask_ing_base]
             combinado = pd.concat([otros, ingr], ignore_index=True)
+
             
             # --- deduplicar únicamente Ingreso_extra (si existe 'Motivo') ---
             if "Motivo" in combinado.columns:
@@ -2901,23 +2939,33 @@ def main():
                 )
             
                 if "Motivo" in df_valid.columns:
-                    mask_dev = (df_valid["Tipo"] == "INGRESO") & (df_valid["Motivo"].astype(str).str.lower() == "devolucion")
+                    motivo_norm_v = df_valid["Motivo"].astype(str).str.strip().str.lower()
+                    mask_dev = (df_valid["Tipo"] == "INGRESO") & motivo_norm_v.str.contains("devoluc", na=False)
                 else:
-                    mask_dev = (df_valid["Tipo"] == "INGRESO") & (df_valid["Nombre del producto"].astype(str).str.lower().str.contains("devoluc"))
-            
+                    mask_dev = (df_valid["Tipo"] == "INGRESO") & (
+                        df_valid["Nombre del producto"].astype(str).str.lower().str.contains("devoluc", na=False)
+                    )
+                
                 devoluciones_por_orden = (
                     df_valid[mask_dev]
                     .groupby("Orden")["Monto"].sum(min_count=1)
                 )
-            
+                
                 ordenes = sorted(set(devoluciones_por_orden.index) | set(egresos_por_orden.index))
                 for o in ordenes:
                     eg = float(egresos_por_orden.get(o, 0.0) or 0.0)
                     dv = float(devoluciones_por_orden.get(o, 0.0) or 0.0)
-                    if dv > eg and eg > 0:
+                
+                    if dv > 0 and eg <= 0:
+                        msg = f"Devolución con orden inexistente en casillero {cas} — Orden {o}: devuelto ${dv:,.2f} y egresado ${eg:,.2f}."
+                        st.error(f"🚨 {msg}")
+                        errores_validacion.append(msg)
+                    elif dv > eg:
                         exceso = dv - eg
                         msg = f"Devolución excedida en casillero {cas} — Orden {o}: devuelto ${dv:,.2f} > egresado ${eg:,.2f}. Exceso ${exceso:,.2f}."
                         st.error(f"🚨 {msg}")
+                        errores_validacion.append(msg)
+
                         errores_validacion.append(msg)
             # ---------- /VALIDACIÓN ----------
 
