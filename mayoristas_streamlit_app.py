@@ -3121,12 +3121,12 @@ def main():
             horizontal=True
         )
         
-        if modo_prueba == "No":
+       # if modo_prueba == "No":
             # Enviar correos por casillero (solo a los configurados)
-            for cas in st.secrets["zoho"]["recipients"].keys():
-                obtener_y_enviar_alerta_saldo(historico, str(cas), fecha_carga)
-        else:
-            st.info("Modo prueba activo: no se enviaron correos.")
+        #    for cas in st.secrets["zoho"]["recipients"].keys():
+         #       obtener_y_enviar_alerta_saldo(historico, str(cas), fecha_carga)
+       # else:
+        #    st.info("Modo prueba activo: no se enviaron correos.")
 
 
         # 1) Botón de descarga local
