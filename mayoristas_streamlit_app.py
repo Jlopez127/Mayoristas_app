@@ -1685,48 +1685,84 @@ def main():
     
 
                 
+            # ---- Cobros mensuales de contabilidad (parametrizados por casillero) ----
+            if cas in COBROS_MENSUALES_CONF:
+                cfg = COBROS_MENSUALES_CONF[cas]
+                tmp_hist = {hoja: combinado.copy()}
+                tmp_hist = aplicar_cobro_contabilidad_mensual(
+                    tmp_hist, hoja, cas, usuario, fecha_carga,
+                    inicio_yyyymm=cfg["inicio"], monto=cfg["monto"], etiqueta_base="cobro contabilidad"
+                )
+                combinado = tmp_hist[hoja].copy()
+            # -------------------------------------------------------------------------
+
+            # ---------- RECÁLCULO FINAL DE TOTALES ----------
+            combinado = recalcular_totales_diarios(
+                combinado,
+                usuario=usuario,
+                cas=cas
+            )
+            # ---------- /RECÁLCULO FINAL DE TOTALES ----------
+
             # ---------- COMISIÓN QUINCENAL POR TOTALES (SOLO CA1444) ----------
+            # Corre DESPUÉS del recálculo para usar el saldo final (incluye movimientos tardíos
+            # subidos en esta misma corrida). Para períodos con inicio >= 2026-04-01, si la fila
+            # ya existe se reescribe el Monto con el valor recalculado; para períodos anteriores
+            # se mantiene el comportamiento viejo (skip si existe).
             if cas == "1444":
                 import calendar
-            
+                from datetime import date as _date
+
                 dfh = combinado.copy()
                 dfh["Fecha_dt"] = pd.to_datetime(dfh["Fecha"], errors="coerce").dt.date
                 dfh["Monto"] = pd.to_numeric(dfh["Monto"], errors="coerce")
-            
+
                 fc_date = pd.to_datetime(fecha_carga, errors="coerce").date()
                 y, m, d = fc_date.year, fc_date.month, fc_date.day
-            
+
                 meses = {
                     1:"enero",2:"febrero",3:"marzo",4:"abril",5:"mayo",6:"junio",
                     7:"julio",8:"agosto",9:"septiembre",10:"octubre",11:"noviembre",12:"diciembre"
                 }
-            
+
+                CUTOFF_COMISION_NUEVA = _date(2026, 4, 1)
+
                 def agregar_comision_rango(dfh_local, ini_date, fin_date, etiqueta):
                     orden_nombre = f"Comision de ({etiqueta})"
-            
-                    existe = False
+                    es_nueva_logica = ini_date >= CUTOFF_COMISION_NUEVA
+
+                    mask_existente = pd.Series(False, index=dfh_local.index)
                     if "Orden" in dfh_local.columns:
-                        existe = existe or dfh_local["Orden"].astype(str).str.lower().eq(orden_nombre.lower()).any()
+                        mask_existente = mask_existente | dfh_local["Orden"].astype(str).str.lower().eq(orden_nombre.lower())
                     if "Nombre del producto" in dfh_local.columns:
-                        existe = existe or dfh_local["Nombre del producto"].astype(str).str.lower().eq(orden_nombre.lower()).any()
-            
-                    if existe:
+                        mask_existente = mask_existente | dfh_local["Nombre del producto"].astype(str).str.lower().eq(orden_nombre.lower())
+
+                    existe = bool(mask_existente.any())
+
+                    if existe and not es_nueva_logica:
                         return dfh_local
-            
-                    mask = (
+
+                    mask_tot = (
                         dfh_local["Tipo"].astype(str).str.upper().eq("TOTAL")
                         & (dfh_local["Fecha_dt"] >= ini_date)
                         & (dfh_local["Fecha_dt"] <= fin_date)
                     )
-            
-                    serie = pd.to_numeric(dfh_local.loc[mask, "Monto"], errors="coerce")
+
+                    serie = pd.to_numeric(dfh_local.loc[mask_tot, "Monto"], errors="coerce")
                     serie = serie[serie < 0]
-            
+
                     if serie.empty:
+                        if existe and es_nueva_logica:
+                            return dfh_local.loc[~mask_existente].copy()
                         return dfh_local
-            
+
                     comision = float(abs(serie.min()) * 0.015)
-            
+
+                    if existe and es_nueva_logica:
+                        dfh_local.loc[mask_existente, "Monto"] = comision
+                        dfh_local.loc[mask_existente, "Fecha de Carga"] = fecha_carga
+                        return dfh_local
+
                     nueva = pd.DataFrame([{
                         "Fecha": fc_date,
                         "Tipo": "Egreso",
@@ -1740,9 +1776,9 @@ def main():
                         "Nombre del producto": orden_nombre,
                         "Fecha de Carga": fecha_carga
                     }])
-            
+
                     return pd.concat([dfh_local, nueva], ignore_index=True)
-            
+
                 if 1 <= d <= 15:
                     prev_y = y if m > 1 else y - 1
                     prev_m = m - 1 if m > 1 else 12
@@ -1751,36 +1787,26 @@ def main():
                     fin = pd.Timestamp(prev_y, prev_m, last_prev).date()
                     etiqueta = f"16-fin {meses[prev_m]} {prev_y}"
                     dfh = agregar_comision_rango(dfh, ini, fin, etiqueta)
-            
+
                 if d >= 16:
                     ini = pd.Timestamp(y, m, 1).date()
                     fin = pd.Timestamp(y, m, 15).date()
                     etiqueta = f"1-15 {meses[m]} {y}"
                     dfh = agregar_comision_rango(dfh, ini, fin, etiqueta)
-            
+
                 dfh = dfh.drop(columns=["Fecha_dt"], errors="ignore")
                 combinado = dfh.copy()
-            # ---------- /COMISIÓN QUINCENAL ----------
-            
-            # ---- Cobros mensuales de contabilidad (parametrizados por casillero) ----
-            if cas in COBROS_MENSUALES_CONF:
-                cfg = COBROS_MENSUALES_CONF[cas]
-                tmp_hist = {hoja: combinado.copy()}
-                tmp_hist = aplicar_cobro_contabilidad_mensual(
-                    tmp_hist, hoja, cas, usuario, fecha_carga,
-                    inicio_yyyymm=cfg["inicio"], monto=cfg["monto"], etiqueta_base="cobro contabilidad"
+
+                # Recalcular TOTALES otra vez para que el saldo del día de carga incorpore la
+                # fila de comisión recién agregada o actualizada.
+                combinado = recalcular_totales_diarios(
+                    combinado,
+                    usuario=usuario,
+                    cas=cas
                 )
-                combinado = tmp_hist[hoja].copy()
-            # -------------------------------------------------------------------------
-            
-            # ---------- RECÁLCULO FINAL DE TOTALES ----------
-            combinado = recalcular_totales_diarios(
-                combinado,
-                usuario=usuario,
-                cas=cas
-            )
+            # ---------- /COMISIÓN QUINCENAL ----------
+
             historico[hoja] = combinado.copy()
-            # ---------- /RECÁLCULO FINAL DE TOTALES ----------
                         
             
             
