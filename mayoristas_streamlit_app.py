@@ -47,7 +47,14 @@ def procesar_egresos(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     df = df.copy()
 
     # Fechas y tipos
-    df["Fecha Compra"] = pd.to_datetime(df["Fecha Compra"], errors="coerce", utc=True).dt.tz_convert(None)
+    # La fecha base de los egresos es la de CREACIÓN de la orden, en hora Colombia
+    # (Bogotá, UTC-5). 'Fecha Creación Orden' trae hora real en UTC, así que hay que
+    # convertir antes de tomar el día para que las órdenes caigan en la quincena correcta.
+    df["Fecha"] = (
+        pd.to_datetime(df["Fecha Creación Orden"], errors="coerce", utc=True)
+        .dt.tz_convert("America/Bogota")
+        .dt.tz_localize(None)
+    )
     df["Casillero"] = df["Casillero"].astype(str)
 
     # Filtrar casilleros manejados
@@ -61,14 +68,14 @@ def procesar_egresos(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
     # Mantener 13608 solo desde 2025-09-18 y 9680 solo desde 2025-11-11
     df = df[
-        ((df["Casillero"] != "13608") | (df["Fecha Compra"] >= cutoff_13608)) &
-        ((df["Casillero"] != "9680")  | (df["Fecha Compra"] >= cutoff_9680)) &
-        ((df["Casillero"] != "14825") | (df["Fecha Compra"] >= cutoff_14825))
+        ((df["Casillero"] != "13608") | (df["Fecha"] >= cutoff_13608)) &
+        ((df["Casillero"] != "9680")  | (df["Fecha"] >= cutoff_9680)) &
+        ((df["Casillero"] != "14825") | (df["Fecha"] >= cutoff_14825))
     ]
 
 
     # Formatos y normalizaciones
-    df["Fecha Compra"] = df["Fecha Compra"].dt.strftime("%Y-%m-%d")
+    df["Fecha"] = df["Fecha"].dt.strftime("%Y-%m-%d")
     df["Tipo"] = "Egreso"
     df["Total de Pago COP"] = pd.to_numeric(df["Total de Pago COP"], errors="coerce")
     df["Valor de compra COP"] = pd.to_numeric(df["Valor de compra COP"], errors="coerce")
@@ -89,8 +96,8 @@ def procesar_egresos(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         axis=1
     )
 
-    # Renombrar y seleccionar columnas finales
-    df = df.rename(columns={"Fecha Compra": "Fecha"})[
+    # Seleccionar columnas finales (la fecha ya es 'Fecha' = Fecha Creación Orden en hora Colombia)
+    df = df[
         ["Fecha","Tipo","Monto","Orden","TRM","Usuario","Casillero","Estado de Orden","Nombre del producto"]
     ]
 
@@ -1725,7 +1732,11 @@ def main():
                     7:"julio",8:"agosto",9:"septiembre",10:"octubre",11:"noviembre",12:"diciembre"
                 }
 
-                CUTOFF_COMISION_NUEVA = _date(2026, 4, 1)
+                # Las comisiones quincenales con inicio ANTERIOR a esta fecha quedan congeladas
+                # (se conservan tal cual están en el histórico). Desde la 2ª quincena de mayo
+                # (16-31 may, la cobrada el 1 de junio) en adelante se recalculan con la nueva
+                # fecha base (Fecha Creación Orden en hora Colombia).
+                CUTOFF_COMISION_NUEVA = _date(2026, 5, 16)
 
                 def agregar_comision_rango(dfh_local, ini_date, fin_date, etiqueta):
                     orden_nombre = f"Comision de ({etiqueta})"
