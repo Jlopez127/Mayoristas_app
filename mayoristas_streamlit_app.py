@@ -216,6 +216,7 @@ CONS_NOMBRES = {
 }
 
 
+@st.cache_data(ttl=120)
 def procesar_consignaciones_dropbox() -> dict[str, pd.DataFrame]:
     """Lee consignaciones_<cas>.xlsx de Dropbox (fuente: app Dash) y arma, por casillero,
     las filas a sumar al histórico SOLO de las APROBADAS:
@@ -233,33 +234,38 @@ def procesar_consignaciones_dropbox() -> dict[str, pd.DataFrame]:
         except Exception:
             return 0.0
 
+    REQ_COLS = ("Estado", "ID", "Monto")
     for cas in CONS_NOMBRES:
         path = str(base_dir / f"consignaciones_{cas}.xlsx")
         try:
             _, res = dbx.files_download(path)
             df = pd.read_excel(io.BytesIO(res.content), sheet_name="Consignaciones", dtype=str)
+            if df is None or df.empty or any(c not in df.columns for c in REQ_COLS):
+                continue
+            df = df.fillna("")
+            aprob = df[df["Estado"].astype(str).str.strip().str.lower() == "aprobada"]
+            for _, r in aprob.iterrows():
+                oid = str(r.get("ID", "")).strip()
+                if not oid:
+                    continue  # sin Orden no se puede deduplicar -> no inyectar
+                fecha = str(r.get("Fecha", "")).strip()
+                desc = str(r.get("Descripcion", "")).strip()
+                ing_rows[cas].append({
+                    "Fecha": fecha, "Tipo": "Ingreso", "Monto": _num(r.get("Monto")),
+                    "Orden": oid, "Usuario": CONS_NOMBRES[cas],
+                    "Casillero": cas, "Motivo": "Ingreso_extra", "Nombre del producto": desc,
+                })
+                a = str(r.get("Mayorista retira", "")).strip()
+                rid = str(r.get("ID retiro", "")).strip()
+                if a in CONS_NOMBRES and rid:  # retiro a casillero real, con id válido
+                    egr_rows[a].append({
+                        "Fecha": fecha, "Tipo": "Egreso", "Monto": _num(r.get("Egreso retiro")),
+                        "Orden": rid, "Usuario": CONS_NOMBRES[a],
+                        "Casillero": a, "Motivo": "Retiro",
+                        "Nombre del producto": desc or ("Retiro " + rid),
+                    })
         except Exception:
             continue
-        if df is None or df.empty:
-            continue
-        df = df.fillna("")
-        aprob = df[df["Estado"].astype(str).str.strip().str.lower() == "aprobada"]
-        for _, r in aprob.iterrows():
-            fecha = str(r.get("Fecha", "")).strip()
-            desc = str(r.get("Descripcion", "")).strip()
-            ing_rows[cas].append({
-                "Fecha": fecha, "Tipo": "Ingreso", "Monto": _num(r.get("Monto")),
-                "Orden": str(r.get("ID", "")).strip(), "Usuario": CONS_NOMBRES[cas],
-                "Casillero": cas, "Motivo": "Ingreso_extra", "Nombre del producto": desc,
-            })
-            a = str(r.get("Mayorista retira", "")).strip()
-            if a in CONS_NOMBRES:  # casillero real (excluye PRUEBA-*)
-                egr_rows[a].append({
-                    "Fecha": fecha, "Tipo": "Egreso", "Monto": _num(r.get("Egreso retiro")),
-                    "Orden": str(r.get("ID retiro", "")).strip(), "Usuario": CONS_NOMBRES[a],
-                    "Casillero": a, "Motivo": "Retiro",
-                    "Nombre del producto": desc or ("Retiro " + str(r.get("ID retiro", "")).strip()),
-                })
 
     cols = ["Fecha", "Tipo", "Monto", "Orden", "Usuario", "Casillero", "Motivo", "Nombre del producto"]
     salida = {}
