@@ -208,6 +208,68 @@ def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return salida
 
 
+# — Consignaciones (leídas por debajo desde Dropbox; las mantiene la app Dash) —
+CONS_NOMBRES = {
+    "9444": "Maira Alejandra Paez", "14856": "Jimmy Cortes", "11591": "Paula Herrera",
+    "1444": "Maria Moises", "1633": "Nathalia Ospina", "13608": "julian sanchez",
+    "9680": "Juan Felipe Laverde", "14825": "Cristian Javier Castro",
+}
+
+
+def procesar_consignaciones_dropbox() -> dict[str, pd.DataFrame]:
+    """Lee consignaciones_<cas>.xlsx de Dropbox (fuente: app Dash) y arma, por casillero,
+    las filas a sumar al histórico SOLO de las APROBADAS:
+      - consignación aprobada -> Ingreso_extra en su casillero B (Orden = ID, ej. Consignacion4)
+      - retiro aprobado       -> ademas Egreso en el casillero que retira A (Orden = ID retiro)
+    El dedup por 'Orden' del histórico evita duplicar al correr el generador varias veces.
+    NO requiere subir archivo; lee directo de Dropbox. Excluye casilleros de prueba (PRUEBA-*)."""
+    base_dir = PurePosixPath(cfg_dbx["remote_path"]).parent
+    ing_rows = {c: [] for c in CONS_NOMBRES}   # ingresos por casillero B
+    egr_rows = {c: [] for c in CONS_NOMBRES}   # egresos por casillero A (retiros)
+
+    def _num(x):
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
+    for cas in CONS_NOMBRES:
+        path = str(base_dir / f"consignaciones_{cas}.xlsx")
+        try:
+            _, res = dbx.files_download(path)
+            df = pd.read_excel(io.BytesIO(res.content), sheet_name="Consignaciones", dtype=str)
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+        df = df.fillna("")
+        aprob = df[df["Estado"].astype(str).str.strip().str.lower() == "aprobada"]
+        for _, r in aprob.iterrows():
+            fecha = str(r.get("Fecha", "")).strip()
+            desc = str(r.get("Descripcion", "")).strip()
+            ing_rows[cas].append({
+                "Fecha": fecha, "Tipo": "Ingreso", "Monto": _num(r.get("Monto")),
+                "Orden": str(r.get("ID", "")).strip(), "Usuario": CONS_NOMBRES[cas],
+                "Casillero": cas, "Motivo": "Ingreso_extra", "Nombre del producto": desc,
+            })
+            a = str(r.get("Mayorista retira", "")).strip()
+            if a in CONS_NOMBRES:  # casillero real (excluye PRUEBA-*)
+                egr_rows[a].append({
+                    "Fecha": fecha, "Tipo": "Egreso", "Monto": _num(r.get("Egreso retiro")),
+                    "Orden": str(r.get("ID retiro", "")).strip(), "Usuario": CONS_NOMBRES[a],
+                    "Casillero": a, "Motivo": "Retiro",
+                    "Nombre del producto": desc or ("Retiro " + str(r.get("ID retiro", "")).strip()),
+                })
+
+    cols = ["Fecha", "Tipo", "Monto", "Orden", "Usuario", "Casillero", "Motivo", "Nombre del producto"]
+    salida = {}
+    for cas in CONS_NOMBRES:
+        filas = ing_rows[cas] + egr_rows[cas]
+        if filas:
+            salida[cas] = pd.DataFrame(filas)[cols]
+    return salida
+
+
 
 
 
@@ -1444,7 +1506,10 @@ def main():
     casilleros = ["9444", "14856", "11591", "1444", "1633", "13608", "9680", "14825"]
 
     conciliaciones = {}
-    
+
+    # Consignaciones/retiros aprobados (leídos por debajo de Dropbox; fuente: app Dash)
+    consignaciones_hist = procesar_consignaciones_dropbox()
+
     for cas in casilleros:
         key_ing = f"ingresos_{cas}"
     
@@ -1552,9 +1617,12 @@ def main():
         # >>> NUEVO: ENVIOS MAYORISTAS por casillero <<<
         env = envios_may.get(f"envios_{cas}") if 'envios_may' in locals() else None
 
+        # >>> NUEVO: CONSIGNACIONES/RETIROS aprobados (Ingreso_extra a B / Egreso a A) <<<
+        cons = consignaciones_hist.get(cas) if 'consignaciones_hist' in locals() else None
+
         # 3) Armar la lista de DataFrames válidos
         frames = []
-        for df in (inc, egr, ext, env):  # << añade env aquí
+        for df in (inc, egr, ext, env, cons):  # << añade cons aquí
             if df is not None and not df.empty:
                 frames.append(df)
 
