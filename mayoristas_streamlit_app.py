@@ -161,6 +161,41 @@ def procesar_ingresos_extra(hojas: dict[str, pd.DataFrame]) -> dict[str, pd.Data
 
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Envíos BLOQUEADOS (DOBLE COBRO detectado, CA1444 Maria Moises).
+# Estos 23 sub-envíos son el desglose de 4 "encabezados" que YA cobran el total
+# del grupo; cobrarlos además individualmente duplica el cargo. Se conservan SOLO
+# los encabezados (95079, 95390, 95401, 95412). Los sub-envíos de abajo:
+#   - NUNCA se cargan desde un archivo de envíos nuevo (procesar_envios_mayoristas)
+#   - se ELIMINAN del histórico en cada corrida (paso 6, antes de recalcular totales)
+# ──────────────────────────────────────────────────────────────────────────────
+ENVIOS_BLOQUEADOS_NUMS = {
+    # Grupo 1  (encabezado Envio 95079 — SE CONSERVA)
+    "95954", "95955", "95956", "95957", "95958", "95959", "95960",
+    # Grupo 2  (encabezado Envio 95390 — SE CONSERVA)
+    "95925", "95926", "95927", "95928", "95929", "95930",
+    # Grupo 3  (encabezado Envio 95401 — SE CONSERVA)
+    "95940", "95941", "95942", "95943",
+    # Grupo 4  (encabezado Envio 95412 — SE CONSERVA)
+    "95915", "95916", "95917", "95918", "95919", "95920",
+}
+# Órdenes normalizadas a bloquear, p.ej. "envio 95954"
+ENVIOS_BLOQUEADOS = {f"envio {n}" for n in ENVIOS_BLOQUEADOS_NUMS}
+
+
+def _es_envio_bloqueado(orden_series: pd.Series) -> pd.Series:
+    """True donde la Orden corresponde a un envío bloqueado (doble cobro).
+    Normaliza a minúsculas y colapsa espacios antes de comparar."""
+    norm = (
+        orden_series.astype(str)
+        .str.strip()
+        .str.lower()
+        .str.split()
+        .str.join(" ")
+    )
+    return norm.isin(ENVIOS_BLOQUEADOS)
+
+
 @st.cache_data
 def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """
@@ -198,6 +233,9 @@ def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     # Filtrar filas válidas y casilleros conocidos
     df2 = df2.dropna(subset=["Fecha", "Monto"])
     df2 = df2[df2["Casillero"].isin(casilleros_validos)].copy()
+
+    # 🚫 Envíos bloqueados (doble cobro): NUNCA cargarlos desde un archivo nuevo
+    df2 = df2[~_es_envio_bloqueado(df2["Orden"])].copy()
 
     # Orden de columnas
     cols = ["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Motivo","Nombre del producto"]
@@ -1764,7 +1802,14 @@ def main():
                 .str.strip()
                 .str.replace(".0", "", regex=False)
             )
-            
+
+            # 🚫 Purga de envíos bloqueados (doble cobro): eliminarlos del histórico.
+            # Corre ANTES del dedup y del recálculo de totales para que el saldo
+            # se recompute sin estos cargos duplicados. Solo afecta CA1444.
+            _mask_bloq = _es_envio_bloqueado(combinado["Orden"])
+            if _mask_bloq.any():
+                combinado = combinado[~_mask_bloq].reset_index(drop=True)
+
             combinado["Tipo"] = combinado["Tipo"].astype(str).str.strip()
             
             # eliminar duplicados egresos (sin tocar devoluciones que comparten Orden)
