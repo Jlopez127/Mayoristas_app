@@ -402,6 +402,101 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFrame]
     return salida
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# INCENTIVO AMEX MENSUAL (cashback). Por cada mes CERRADO, agrega un Ingreso al casillero
+# = INCENTIVO_COP_POR_USD * USD_neto, donde USD_neto = Σ(USD egresos Amex) − Σ(USD ingresos Amex)
+# y USD_fila = Monto_COP / TRM_fila (la TRM del histórico YA incluye el spread +125, así que
+# COP/TRM recupera el USD original — no se ajusta spread).
+#   - Solo casilleros Amex (AMEX_USUARIOS: 11591, 1444, 13608).
+#   - Identifica filas Amex por 'amex' en Nombre del producto/Motivo (ambos formatos), EXCLUYENDO
+#     las propias filas de incentivo.
+#   - Idempotente: Orden único incentivoamex_<cas>_<YYYY-MM> + chequeo de existencia (no recrea
+#     ni recalcula un mes ya creado; queda congelado).
+#   - Mes cerrado = mes ANTERIOR a fecha_carga; se crean todos los meses cerrados desde
+#     INCENTIVO_MES_INICIO que aún no tengan incentivo (robusto a corridas perdidas).
+# ──────────────────────────────────────────────────────────────────────────────
+INCENTIVO_AMEX_ACTIVO = False        # 🚦 activar (True) para que se generen los incentivos
+INCENTIVO_COP_POR_USD = 25           # tarifa: COP de cashback por USD neto gastado en Amex
+INCENTIVO_MES_INICIO = "2026-07"     # primer mes cerrado a incentivar (no backfillea antes)
+INCENTIVO_MESES_ES = {1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
+                      7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre",
+                      11: "Noviembre", 12: "Diciembre"}
+
+
+def _incentivo_meses_objetivo(fecha_carga):
+    """Lista de (año, mes) cerrados desde INCENTIVO_MES_INICIO hasta el mes ANTERIOR a fecha_carga."""
+    fc = pd.to_datetime(fecha_carga, errors="coerce")
+    if pd.isna(fc):
+        return []
+    y, m = int(fc.year), int(fc.month)
+    prev_y, prev_m = (y - 1, 12) if m == 1 else (y, m - 1)
+    ini_y, ini_m = int(INCENTIVO_MES_INICIO[:4]), int(INCENTIVO_MES_INICIO[5:7])
+    meses, yy, mm = [], ini_y, ini_m
+    while (yy, mm) <= (prev_y, prev_m):
+        meses.append((yy, mm))
+        yy, mm = (yy + 1, 1) if mm == 12 else (yy, mm + 1)
+    return meses
+
+
+def agregar_incentivo_amex(combinado, cas, usuario, fecha_carga):
+    """Agrega (si no existe) un Ingreso de incentivo Amex por cada mes cerrado. Idempotente.
+    No modifica filas existentes; solo agrega. Solo casilleros Amex."""
+    if not INCENTIVO_AMEX_ACTIVO or cas not in AMEX_USUARIOS:
+        return combinado
+    if combinado is None or combinado.empty or "Orden" not in combinado.columns:
+        return combinado
+
+    df = combinado
+    orden_s = df["Orden"].astype(str)
+    nombre_s = df["Nombre del producto"].astype(str) if "Nombre del producto" in df.columns else pd.Series("", index=df.index)
+    motivo_s = df["Motivo"].astype(str) if "Motivo" in df.columns else pd.Series("", index=df.index)
+    fecha_dt = pd.to_datetime(df["Fecha"], errors="coerce")
+    monto = pd.to_numeric(df["Monto"], errors="coerce")
+    trm = pd.to_numeric(df["TRM"], errors="coerce") if "TRM" in df.columns else pd.Series(pd.NA, index=df.index)
+    tipo_u = df["Tipo"].astype(str).str.strip().str.upper()
+
+    es_amex = (nombre_s + " " + motivo_s).str.lower().str.contains("amex", na=False)
+    es_incentivo = orden_s.str.startswith("incentivoamex_") | motivo_s.str.strip().eq("Incentivo Amex")
+    amex_mask = es_amex & ~es_incentivo & tipo_u.isin(["EGRESO", "INGRESO"])
+
+    ordenes_existentes = set(orden_s)
+    nuevas = []
+    for (yy, mm) in _incentivo_meses_objetivo(fecha_carga):
+        orden_inc = f"incentivoamex_{cas}_{yy:04d}-{mm:02d}"
+        if orden_inc in ordenes_existentes:
+            continue  # ya existe -> no recrear ni recalcular (congelado)
+        mes_mask = amex_mask & (fecha_dt.dt.year == yy) & (fecha_dt.dt.month == mm)
+        if not mes_mask.any():
+            continue
+        trm_mes = trm[mes_mask]
+        if (trm_mes.isna() | (trm_mes <= 0)).any():
+            st.warning(f"⚠️ Incentivo Amex {cas} {yy}-{mm:02d}: hay filas Amex sin TRM válida; no se crea el incentivo.")
+            continue
+        usd_fila = monto[mes_mask] / trm_mes
+        tu_mes = tipo_u[mes_mask]
+        usd_neto = usd_fila[tu_mes == "EGRESO"].sum() - usd_fila[tu_mes == "INGRESO"].sum()
+        if usd_neto <= 0:
+            continue  # omitir (net <= 0)
+        monto_inc = round(INCENTIVO_COP_POR_USD * float(usd_neto))
+        etiqueta = f"{INCENTIVO_MESES_ES[mm]} {yy}"
+        nuevas.append({
+            "Fecha": pd.to_datetime(fecha_carga).strftime("%Y-%m-%d"),
+            "Tipo": "Ingreso",
+            "Monto": monto_inc,
+            "Orden": orden_inc,
+            "Motivo": "Incentivo Amex",
+            "TRM": "",
+            "Usuario": usuario,
+            "Casillero": cas,
+            "Estado de Orden": "",
+            "Nombre del producto": f"Incentivo Amex {etiqueta}",
+        })
+
+    if nuevas:
+        combinado = pd.concat([combinado, pd.DataFrame(nuevas)], ignore_index=True)
+    return combinado
+
+
 # — Consignaciones (leídas por debajo desde Dropbox; las mantiene la app Dash) —
 CONS_NOMBRES = {
     "9444": "Maira Alejandra Paez", "14856": "Jimmy Cortes", "11591": "Paula Herrera",
@@ -2083,6 +2178,12 @@ def main():
                 )
                 combinado = tmp_hist[hoja].copy()
             # -------------------------------------------------------------------------
+
+            # ── [INCENTIVO AMEX] Cashback mensual (25 COP x USD neto Amex del mes cerrado).
+            # Va ANTES del recálculo+comisión para que (por decisión de negocio) el incentivo SÍ
+            # afecte la comisión quincenal de 1444. Idempotente: no recrea un mes ya existente.
+            combinado = agregar_incentivo_amex(combinado, cas, usuario, fecha_carga)
+            # ── /[INCENTIVO AMEX] ──
 
             # ── [AMEX/COMISIÓN 1444] Aislar filas Amex del cálculo de comisión (flag en False) ──
             # Con AMEX_AFECTA_COMISION_1444=False se retiran las filas Amex de 1444 (Orden
