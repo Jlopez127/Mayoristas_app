@@ -249,6 +249,159 @@ def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return salida
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Cargue "Tarjeta Amex" (FASE 1). Convierte la actividad Amex (USD) en movimientos
+# COP acumulados por casillero y por día, listos para entrar a conciliacion_<cas>.
+#   - Solo estos 3 Card Members se cargan (el resto se IGNORA):
+#       PAULA HERRERA -> 11591 ; JUAN P CORREAL -> 1444 ; JULIAN SANCHEZ -> 13608
+#   - Amount > 0 = gasto     -> Egreso  (Monto POSITIVO, como el resto del histórico)
+#     Amount < 0 = reembolso -> Ingreso (Monto = abs)
+#   - Se agrupa por (casillero, tipo, fecha) y se suma; se convierte USD->COP con la
+#     TRM del día (datos.gov.co, mismo dataset mcec-87by) + 125 COP fijo.
+#     *** SIN TRM de respaldo: si falta la TRM de algún día con movimiento,
+#         procesar_amex LEVANTA ValueError con la lista de días (nunca inventa). ***
+#   - Etiqueta en 'Nombre del producto'; tag 'Tarjeta Amex' en 'Motivo'.
+# ──────────────────────────────────────────────────────────────────────────────
+AMEX_CARD_MAP = {
+    "PAULA HERRERA": "11591",
+    "JUAN P CORREAL": "1444",
+    "JULIAN SANCHEZ": "13608",
+}
+AMEX_USUARIOS = {"11591": "Paula Herrera", "1444": "Maria Moises", "13608": "Julian Sanchez"}
+AMEX_TRM_SPREAD = 125  # COP fijo que se suma a la TRM del día
+
+# ⚠️ CA1444 / COMISIÓN QUINCENAL.
+#   POLÍTICA ACTUAL -> True: el gasto Amex de 1444 SÍ cuenta en la base de la comisión quincenal
+#     (Amex baja el saldo -> sube la comisión). Con True el path de 1444 NO ejecuta el stash;
+#     las filas Amex entran natural al recálculo y a la comisión.
+#   False: aísla las filas Amex de la base de comisión (se ENFORCEA envolviendo el bloque de
+#     comisión con stash/reincorporación, SIN modificar su lógica). El mecanismo se deja en el
+#     código para poder volver a False si algún día cambia la política.
+AMEX_AFECTA_COMISION_1444 = True
+
+# 🚦 FECHA DE CORTE (global, único) del cargue Amex. Formato "YYYY-MM-DD".
+#   - None  -> INACTIVO: procesar_amex NO procesa ninguna fila (protección anti doble-conteo:
+#              el histórico ya trae los "Compra Amex" del backoffice; solo se carga lo NUEVO).
+#   - "YYYY-MM-DD" -> descarta toda transacción con FECHA DE TRANSACCIÓN < corte. Corte global
+#              para los 3 casilleros.
+#   Nota de diseño: al ser corte GLOBAL, si un casillero tenía backoffice hasta una fecha
+#   anterior (ej. 13608 ~2026-06-06), el tramo intermedio NO se recupera. Es intencional:
+#   se arranca limpio desde la fecha de corte.
+AMEX_FECHA_DESDE = None
+
+
+def _amex_norm_cardmember(s) -> str:
+    """Normaliza Card Member: MAYÚSCULAS + colapsa espacios dobles."""
+    return " ".join(str(s).strip().upper().split())
+
+
+def _amex_trm_dia(fecha_iso: str, _cache: dict):
+    """TRM oficial (datos.gov.co, mcec-87by) VIGENTE en 'fecha_iso' (YYYY-MM-DD) + AMEX_TRM_SPREAD.
+    Consulta por RANGO (vigenciadesde <= día <= vigenciahasta) para cubrir fines de semana/festivos
+    (el filtro por vigenciadesde exacta de procesar_ingresos_extra devuelve vacío esos días).
+    Devuelve float o None si no se encontró. Cachea por fecha."""
+    if fecha_iso in _cache:
+        return _cache[fecha_iso]
+    trm = None
+    try:
+        ds = f"{fecha_iso}T00:00:00.000"
+        url = (
+            "https://www.datos.gov.co/resource/mcec-87by.json"
+            f"?$where=vigenciadesde<='{ds}' AND vigenciahasta>='{ds}'"
+        )
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and isinstance(data, list) and "valor" in data[0]:
+            trm = float(data[0]["valor"]) + AMEX_TRM_SPREAD
+    except Exception:
+        trm = None
+    _cache[fecha_iso] = trm
+    return trm
+
+
+def procesar_amex(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFrame]:
+    """Transforma la hoja 'Transaction Details' de Amex en {amex_<cas>: DF} con movimientos COP
+    acumulados por día (ver bloque de arriba). Levanta ValueError si falta la TRM de cualquier
+    día con movimiento. 'fecha_desde' (opcional) descarta transacciones anteriores a esa fecha."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    for col in ("Card Member", "Date", "Amount"):
+        if col not in df.columns:
+            raise ValueError(f"La hoja 'Transaction Details' no tiene la columna '{col}'.")
+
+    # INACTIVO sin fecha de corte: no se procesa nada (protección anti doble-conteo).
+    # Se valida columnas ANTES (un archivo malo igual falla claro), luego se corta aquí.
+    if fecha_desde is None:
+        return {}
+
+    # Card Member -> casillero (ignora los que no están en el mapeo)
+    df["_cas"] = df["Card Member"].map(_amex_norm_cardmember).map(AMEX_CARD_MAP)
+    df = df[df["_cas"].notna()].copy()
+
+    # Fecha de transacción (Amex viene MM/DD/YYYY)
+    df["_fecha"] = pd.to_datetime(df["Date"], format="%m/%d/%Y", errors="coerce")
+    df = df[df["_fecha"].notna()].copy()
+    if fecha_desde is not None:
+        df = df[df["_fecha"] >= pd.Timestamp(fecha_desde)]
+
+    # Signo -> Tipo ; Monto USD absoluto (Amount == 0 se descarta)
+    df["_amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+    df = df[df["_amount"].notna() & (df["_amount"] != 0)].copy()
+    df["_tipo"] = df["_amount"].apply(lambda a: "Egreso" if a > 0 else "Ingreso")
+    df["_usd"] = df["_amount"].abs()
+    df["_fecha_iso"] = df["_fecha"].dt.strftime("%Y-%m-%d")
+
+    if df.empty:
+        return {}
+
+    # Agrupar por (casillero, tipo, fecha) y sumar USD
+    grp = (
+        df.groupby(["_cas", "_tipo", "_fecha_iso"], as_index=False)
+          .agg(usd=("_usd", "sum"), n=("_usd", "size"))
+    )
+    grp = grp[grp["usd"] != 0]  # si la suma del día da 0, se omite
+
+    # TRM por día (+125). Recolecta TODOS los días faltantes antes de decidir (sin default).
+    trm_cache: dict = {}
+    faltantes = set()
+    for f_iso in grp["_fecha_iso"].unique():
+        if _amex_trm_dia(f_iso, trm_cache) is None:
+            faltantes.add(f_iso)
+    if faltantes:
+        dias = ", ".join(sorted(faltantes))
+        raise ValueError(
+            f"Sin TRM (datos.gov.co) para los días con movimiento Amex: {dias}. "
+            f"No se genera ningún movimiento (no hay TRM de respaldo)."
+        )
+
+    filas = []
+    for _, r in grp.iterrows():
+        cas, tipo, f_iso, n = r["_cas"], r["_tipo"], r["_fecha_iso"], int(r["n"])
+        trm = trm_cache[f_iso]
+        monto = round(float(r["usd"]) * trm)  # COP, POSITIVO
+        etq = "gasto" if tipo == "Egreso" else "reembolso"
+        pref = "gastoamex" if tipo == "Egreso" else "reembolsoamex"
+        filas.append({
+            "Fecha": f_iso,
+            "Tipo": tipo,
+            "Monto": monto,
+            "Orden": f"{pref}_{cas}_{f_iso}",
+            "Motivo": "Tarjeta Amex",
+            "TRM": round(trm, 2),
+            "Usuario": AMEX_USUARIOS[cas],
+            "Casillero": cas,
+            "Estado de Orden": "",
+            "Nombre del producto": f"Tarjeta Amex - {etq} ({n} transacciones)",
+        })
+
+    out = pd.DataFrame(filas)
+    salida = {}
+    for cas in sorted(out["Casillero"].unique()):
+        salida[f"amex_{cas}"] = out[out["Casillero"] == cas].reset_index(drop=True)
+    return salida
+
+
 # — Consignaciones (leídas por debajo desde Dropbox; las mantiene la app Dash) —
 CONS_NOMBRES = {
     "9444": "Maira Alejandra Paez", "14856": "Jimmy Cortes", "11591": "Paula Herrera",
@@ -1256,7 +1409,53 @@ def main():
     else:
         st.info("📂 Aún no subes 'Envios mayoristas'")
 
-    
+
+    # 3.2) Tarjeta Amex (nuevo cargue)
+    st.markdown("---")
+    st.header("3.2) Tarjeta Amex")
+
+    amex_file = st.file_uploader(
+        "Sube el archivo de actividad Amex (hoja: 'Transaction Details')",
+        type=["xls", "xlsx"],
+        key="amex_uploader"
+    )
+
+    amex_may = {}  # dict global para usar después en conciliaciones
+
+    # Estado del corte de fecha (MUY visible)
+    if AMEX_FECHA_DESDE:
+        st.success(f"✅ Corte Amex ACTIVO: solo transacciones con fecha ≥ {AMEX_FECHA_DESDE}")
+    else:
+        st.warning("⚠️ Amex INACTIVO — `AMEX_FECHA_DESDE` está en None. No se carga ninguna fila "
+                   "(protección anti doble-conteo). Fija la fecha de corte (YYYY-MM-DD) para activar.")
+
+    if amex_file:
+        try:
+            # Header en la fila 7 del export Amex (índice 6)
+            df_amex = pd.read_excel(amex_file, sheet_name="Transaction Details", header=6)
+        except Exception as e:
+            st.error(f"❌ No se pudo leer la hoja 'Transaction Details': {e}")
+            df_amex = None
+
+        if df_amex is not None:
+            try:
+                amex_may = procesar_amex(df_amex, fecha_desde=AMEX_FECHA_DESDE)
+            except ValueError as e:
+                st.error(f"⛔ {e}")
+                st.stop()  # DETENER: falta TRM o columnas (sin default, como se acordó)
+            if not amex_may:
+                if AMEX_FECHA_DESDE is None:
+                    st.info("Amex INACTIVO: no se procesó nada (fija AMEX_FECHA_DESDE).")
+                else:
+                    st.info("No hay transacciones Amex (de los 3 Card Members) desde la fecha de corte.")
+            else:
+                tabs_amex = st.tabs(list(amex_may.keys()))
+                for tab, key in zip(tabs_amex, amex_may):
+                    with tab:
+                        st.dataframe(amex_may[key], use_container_width=True)
+    else:
+        st.info("📂 Aún no subes el archivo de Tarjeta Amex")
+
 
     # 3) Ingresos Nathalia Ospina (CA1633)
     st.header("4) Ingresos Nathalia Ospina (CA1633)")
@@ -1718,9 +1917,12 @@ def main():
         # >>> NUEVO: CONSIGNACIONES/RETIROS aprobados (Ingreso_extra a B / Egreso a A) <<<
         cons = consignaciones_hist.get(cas) if 'consignaciones_hist' in locals() else None
 
+        # >>> NUEVO: TARJETA AMEX por casillero (gasto/reembolso acumulado por día) <<<
+        amex = amex_may.get(f"amex_{cas}") if 'amex_may' in locals() else None
+
         # 3) Armar la lista de DataFrames válidos
         frames = []
-        for df in (inc, egr, ext, env, cons):  # << añade cons aquí
+        for df in (inc, egr, ext, env, cons, amex):  # << añade amex aquí
             if df is not None and not df.empty:
                 frames.append(df)
 
@@ -1876,6 +2078,21 @@ def main():
                 combinado = tmp_hist[hoja].copy()
             # -------------------------------------------------------------------------
 
+            # ── [AMEX/COMISIÓN 1444] Aislar filas Amex del cálculo de comisión (flag en False) ──
+            # Con AMEX_AFECTA_COMISION_1444=False se retiran las filas Amex de 1444 (Orden
+            # gastoamex_1444_/reembolsoamex_1444_) ANTES del recálculo+comisión y se reincorporan
+            # DESPUÉS. Así la comisión quincenal NO ve el gasto Amex (base intacta) pero el saldo
+            # final SÍ lo incluye. NO se toca el código de comisión; solo se envuelve.
+            _amex_stash_1444 = None
+            if cas == "1444" and not AMEX_AFECTA_COMISION_1444:
+                _m_amex = combinado["Orden"].astype(str).str.match(
+                    r"^(?:gastoamex|reembolsoamex)_1444_", na=False
+                )
+                if _m_amex.any():
+                    _amex_stash_1444 = combinado[_m_amex].copy()
+                    combinado = combinado[~_m_amex].copy()
+            # ── /[AMEX/COMISIÓN 1444] ──
+
             # ---------- RECÁLCULO FINAL DE TOTALES ----------
             combinado = recalcular_totales_diarios(
                 combinado,
@@ -1989,6 +2206,13 @@ def main():
                     cas=cas
                 )
             # ---------- /COMISIÓN QUINCENAL ----------
+
+            # ── [AMEX/COMISIÓN 1444] Reincorporar filas Amex y recalcular saldo final ──
+            # (la comisión ya se calculó SIN ellas; ahora el saldo SÍ las incluye)
+            if _amex_stash_1444 is not None:
+                combinado = pd.concat([combinado, _amex_stash_1444], ignore_index=True)
+                combinado = recalcular_totales_diarios(combinado, usuario=usuario, cas=cas)
+            # ── /[AMEX/COMISIÓN 1444] ──
 
             historico[hoja] = combinado.copy()
                         
