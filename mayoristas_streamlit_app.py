@@ -1430,6 +1430,14 @@ def main():
                    "(protección anti doble-conteo). Fija la fecha de corte (YYYY-MM-DD) para activar.")
 
     if amex_file:
+        # 🔒 BLOQUEO DURO (1ª llave): sin fecha de corte NO se procesa nada. Se detiene ANTES de
+        # leer/procesar el archivo -> imposible escribir una sola fila con AMEX_FECHA_DESDE=None.
+        if AMEX_FECHA_DESDE is None:
+            st.error("🔒 Cargue Amex BLOQUEADO: no hay fecha de corte definida "
+                     "(AMEX_FECHA_DESDE=None). Define la fecha de corte antes de cargar para "
+                     "evitar doble conteo con los egresos Amex del backoffice.")
+            st.stop()
+
         try:
             # Header en la fila 7 del export Amex (índice 6)
             df_amex = pd.read_excel(amex_file, sheet_name="Transaction Details", header=6)
@@ -1438,16 +1446,14 @@ def main():
             df_amex = None
 
         if df_amex is not None:
+            # 2ª llave: procesar_amex igual devuelve {} si fecha_desde es None (por si se llama aparte).
             try:
                 amex_may = procesar_amex(df_amex, fecha_desde=AMEX_FECHA_DESDE)
             except ValueError as e:
                 st.error(f"⛔ {e}")
                 st.stop()  # DETENER: falta TRM o columnas (sin default, como se acordó)
             if not amex_may:
-                if AMEX_FECHA_DESDE is None:
-                    st.info("Amex INACTIVO: no se procesó nada (fija AMEX_FECHA_DESDE).")
-                else:
-                    st.info("No hay transacciones Amex (de los 3 Card Members) desde la fecha de corte.")
+                st.info("No hay transacciones Amex (de los 3 Card Members) desde la fecha de corte.")
             else:
                 tabs_amex = st.tabs(list(amex_may.keys()))
                 for tab, key in zip(tabs_amex, amex_may):
