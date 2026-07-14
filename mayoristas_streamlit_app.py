@@ -255,7 +255,10 @@ def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 #   - Solo estos 3 Card Members se cargan (el resto se IGNORA):
 #       PAULA HERRERA -> 11591 ; JUAN P CORREAL -> 1444 ; JULIAN SANCHEZ -> 13608
 #   - Amount > 0 = gasto     -> Egreso  (Monto POSITIVO, como el resto del histórico)
-#     Amount < 0 = reembolso -> Ingreso (Monto = abs)
+#     Amount < 0 = reembolso REAL de merchant -> Ingreso (Monto = abs).
+#       * De los negativos se EXCLUYEN (no entran ni como ingreso ni como egreso) los
+#         PAGOS a la tarjeta (los hace Encargomio) y los CRÉDITOS Amazon que no son
+#         reembolso de compra. Ver AMEX_PAGO_PATTERNS / AMEX_CREDITO_EXCLUIR.
 #   - Se agrupa por (casillero, tipo, fecha) y se suma; se convierte USD->COP con la
 #     TRM del día (datos.gov.co, mismo dataset mcec-87by) + 125 COP fijo.
 #     *** SIN TRM de respaldo: si falta la TRM de algún día con movimiento,
@@ -269,6 +272,23 @@ AMEX_CARD_MAP = {
 }
 AMEX_USUARIOS = {"11591": "Paula Herrera", "1444": "Maria Moises", "13608": "Julian Sanchez"}
 AMEX_TRM_SPREAD = 125  # COP fijo que se suma a la TRM del día
+
+# ── Blindaje defensivo de los NEGATIVOS (Amount < 0) ──────────────────────────
+# Las TC son de Encargomio, amparadas a los mayoristas: el mayorista compra ->
+# Encargomio paga la tarjeta -> Encargomio le cobra el gasto. Por eso, de los
+# negativos SOLO el reembolso real de un merchant es Ingreso del mayorista. Se
+# EXCLUYEN (ni ingreso ni egreso):
+#   a) PAGOS a la tarjeta (los hace Encargomio): Description contiene "THANK YOU"
+#      O Category vacía/NaN. En los extractos ambas señales son 100% equivalentes
+#      (pago => "MOBILE/ONLINE PAYMENT - THANK YOU" con Category en blanco); se
+#      usan las dos con OR por redundancia -> "Category vacía = pago".
+#   b) CRÉDITOS Amazon que NO son reembolso de compra (liquidación / puntos):
+#      Description contiene "AMAZON PAY YOUR CHARGES" o "AMAZON PAY WITH POINTS".
+# Comparación case-insensitive. Solo afecta a Amount < 0; los Egreso (Amount > 0)
+# no se tocan. Hoy el impacto es $0 (esos negativos están bajo un Card Member no
+# mapeado, ya descartado); es blindaje para cuando cambie la estructura de tarjetas.
+AMEX_PAGO_PATTERNS = ["THANK YOU"]
+AMEX_CREDITO_EXCLUIR = ["AMAZON PAY YOUR CHARGES", "AMAZON PAY WITH POINTS"]
 
 # ⚠️ CA1444 / COMISIÓN QUINCENAL.
 #   POLÍTICA ACTUAL -> True: el gasto Amex de 1444 SÍ cuenta en la base de la comisión quincenal
@@ -348,6 +368,20 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFrame]
     # Signo -> Tipo ; Monto USD absoluto (Amount == 0 se descarta)
     df["_amount"] = pd.to_numeric(df["Amount"], errors="coerce")
     df = df[df["_amount"].notna() & (df["_amount"] != 0)].copy()
+
+    # Blindaje defensivo: de los NEGATIVOS, excluir pagos a la tarjeta y créditos
+    # Amazon (ver AMEX_PAGO_PATTERNS / AMEX_CREDITO_EXCLUIR). Los positivos (Egreso)
+    # NO se tocan: el AND con `_neg` garantiza que solo se filtran Amount < 0.
+    _neg = df["_amount"] < 0
+    _desc_up = df.get("Description", pd.Series("", index=df.index)).astype(str).str.upper()
+    _cat = df.get("Category", pd.Series("", index=df.index))
+    _cat_vacia = _cat.isna() | _cat.astype(str).str.strip().str.lower().isin(["", "nan", "none"])
+    _es_pago = _cat_vacia | _desc_up.apply(lambda d: any(p.upper() in d for p in AMEX_PAGO_PATTERNS))
+    _es_credito = _desc_up.apply(lambda d: any(p.upper() in d for p in AMEX_CREDITO_EXCLUIR))
+    df = df[~(_neg & (_es_pago | _es_credito))].copy()
+    if df.empty:
+        return {}
+
     df["_tipo"] = df["_amount"].apply(lambda a: "Egreso" if a > 0 else "Ingreso")
     df["_usd"] = df["_amount"].abs()
     df["_fecha_iso"] = df["_fecha"].dt.strftime("%Y-%m-%d")
