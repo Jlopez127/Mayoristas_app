@@ -437,13 +437,141 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFrame]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Cargue "Tarjeta Rakuten" (módulo PARALELO a Amex, lógica propia; NO reusa procesar_amex).
+# SOLO Maria Moises -> casillero 1444. Fuente: CSV Rakuten
+#   (columnas: Date, Amount, Type, Merchant, Category, Method).
+#   - Se FILTRA POR LA COLUMNA `Type` (NO por el signo: PAYMENT y REFUND son ambos negativos):
+#       TRANSACTION -> Egreso (gasto)         ; REFUND -> Ingreso (devolución, Monto = abs)
+#       PAYMENT / OFFER / AUTH -> IGNORAR       ; Type NUEVO/desconocido -> IGNORAR + st.warning
+#   - USD -> COP con la MISMA TRM que Amex (_amex_trm_dia: datos.gov.co por rango, +125).
+#     *** SIN TRM de respaldo: si falta la TRM de un día con movimiento, LEVANTA ValueError. ***
+#   - Acumulado por (Tipo, fecha); Orden gastorakuten_/reembolsorakuten_1444_<YYYY-MM-DD> (idempotente).
+#   - Motivo = "Tarjeta Rakuten" (tag EXACTO que captura el incentivo combinado de 1444).
+# ──────────────────────────────────────────────────────────────────────────────
+RAKUTEN_CASILLERO = "1444"
+RAKUTEN_USUARIO = "Maria Moises"
+RAKUTEN_TIPO_MAP = {"TRANSACTION": "Egreso", "REFUND": "Ingreso"}  # el resto se ignora
+RAKUTEN_TIPOS_IGNORAR = {"PAYMENT", "OFFER", "AUTH"}
+RAKUTEN_COLS = ["Date", "Amount", "Type", "Merchant", "Category", "Method"]
+
+# 🚦 FECHA DE CORTE del cargue Rakuten (mismo patrón/bloqueo que Amex). Formato "YYYY-MM-DD".
+#   - None  -> INACTIVO: procesar_rakuten NO procesa ninguna fila (protección anti doble-conteo).
+#   - "YYYY-MM-DD" -> descarta toda transacción con fecha < corte.
+RAKUTEN_FECHA_DESDE = None
+
+
+def _rakuten_warn(msg: str):
+    """st.warning si Streamlit está disponible; en dry-run (sin st) no rompe."""
+    try:
+        st.warning(msg)
+    except Exception:
+        pass
+
+
+def _rakuten_parse_amount(x) -> float:
+    """USD Rakuten '$1,234.56' / '-$1,234.56' / '($1,234.56)' -> float. NaN si no parsea."""
+    s = str(x).strip().replace("$", "").replace(",", "")
+    neg = s.startswith("(") and s.endswith(")")
+    s = s.strip("()")
+    try:
+        v = float(s)
+    except ValueError:
+        return float("nan")
+    return -v if neg else v
+
+
+def procesar_rakuten(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFrame]:
+    """Transforma el CSV Rakuten en {rakuten_1444: DF} con movimientos COP acumulados por día
+    (ver bloque de arriba). Filtra por `Type`. Levanta ValueError si falta la TRM de cualquier
+    día con movimiento. 'fecha_desde' descarta transacciones anteriores; None -> no procesa."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    faltan = [c for c in RAKUTEN_COLS if c not in df.columns]
+    if faltan:
+        raise ValueError(f"El CSV Rakuten no tiene las columnas esperadas: {', '.join(faltan)}.")
+
+    # INACTIVO sin fecha de corte: no se procesa nada (se valida columnas ANTES).
+    if fecha_desde is None:
+        return {}
+
+    # Tipo por la columna Type (NO por signo). Desconocidos -> avisar + ignorar (no cargar a ciegas).
+    df["_type"] = df["Type"].astype(str).str.strip().str.upper()
+    conocidos = set(RAKUTEN_TIPO_MAP) | RAKUTEN_TIPOS_IGNORAR
+    desconocidos = sorted(set(df["_type"].unique()) - conocidos)
+    if desconocidos:
+        _rakuten_warn("⚠️ Rakuten: tipos NO reconocidos (ignorados): "
+                      f"{', '.join(desconocidos)}. Revisa si Rakuten agregó un tipo nuevo.")
+    df["_tipo"] = df["_type"].map(RAKUTEN_TIPO_MAP)
+    df = df[df["_tipo"].notna()].copy()  # solo TRANSACTION/REFUND
+
+    # Fecha (solo día) y monto USD absoluto (Amount == 0 se descarta)
+    df["_fecha"] = pd.to_datetime(df["Date"], format="%Y/%m/%d, %H:%M:%S", errors="coerce")
+    df = df[df["_fecha"].notna()].copy()
+    if fecha_desde is not None:
+        df = df[df["_fecha"] >= pd.Timestamp(fecha_desde)]
+    df["_amount"] = df["Amount"].map(_rakuten_parse_amount)
+    df = df[df["_amount"].notna() & (df["_amount"] != 0)].copy()
+    df["_usd"] = df["_amount"].abs()
+    df["_fecha_iso"] = df["_fecha"].dt.strftime("%Y-%m-%d")
+    if df.empty:
+        return {}
+
+    # Agrupar por (tipo, fecha) y sumar USD
+    grp = (
+        df.groupby(["_tipo", "_fecha_iso"], as_index=False)
+          .agg(usd=("_usd", "sum"), n=("_usd", "size"))
+    )
+    grp = grp[grp["usd"] != 0]  # si la suma del día da 0, se omite
+    if grp.empty:
+        return {}
+
+    # TRM por día (+125), misma función que Amex. Recolecta faltantes antes de decidir (sin default).
+    trm_cache: dict = {}
+    faltantes = set()
+    for f_iso in grp["_fecha_iso"].unique():
+        if _amex_trm_dia(f_iso, trm_cache) is None:
+            faltantes.add(f_iso)
+    if faltantes:
+        dias = ", ".join(sorted(faltantes))
+        raise ValueError(
+            f"Sin TRM (datos.gov.co) para los días con movimiento Rakuten: {dias}. "
+            f"No se genera ningún movimiento (no hay TRM de respaldo)."
+        )
+
+    cas = RAKUTEN_CASILLERO
+    filas = []
+    for _, r in grp.iterrows():
+        tipo, f_iso, n = r["_tipo"], r["_fecha_iso"], int(r["n"])
+        trm = trm_cache[f_iso]
+        monto = round(float(r["usd"]) * trm)  # COP, POSITIVO
+        etq = "gasto" if tipo == "Egreso" else "reembolso"
+        pref = "gastorakuten" if tipo == "Egreso" else "reembolsorakuten"
+        filas.append({
+            "Fecha": f_iso,
+            "Tipo": tipo,
+            "Monto": monto,
+            "Orden": f"{pref}_{cas}_{f_iso}",
+            "Motivo": "Tarjeta Rakuten",
+            "TRM": round(trm, 2),
+            "Usuario": RAKUTEN_USUARIO,
+            "Casillero": cas,
+            "Estado de Orden": "",
+            "Nombre del producto": f"Tarjeta Rakuten - {etq} ({n} transacciones)",
+        })
+
+    out = pd.DataFrame(filas)
+    return {f"rakuten_{cas}": out.reset_index(drop=True)}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # INCENTIVO AMEX MENSUAL (cashback). Por cada mes CERRADO, agrega un Ingreso al casillero
 # = INCENTIVO_COP_POR_USD * USD_neto, donde USD_neto = Σ(USD egresos Amex) − Σ(USD ingresos Amex)
 # y USD_fila = Monto_COP / TRM_fila (la TRM del histórico YA incluye el spread +125, así que
 # COP/TRM recupera el USD original — no se ajusta spread).
 #   - Solo casilleros Amex (AMEX_USUARIOS: 11591, 1444, 13608).
-#   - Identifica filas Amex por 'amex' en Nombre del producto/Motivo (ambos formatos), EXCLUYENDO
-#     las propias filas de incentivo.
+#   - Identifica las filas de tarjeta por Motivo EXACTO ∈ {"Tarjeta Amex", "Tarjeta Rakuten"} y
+#     SUMA ambas al mismo incentivo mensual de 1444 (un solo incentivoamex_1444_<mes>), EXCLUYENDO
+#     las propias filas de incentivo. (Motivo exacto = más robusto que buscar el texto "amex".)
 #   - Idempotente: Orden único incentivoamex_<cas>_<YYYY-MM> + chequeo de existencia (no recrea
 #     ni recalcula un mes ya creado; queda congelado).
 #   - Mes cerrado = mes ANTERIOR a fecha_carga; se crean todos los meses cerrados desde
@@ -451,7 +579,12 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFrame]
 # ──────────────────────────────────────────────────────────────────────────────
 INCENTIVO_AMEX_ACTIVO = False        # 🚦 activar (True) para que se generen los incentivos
 INCENTIVO_COP_POR_USD = 25           # tarifa: COP de cashback por USD neto gastado en Amex
-INCENTIVO_MES_INICIO = "2026-07"     # primer mes cerrado a incentivar (no backfillea antes)
+# Arranca en AGOSTO (no julio): julio 2026 es 100% legacy backoffice ("Compra Amex", Motivo
+# vacío) y con la captura por Motivo EXACTO {"Tarjeta Amex","Tarjeta Rakuten"} no se calcularía
+# bien -> se decidió NO generar incentivo de julio. Desde agosto los egresos ya traen el Motivo
+# correcto (cargue nuevo Amex + Rakuten). El primer incentivo será el de agosto (en la 1ª corrida
+# de septiembre).
+INCENTIVO_MES_INICIO = "2026-08"     # primer mes cerrado a incentivar (no backfillea antes)
 INCENTIVO_MESES_ES = {1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
                       7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre",
                       11: "Noviembre", 12: "Diciembre"}
@@ -489,9 +622,13 @@ def agregar_incentivo_amex(combinado, cas, usuario, fecha_carga):
     trm = pd.to_numeric(df["TRM"], errors="coerce") if "TRM" in df.columns else pd.Series(pd.NA, index=df.index)
     tipo_u = df["Tipo"].astype(str).str.strip().str.upper()
 
-    es_amex = (nombre_s + " " + motivo_s).str.lower().str.contains("amex", na=False)
+    # Captura por Motivo EXACTO (opción b): suma Amex + Rakuten al mismo incentivo de 1444.
+    # Más robusto que el texto "amex" suelto (evita falsos positivos si un merchant se llamara
+    # "Rakuten X"/"Amex Y"). Nota: las filas backoffice legacy "Compra Amex" (Motivo vacío) NO
+    # entran — son pre-INCENTIVO_MES_INICIO, fuera de la ventana del incentivo.
+    es_tarjeta = motivo_s.str.strip().isin(["Tarjeta Amex", "Tarjeta Rakuten"])
     es_incentivo = orden_s.str.startswith("incentivoamex_") | motivo_s.str.strip().eq("Incentivo Amex")
-    amex_mask = es_amex & ~es_incentivo & tipo_u.isin(["EGRESO", "INGRESO"])
+    tarjeta_mask = es_tarjeta & ~es_incentivo & tipo_u.isin(["EGRESO", "INGRESO"])
 
     ordenes_existentes = set(orden_s)
     nuevas = []
@@ -499,7 +636,7 @@ def agregar_incentivo_amex(combinado, cas, usuario, fecha_carga):
         orden_inc = f"incentivoamex_{cas}_{yy:04d}-{mm:02d}"
         if orden_inc in ordenes_existentes:
             continue  # ya existe -> no recrear ni recalcular (congelado)
-        mes_mask = amex_mask & (fecha_dt.dt.year == yy) & (fecha_dt.dt.month == mm)
+        mes_mask = tarjeta_mask & (fecha_dt.dt.year == yy) & (fecha_dt.dt.month == mm)
         if not mes_mask.any():
             continue
         trm_mes = trm[mes_mask]
@@ -1592,6 +1729,53 @@ def main():
         st.info("📂 Aún no subes el archivo de Tarjeta Amex")
 
 
+    # 3.3) Tarjeta Rakuten (cargue propio, SOLO Maria Moises / 1444)
+    st.markdown("---")
+    st.header("3.3) Tarjeta Rakuten")
+
+    rakuten_file = st.file_uploader(
+        "Sube el CSV de actividad Rakuten (columnas: Date, Amount, Type, Merchant, Category, Method)",
+        type=["csv"],
+        key="rakuten_uploader"
+    )
+
+    rakuten_may = {}  # dict global para usar después en conciliaciones (solo 1444)
+
+    # Estado del corte de fecha (MUY visible), igual que Amex 3.2
+    if RAKUTEN_FECHA_DESDE:
+        st.success(f"✅ Corte Rakuten ACTIVO: solo transacciones con fecha ≥ {RAKUTEN_FECHA_DESDE}")
+    else:
+        st.warning("⚠️ Rakuten INACTIVO — `RAKUTEN_FECHA_DESDE` está en None. No se carga ninguna fila "
+                   "(protección anti doble-conteo). Fija la fecha de corte (YYYY-MM-DD) para activar.")
+
+    if rakuten_file:
+        # 🔒 BLOQUEO DURO: sin fecha de corte NO se procesa nada (se detiene ANTES de procesar).
+        if RAKUTEN_FECHA_DESDE is None:
+            st.error("🔒 Cargue Rakuten BLOQUEADO: no hay fecha de corte definida "
+                     "(RAKUTEN_FECHA_DESDE=None). Define la fecha de corte antes de cargar.")
+            st.stop()
+
+        try:
+            df_rakuten = pd.read_csv(rakuten_file)
+        except Exception as e:
+            st.error(f"❌ No se pudo leer el CSV Rakuten: {e}")
+            df_rakuten = None
+
+        if df_rakuten is not None:
+            try:
+                rakuten_may = procesar_rakuten(df_rakuten, fecha_desde=RAKUTEN_FECHA_DESDE)
+            except ValueError as e:
+                st.error(f"⛔ {e}")
+                st.stop()  # DETENER: falta TRM o columnas (sin default, como Amex)
+            if not rakuten_may:
+                st.info("No hay transacciones Rakuten (TRANSACTION/REFUND) desde la fecha de corte.")
+            else:
+                for key, dfr in rakuten_may.items():
+                    st.dataframe(dfr, use_container_width=True)
+    else:
+        st.info("📂 Aún no subes el CSV de Tarjeta Rakuten")
+
+
     # 3) Ingresos Nathalia Ospina (CA1633)
     st.header("4) Ingresos Nathalia Ospina (CA1633)")
     nat_files = st.file_uploader(
@@ -2055,9 +2239,12 @@ def main():
         # >>> NUEVO: TARJETA AMEX por casillero (gasto/reembolso acumulado por día) <<<
         amex = amex_may.get(f"amex_{cas}") if 'amex_may' in locals() else None
 
+        # >>> NUEVO: TARJETA RAKUTEN — módulo paralelo, SOLO 1444 (get devuelve None para el resto) <<<
+        rakuten = rakuten_may.get(f"rakuten_{cas}") if 'rakuten_may' in locals() else None
+
         # 3) Armar la lista de DataFrames válidos
         frames = []
-        for df in (inc, egr, ext, env, cons, amex):  # << añade amex aquí
+        for df in (inc, egr, ext, env, cons, amex, rakuten):  # rakuten solo aporta 1444
             if df is not None and not df.empty:
                 frames.append(df)
 
