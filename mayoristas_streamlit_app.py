@@ -13,6 +13,7 @@ from datetime import datetime
 from datetime import timedelta
 import dropbox
 import numpy as np
+import hashlib
 import smtplib, ssl
 from email.message import EmailMessage
 from pathlib import Path, PurePosixPath
@@ -250,8 +251,60 @@ def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Cargue "Tarjeta Amex" (FASE 1). Convierte la actividad Amex (USD) en movimientos
-# COP acumulados por casillero y por día, listos para entrar a conciliacion_<cas>.
+# LISTA DE EXCLUSIÓN "TARJETAS COBRADAS" (anti-doble-cobro, defensa PRINCIPAL).
+# Archivo en Dropbox (misma carpeta del histórico): tarjetas_cobradas.xlsx, hoja "cobradas",
+# UNA fila por transacción YA COBRADA al mayorista antes del cargue 1-a-1, con su Orden
+# EXACTO (amex_<Reference> / rakuten_<hash>) + columnas de auditoría. Se generó UNA VEZ con
+# generar_tarjetas_cobradas.py desde el Excel de cobrados congelado (20260710) — los cobros
+# posteriores entran por el flujo 1-a-1 normal y NO requieren mantener esta lista.
+#   - procesar_amex / procesar_rakuten EXCLUYEN toda transacción cuyo Orden esté en la lista
+#     (misma filosofía que ENVIOS_BLOQUEADOS: lista explícita de Orden vetados).
+#   - Si la lista NO se puede leer -> NO se procesa nada (st.stop en la UI): procesar sin
+#     lista recobraría todo lo ya cobrado.
+#   - ROL DE LA FECHA DE CORTE (cambio de diseño): AMEX_FECHA_DESDE / RAKUTEN_FECHA_DESDE ya
+#     NO son el filtro principal anti-doble-conteo; son solo un límite de sanidad para no
+#     procesar historia irrelevante. La decisión cobrar/no-cobrar la toma la LISTA. Una
+#     transacción vieja (>= corte) que NO esté en la lista SÍ entra: es una compra tardía
+#     nunca cobrada (regla de negocio: NUNCA dejar de cobrar).
+# ──────────────────────────────────────────────────────────────────────────────
+TARJETAS_COBRADAS_FILENAME = "tarjetas_cobradas.xlsx"
+
+
+@st.cache_data(ttl=600)  # cache 10 min: no re-descargar de Dropbox en cada rerun
+def cargar_tarjetas_cobradas():
+    """Lee de Dropbox la lista de exclusión y devuelve (set de Orden ya cobrados, DataFrame de
+    'pendientes_rematch'). Los pendientes son cobros REALES aún sin Orden (pre-asiento): el
+    escudo también los excluye, por match fecha+monto (+CardMember en Amex). PROPAGA la
+    excepción si el archivo no existe / no se puede leer / está vacío: el caller debe hacer
+    st.stop() — sin lista NO se procesa (se recobraría)."""
+    cfg = st.secrets["dropbox"]
+    path = str(PurePosixPath(cfg["remote_path"]).parent / TARJETAS_COBRADAS_FILENAME)
+    _, res = dbx.files_download(path)
+    xls = pd.ExcelFile(io.BytesIO(res.content))
+    df = pd.read_excel(xls, sheet_name="cobradas")
+    if "Orden" not in df.columns:
+        raise ValueError(f"{TARJETAS_COBRADAS_FILENAME}: falta la columna 'Orden' en la hoja 'cobradas'.")
+    ordenes = set(df["Orden"].astype(str).str.strip()) - {"", "nan", "None"}
+    if not ordenes:
+        raise ValueError(f"{TARJETAS_COBRADAS_FILENAME}: la hoja 'cobradas' está vacía.")
+    try:
+        pendientes = pd.read_excel(xls, sheet_name="pendientes_rematch")
+    except Exception:
+        pendientes = pd.DataFrame()  # sin hoja de pendientes -> escudo solo por Orden
+    return ordenes, pendientes
+
+
+def _cobradas_info(msg: str):
+    """st.info si Streamlit está disponible; en dry-run (sin st) no rompe."""
+    try:
+        st.info(msg)
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cargue "Tarjeta Amex" 1-a-1: cada transacción del extracto -> UNA fila propia en el
+# histórico (ya NO se acumula por día), lista para entrar a conciliacion_<cas>.
 #   - Solo estos 3 Card Members se cargan (el resto se IGNORA):
 #       PAULA HERRERA -> 11591 ; JUAN P CORREAL -> 1444 ; JULIAN SANCHEZ -> 13608
 #   - Amount > 0 = gasto     -> Egreso  (Monto POSITIVO, como el resto del histórico)
@@ -259,17 +312,29 @@ def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 #       * De los negativos se EXCLUYEN (no entran ni como ingreso ni como egreso) los
 #         PAGOS a la tarjeta (los hace Encargomio) y los CRÉDITOS Amazon que no son
 #         reembolso de compra. Ver AMEX_PAGO_PATTERNS / AMEX_CREDITO_EXCLUIR.
-#   - Se agrupa por (casillero, tipo, fecha) y se suma; se convierte USD->COP con la
-#     TRM del día (datos.gov.co, mismo dataset mcec-87by) + 125 COP fijo.
+#   - Orden POR TRANSACCIÓN = "amex_<Reference>". 'Reference' es el ID nativo de Amex
+#     (entero de 18 dígitos: 3|año|día-del-año del asiento|serial), 100% poblado, ÚNICO
+#     y ESTABLE entre descargas (verificado con 2 snapshots reales, 371/371 idénticos).
+#     Con el dedup existente por Orden (keep="last") el cargue es IDEMPOTENTE: recargar
+#     el mismo extracto reemplaza filas idénticas (no-op) y una compra TARDÍA (asienta
+#     hasta ~27 días después) entra apenas aparezca en un export, sin importar cuándo
+#     se cargue -> NUNCA se deja de cobrar, NUNCA se duplica.
+#     *** Sin 'Reference' válido en alguna fila, o con Reference repetido en el archivo,
+#         procesar_amex LEVANTA ValueError (fail-loud: nunca inventa IDs). ***
+#   - USD->COP con la TRM del día de la compra (datos.gov.co, mcec-87by) + 125 COP fijo.
 #     *** SIN TRM de respaldo: si falta la TRM de algún día con movimiento,
 #         procesar_amex LEVANTA ValueError con la lista de días (nunca inventa). ***
-#   - Etiqueta en 'Nombre del producto'; tag 'Tarjeta Amex' en 'Motivo'.
+#   - Etiqueta en 'Nombre del producto' (incluye el Description del merchant);
+#     tag 'Tarjeta Amex' en 'Motivo'.
 # ──────────────────────────────────────────────────────────────────────────────
 AMEX_CARD_MAP = {
     "PAULA HERRERA": "11591",
     "JUAN P CORREAL": "1444",
     "JULIAN SANCHEZ": "13608",
 }
+# ⛔ K LOPEZ VELANDIA: SIEMPRE ignorada (compras y reembolsos), sin excepción — decisión de
+# negocio 2026-07-16. NO agregarla al mapa aunque aparezca en extractos o en cobros históricos
+# (aparece también tipeada como "KELLY P LOPEZVELANDIA", misma cuenta -23003).
 AMEX_USUARIOS = {"11591": "Paula Herrera", "1444": "Maria Moises", "13608": "Julian Sanchez"}
 AMEX_TRM_SPREAD = 125  # COP fijo que se suma a la TRM del día
 
@@ -299,15 +364,16 @@ AMEX_CREDITO_EXCLUIR = ["AMAZON PAY YOUR CHARGES", "AMAZON PAY WITH POINTS"]
 #     código para poder volver a False si algún día cambia la política.
 AMEX_AFECTA_COMISION_1444 = True
 
-# 🚦 FECHA DE CORTE (global, único) del cargue Amex. Formato "YYYY-MM-DD".
-#   - None  -> INACTIVO: procesar_amex NO procesa ninguna fila (protección anti doble-conteo:
-#              el histórico ya trae los "Compra Amex" del backoffice; solo se carga lo NUEVO).
-#   - "YYYY-MM-DD" -> descarta toda transacción con FECHA DE TRANSACCIÓN < corte. Corte global
-#              para los 3 casilleros.
-#   Nota de diseño: al ser corte GLOBAL, si un casillero tenía backoffice hasta una fecha
-#   anterior (ej. 13608 ~2026-06-06), el tramo intermedio NO se recupera. Es intencional:
-#   se arranca limpio desde la fecha de corte.
-AMEX_FECHA_DESDE = None
+# 🚦 FECHA DE CORTE del cargue Amex — DISEÑO FINAL (3 reglas, decisión 2026-07-16):
+#   1. EL HISTÓRICO DE COBRADOS MANDA: lo que esté en tarjetas_cobradas.xlsx (hoja
+#      "cobradas" por Orden exacto, u hoja "pendientes_rematch" por fecha+monto+CardMember)
+#      NO se vuelve a cobrar, nunca. Lista OBLIGATORIA: sin ella no se procesa (st.stop).
+#   2. CORTE = ÚLTIMO MES: transacciones con FECHA DE COMPRA < corte se IGNORAN por completo
+#      (historia vieja, ya liquidada a mano por el backoffice; ni se cobra ni se mira).
+#   3. TODO LO NUEVO SE TOMA: fecha >= corte y fuera de lista/pendientes -> ENTRA y se cobra.
+#      El dedup por Orden evita duplicar entre recargas.
+#   - None -> INACTIVO (kill switch de emergencia: no se procesa nada).
+AMEX_FECHA_DESDE = "2026-06-16"
 
 
 def _amex_norm_cardmember(s) -> str:
@@ -340,13 +406,18 @@ def _amex_trm_dia(fecha_iso: str, _cache: dict):
     return trm
 
 
-def procesar_amex(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFrame]:
-    """Transforma la hoja 'Transaction Details' de Amex en {amex_<cas>: DF} con movimientos COP
-    acumulados por día (ver bloque de arriba). Levanta ValueError si falta la TRM de cualquier
-    día con movimiento. 'fecha_desde' (opcional) descarta transacciones anteriores a esa fecha."""
+def procesar_amex(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None) -> dict[str, pd.DataFrame]:
+    """Transforma la hoja 'Transaction Details' de Amex en {amex_<cas>: DF} con UNA fila COP por
+    transacción (1-a-1, Orden = amex_<Reference>; ver bloque de arriba). Levanta ValueError si
+    falta la TRM de cualquier día con movimiento, o si alguna fila no trae Reference válido.
+    'fecha_desde' (opcional) descarta transacciones con FECHA DE COMPRA anterior a esa fecha.
+    'cobrados' (OBLIGATORIO si fecha_desde está activo) = set de Orden ya cobrados
+    (tarjetas_cobradas.xlsx): esas transacciones se EXCLUYEN (anti-doble-cobro).
+    'pendientes' (opcional) = DataFrame 'pendientes_rematch' de la misma lista: cobros reales
+    aún sin Orden; las transacciones que los matcheen también se EXCLUYEN."""
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
-    for col in ("Card Member", "Date", "Amount"):
+    for col in ("Card Member", "Date", "Amount", "Reference"):
         if col not in df.columns:
             raise ValueError(f"La hoja 'Transaction Details' no tiene la columna '{col}'.")
 
@@ -354,6 +425,13 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFrame]
     # Se valida columnas ANTES (un archivo malo igual falla claro), luego se corta aquí.
     if fecha_desde is None:
         return {}
+
+    # 🛡️ LISTA DE EXCLUSIÓN obligatoria: procesar sin lista recobraría lo ya cobrado.
+    if cobrados is None:
+        raise ValueError(
+            "Falta la lista de exclusión 'tarjetas cobradas' (cobrados=None). "
+            "No se procesa nada: sin la lista se recobrarían transacciones ya cobradas."
+        )
 
     # Card Member -> casillero (ignora los que no están en el mapeo)
     df["_cas"] = df["Card Member"].map(_amex_norm_cardmember).map(AMEX_CARD_MAP)
@@ -389,17 +467,76 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFrame]
     if df.empty:
         return {}
 
-    # Agrupar por (casillero, tipo, fecha) y sumar USD
-    grp = (
-        df.groupby(["_cas", "_tipo", "_fecha_iso"], as_index=False)
-          .agg(usd=("_usd", "sum"), n=("_usd", "size"))
-    )
-    grp = grp[grp["usd"] != 0]  # si la suma del día da 0, se omite
+    # 1-a-1: Reference nativo de Amex -> Orden por transacción. FAIL-LOUD: sin Reference
+    # numérico válido en TODAS las filas, o con Reference repetido dentro del archivo, NO se
+    # genera ningún movimiento (nunca inventar IDs ni colapsar dos cobros en uno en silencio).
+    # Nota: si pandas leyera Reference como float (p.ej. por un NaN en la columna) el valor de
+    # 18 dígitos pierde precisión y quedaría "3.2e+17" -> NO matchea \d+ -> también falla claro.
+    df["_ref"] = df["Reference"].astype(str).str.strip().str.lstrip("'")
+    _ref_mala = ~df["_ref"].str.fullmatch(r"\d+")
+    if _ref_mala.any():
+        _ej = df.loc[_ref_mala, ["Date", "Description", "Amount"]].head(5).to_dict("records") \
+              if "Description" in df.columns else df.loc[_ref_mala, ["Date", "Amount"]].head(5).to_dict("records")
+        raise ValueError(
+            f"{int(_ref_mala.sum())} transacciones Amex sin 'Reference' numérico válido. "
+            f"No se genera ningún movimiento. Primeras: {_ej}"
+        )
+    _ref_dup = df["_ref"].duplicated(keep=False)
+    if _ref_dup.any():
+        raise ValueError(
+            f"Reference repetido en el extracto Amex ({int(_ref_dup.sum())} filas): "
+            f"{sorted(df.loc[_ref_dup, '_ref'].unique())[:5]}. No se genera ningún movimiento "
+            f"(un Reference debe identificar UNA transacción; revisa el export)."
+        )
+
+    # 🛡️ Anti-doble-cobro (defensa PRINCIPAL): excluir transacciones cuyo Orden ya está en la
+    # lista de cobradas. Va DESPUÉS de validar Reference (un archivo malo sigue fallando claro)
+    # y ANTES de la TRM (no se piden TRM de días cuyo movimiento quedó 100% excluido).
+    df["_orden"] = "amex_" + df["_ref"]
+    _ya_cobradas = df["_orden"].isin(cobrados)
+    if _ya_cobradas.any():
+        _cobradas_info(f"🛡️ Amex: {int(_ya_cobradas.sum())} transacciones ya cobradas "
+                       f"(lista de exclusión) — excluidas del cargue.")
+        df = df[~_ya_cobradas].copy()
+    if df.empty:
+        return {}
+
+    # 🛡️ ESCUDO DE PENDIENTES: los 'pendientes_rematch' son cobros REALES hechos antes de que
+    # la compra asentara (aún sin Orden). Si una transacción del extracto matchea un pendiente
+    # por (fecha compra, monto USD firmado, Card Member) también se excluye. COUNT-AWARE: cada
+    # pendiente tapa UNA transacción; el desempate entre gemelas es por Reference ascendente
+    # (determinista entre descargas: nunca se cuela un gemelo distinto en una recarga).
+    if pendientes is not None and len(pendientes) and "tarjeta" in pendientes.columns:
+        _p = pendientes[pendientes["tarjeta"].astype(str).str.strip().str.lower() == "amex"]
+        if len(_p):
+            _pk: dict = {}
+            for _, _rp in _p.iterrows():
+                _k = (str(_rp["fecha_compra"]).strip()[:10],
+                      round(float(_rp["monto_usd"]), 2),
+                      _amex_norm_cardmember(_rp["card_member"] if "card_member" in _p.columns else ""))
+                _pk[_k] = _pk.get(_k, 0) + 1
+            _cmn = df["Card Member"].map(_amex_norm_cardmember)
+            _amt2 = df["_amount"].round(2)
+            _drop = []
+            for _k, _n in _pk.items():
+                _m = df[(df["_fecha_iso"] == _k[0]) & (_amt2 == _k[1]) & (_cmn == _k[2])]
+                if len(_m):
+                    _drop += list(_m.sort_values("_ref").index[:_n])
+            if _drop:
+                _cobradas_info(f"🛡️ Amex: {len(_drop)} transacciones matchean cobros PENDIENTES "
+                               f"de rematch (ya cobradas pre-asiento) — excluidas del cargue.")
+                df = df.drop(index=_drop)
+    if df.empty:
+        return {}
+
+    # Description limpio para 'Nombre del producto' (colapsa los espacios múltiples del extracto)
+    _desc = df.get("Description", pd.Series("", index=df.index)).fillna("")
+    df["_desc"] = _desc.astype(str).map(lambda s: " ".join(s.split()))
 
     # TRM por día (+125). Recolecta TODOS los días faltantes antes de decidir (sin default).
     trm_cache: dict = {}
     faltantes = set()
-    for f_iso in grp["_fecha_iso"].unique():
+    for f_iso in df["_fecha_iso"].unique():
         if _amex_trm_dia(f_iso, trm_cache) is None:
             faltantes.add(f_iso)
     if faltantes:
@@ -410,23 +547,22 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFrame]
         )
 
     filas = []
-    for _, r in grp.iterrows():
-        cas, tipo, f_iso, n = r["_cas"], r["_tipo"], r["_fecha_iso"], int(r["n"])
+    for _, r in df.iterrows():
+        cas, tipo, f_iso = r["_cas"], r["_tipo"], r["_fecha_iso"]
         trm = trm_cache[f_iso]
-        monto = round(float(r["usd"]) * trm)  # COP, POSITIVO
+        monto = round(float(r["_usd"]) * trm)  # COP, POSITIVO
         etq = "gasto" if tipo == "Egreso" else "reembolso"
-        pref = "gastoamex" if tipo == "Egreso" else "reembolsoamex"
         filas.append({
             "Fecha": f_iso,
             "Tipo": tipo,
             "Monto": monto,
-            "Orden": f"{pref}_{cas}_{f_iso}",
+            "Orden": r["_orden"],
             "Motivo": "Tarjeta Amex",
             "TRM": round(trm, 2),
             "Usuario": AMEX_USUARIOS[cas],
             "Casillero": cas,
             "Estado de Orden": "",
-            "Nombre del producto": f"Tarjeta Amex - {etq} ({n} transacciones)",
+            "Nombre del producto": f"Tarjeta Amex - {etq} - {r['_desc']}",
         })
 
     out = pd.DataFrame(filas)
@@ -445,7 +581,19 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFrame]
 #       PAYMENT / OFFER / AUTH -> IGNORAR       ; Type NUEVO/desconocido -> IGNORAR + st.warning
 #   - USD -> COP con la MISMA TRM que Amex (_amex_trm_dia: datos.gov.co por rango, +125).
 #     *** SIN TRM de respaldo: si falta la TRM de un día con movimiento, LEVANTA ValueError. ***
-#   - Acumulado por (Tipo, fecha); Orden gastorakuten_/reembolsorakuten_1444_<YYYY-MM-DD> (idempotente).
+#   - 1-a-1: cada TRANSACTION/REFUND -> UNA fila propia (ya NO se acumula por día).
+#     Rakuten NO trae ID nativo -> Orden determinista por transacción:
+#       clave = "<Date>|<Amount>|<Merchant>|<seq>" con los valores CRUDOS del CSV (Date con
+#       HH:MM:SS; sin normalizar, para que la clave sea reproducible byte a byte) y
+#       seq = nº de ocurrencia (0,1,...) de esa clave exacta dentro del archivo — duplicados
+#       exactos son compras reales distintas en el mismo segundo (p.ej. cargos por ítem de
+#       Adidas: verificado 2x$74.90 el 2026-04-24 22:54:32). seq es estable entre descargas
+#       porque las filas de una misma clave son idénticas entre sí (da igual cuál recibe 0 o 1).
+#       Orden = "rakuten_" + sha1(clave, utf-8)[:12]  (48 bits; colisión ~10^-8 a esta escala).
+#     Con el dedup existente por Orden (keep="last") el cargue es IDEMPOTENTE (recargar = no-op;
+#     compras tardías entran apenas aparezcan en el export "_All").
+#     ⚠️ PENDIENTE DE ACTIVAR: la estabilidad del timestamp entre 2 descargas reales aún no se
+#     verificó -> RAKUTEN_FECHA_DESDE se queda en None hasta hacer esa verificación.
 #   - Motivo = "Tarjeta Rakuten" (tag EXACTO que captura el incentivo combinado de 1444).
 # ──────────────────────────────────────────────────────────────────────────────
 RAKUTEN_CASILLERO = "1444"
@@ -454,10 +602,14 @@ RAKUTEN_TIPO_MAP = {"TRANSACTION": "Egreso", "REFUND": "Ingreso"}  # el resto se
 RAKUTEN_TIPOS_IGNORAR = {"PAYMENT", "OFFER", "AUTH"}
 RAKUTEN_COLS = ["Date", "Amount", "Type", "Merchant", "Category", "Method"]
 
-# 🚦 FECHA DE CORTE del cargue Rakuten (mismo patrón/bloqueo que Amex). Formato "YYYY-MM-DD".
-#   - None  -> INACTIVO: procesar_rakuten NO procesa ninguna fila (protección anti doble-conteo).
-#   - "YYYY-MM-DD" -> descarta toda transacción con fecha < corte.
-RAKUTEN_FECHA_DESDE = None
+# 🚦 FECHA DE CORTE del cargue Rakuten — DISEÑO FINAL (las MISMAS 3 reglas que Amex, ver
+#   arriba: 1. el histórico de cobrados MANDA; 2. corte = último mes, lo anterior se ignora;
+#   3. todo lo nuevo fuera de lista/pendientes se toma).
+#   - None -> INACTIVO (kill switch de emergencia).
+#   ⏳ Pendiente vigente (decisión del usuario: activar de una vez): verificar la estabilidad
+#   del timestamp del CSV con una 2ª descarga; si un timestamp cambiara entre descargas, el
+#   hash cambia y la transacción re-entraría — la lista/pendientes NO la taparían.
+RAKUTEN_FECHA_DESDE = "2026-06-16"
 
 
 def _rakuten_warn(msg: str):
@@ -480,10 +632,15 @@ def _rakuten_parse_amount(x) -> float:
     return -v if neg else v
 
 
-def procesar_rakuten(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFrame]:
-    """Transforma el CSV Rakuten en {rakuten_1444: DF} con movimientos COP acumulados por día
-    (ver bloque de arriba). Filtra por `Type`. Levanta ValueError si falta la TRM de cualquier
-    día con movimiento. 'fecha_desde' descarta transacciones anteriores; None -> no procesa."""
+def procesar_rakuten(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None) -> dict[str, pd.DataFrame]:
+    """Transforma el CSV Rakuten en {rakuten_1444: DF} con UNA fila COP por transacción
+    (1-a-1, Orden = rakuten_<sha1-12>; ver bloque de arriba). Filtra por `Type`. Levanta
+    ValueError si falta la TRM de cualquier día con movimiento. 'fecha_desde' descarta
+    transacciones anteriores; None -> no procesa. 'cobrados' (OBLIGATORIO si fecha_desde
+    está activo) = set de Orden ya cobrados: esas transacciones se EXCLUYEN. 'pendientes'
+    (opcional) = DataFrame 'pendientes_rematch': auth cobrados aún sin asentar; las
+    TRANSACTION que los matcheen (timestamp+monto, o el timestamp completo si asentó
+    partido) también se EXCLUYEN."""
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     faltan = [c for c in RAKUTEN_COLS if c not in df.columns]
@@ -493,6 +650,13 @@ def procesar_rakuten(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFra
     # INACTIVO sin fecha de corte: no se procesa nada (se valida columnas ANTES).
     if fecha_desde is None:
         return {}
+
+    # 🛡️ LISTA DE EXCLUSIÓN obligatoria: procesar sin lista recobraría lo ya cobrado.
+    if cobrados is None:
+        raise ValueError(
+            "Falta la lista de exclusión 'tarjetas cobradas' (cobrados=None). "
+            "No se procesa nada: sin la lista se recobrarían transacciones ya cobradas."
+        )
 
     # Tipo por la columna Type (NO por signo). Desconocidos -> avisar + ignorar (no cargar a ciegas).
     df["_type"] = df["Type"].astype(str).str.strip().str.upper()
@@ -516,19 +680,60 @@ def procesar_rakuten(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFra
     if df.empty:
         return {}
 
-    # Agrupar por (tipo, fecha) y sumar USD
-    grp = (
-        df.groupby(["_tipo", "_fecha_iso"], as_index=False)
-          .agg(usd=("_usd", "sum"), n=("_usd", "size"))
+    # 1-a-1: Orden determinista por transacción (ver esquema en el bloque de arriba).
+    # Clave con los valores CRUDOS del CSV + contador de ocurrencia para duplicados exactos.
+    _clave = (df["Date"].astype(str) + "|" + df["Amount"].astype(str) + "|" + df["Merchant"].astype(str))
+    _seq = _clave.groupby(_clave).cumcount().astype(str)
+    df["_orden"] = "rakuten_" + (_clave + "|" + _seq).map(
+        lambda s: hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
     )
-    grp = grp[grp["usd"] != 0]  # si la suma del día da 0, se omite
-    if grp.empty:
+    # FAIL-LOUD: una colisión de hash entre claves distintas colapsaría dos cobros en uno.
+    if df["_orden"].duplicated().any():
+        raise ValueError(
+            "Colisión de hash en el Orden Rakuten (dos transacciones distintas generaron el "
+            "mismo ID). No se genera ningún movimiento; reporta este archivo."
+        )
+
+    # 🛡️ Anti-doble-cobro (defensa PRINCIPAL): excluir transacciones cuyo Orden ya está en la
+    # lista de cobradas. Va ANTES de la TRM (no pedir TRM de días 100% excluidos).
+    _ya_cobradas = df["_orden"].isin(cobrados)
+    if _ya_cobradas.any():
+        _cobradas_info(f"🛡️ Rakuten: {int(_ya_cobradas.sum())} transacciones ya cobradas "
+                       f"(lista de exclusión) — excluidas del cargue.")
+        df = df[~_ya_cobradas].copy()
+    if df.empty:
+        return {}
+
+    # 🛡️ ESCUDO DE PENDIENTES: los 'pendientes_rematch' Rakuten son auth COBRADOS que aún no
+    # habían asentado. Cuando su TRANSACTION firme aparezca en un CSV futuro se excluye:
+    # primero por (timestamp + monto) exacto; si el auth asentó PARTIDO (montos distintos),
+    # se excluyen TODAS las TRANSACTION de ese timestamp exacto (misma regla del generador de
+    # la lista). Desempate por Orden ascendente (determinista entre descargas).
+    if pendientes is not None and len(pendientes) and "tarjeta" in pendientes.columns:
+        _p = pendientes[pendientes["tarjeta"].astype(str).str.strip().str.lower() == "rakuten"]
+        _drop = []
+        for _, _rp in _p.iterrows():
+            _ts = pd.to_datetime(str(_rp["fecha_compra"]), errors="coerce")
+            if pd.isna(_ts):
+                continue
+            _amt = round(abs(float(_rp["monto_usd"])), 2)
+            _vivos = df[(df["_fecha"] == _ts) & (~df.index.isin(_drop))]
+            _exactos = _vivos[_vivos["_usd"].round(2) == _amt]
+            if len(_exactos):
+                _drop.append(_exactos.sort_values("_orden").index[0])
+            elif len(_vivos):
+                _drop += list(_vivos.index)  # auth asentado partido: tapa todo el timestamp
+        if _drop:
+            _cobradas_info(f"🛡️ Rakuten: {len(_drop)} transacciones matchean cobros PENDIENTES "
+                           f"de rematch (auth ya cobrados) — excluidas del cargue.")
+            df = df.drop(index=_drop)
+    if df.empty:
         return {}
 
     # TRM por día (+125), misma función que Amex. Recolecta faltantes antes de decidir (sin default).
     trm_cache: dict = {}
     faltantes = set()
-    for f_iso in grp["_fecha_iso"].unique():
+    for f_iso in df["_fecha_iso"].unique():
         if _amex_trm_dia(f_iso, trm_cache) is None:
             faltantes.add(f_iso)
     if faltantes:
@@ -540,23 +745,23 @@ def procesar_rakuten(df: pd.DataFrame, fecha_desde=None) -> dict[str, pd.DataFra
 
     cas = RAKUTEN_CASILLERO
     filas = []
-    for _, r in grp.iterrows():
-        tipo, f_iso, n = r["_tipo"], r["_fecha_iso"], int(r["n"])
+    for _, r in df.iterrows():
+        tipo, f_iso = r["_tipo"], r["_fecha_iso"]
         trm = trm_cache[f_iso]
-        monto = round(float(r["usd"]) * trm)  # COP, POSITIVO
+        monto = round(float(r["_usd"]) * trm)  # COP, POSITIVO
         etq = "gasto" if tipo == "Egreso" else "reembolso"
-        pref = "gastorakuten" if tipo == "Egreso" else "reembolsorakuten"
+        merch = " ".join(str(r["Merchant"]).split())
         filas.append({
             "Fecha": f_iso,
             "Tipo": tipo,
             "Monto": monto,
-            "Orden": f"{pref}_{cas}_{f_iso}",
+            "Orden": r["_orden"],
             "Motivo": "Tarjeta Rakuten",
             "TRM": round(trm, 2),
             "Usuario": RAKUTEN_USUARIO,
             "Casillero": cas,
             "Estado de Orden": "",
-            "Nombre del producto": f"Tarjeta Rakuten - {etq} ({n} transacciones)",
+            "Nombre del producto": f"Tarjeta Rakuten - {etq} - {merch}",
         })
 
     out = pd.DataFrame(filas)
@@ -1695,6 +1900,13 @@ def main():
         st.warning("⚠️ Amex INACTIVO — `AMEX_FECHA_DESDE` está en None. No se carga ninguna fila "
                    "(protección anti doble-conteo). Fija la fecha de corte (YYYY-MM-DD) para activar.")
 
+    # 📌 REGLA OPERATIVA (cargue 1-a-1): las compras pueden ASENTAR hasta ~27 días después de
+    # la fecha de compra y solo aparecen en exports descargados DESPUÉS de asentar.
+    st.info("📌 Descarga SIEMPRE el export de RANGO AMPLIO (desde la fecha de corte hasta HOY), "
+            "NUNCA solo 'el último mes/ciclo': hay compras que asientan hasta ~27 días tarde y "
+            "solo salen en exports posteriores. Cargar de más NO duplica (el Orden identifica "
+            "cada transacción y el dedup la reemplaza); cargar de menos SÍ pierde compras.")
+
     if amex_file:
         # 🔒 BLOQUEO DURO (1ª llave): sin fecha de corte NO se procesa nada. Se detiene ANTES de
         # leer/procesar el archivo -> imposible escribir una sola fila con AMEX_FECHA_DESDE=None.
@@ -1702,6 +1914,18 @@ def main():
             st.error("🔒 Cargue Amex BLOQUEADO: no hay fecha de corte definida "
                      "(AMEX_FECHA_DESDE=None). Define la fecha de corte antes de cargar para "
                      "evitar doble conteo con los egresos Amex del backoffice.")
+            st.stop()
+
+        # 🛡️ LISTA DE EXCLUSIÓN obligatoria (2ª llave, anti-doble-cobro): sin lista NO se
+        # procesa nada — procesar a ciegas recobraría todo lo ya cobrado.
+        try:
+            tarjetas_cobradas, tarjetas_pendientes = cargar_tarjetas_cobradas()
+            st.caption(f"🛡️ Lista de exclusión cargada: {len(tarjetas_cobradas)} Orden ya "
+                       f"cobrados + {len(tarjetas_pendientes)} pendientes de rematch.")
+        except Exception as e:
+            st.error(f"🔒 Cargue Amex BLOQUEADO: no se pudo leer '{TARJETAS_COBRADAS_FILENAME}' "
+                     f"desde Dropbox ({e}). Sin la lista de exclusión se recobrarían "
+                     f"transacciones ya cobradas. NO se procesa nada.")
             st.stop()
 
         try:
@@ -1714,7 +1938,9 @@ def main():
         if df_amex is not None:
             # 2ª llave: procesar_amex igual devuelve {} si fecha_desde es None (por si se llama aparte).
             try:
-                amex_may = procesar_amex(df_amex, fecha_desde=AMEX_FECHA_DESDE)
+                amex_may = procesar_amex(df_amex, fecha_desde=AMEX_FECHA_DESDE,
+                                         cobrados=tarjetas_cobradas,
+                                         pendientes=tarjetas_pendientes)
             except ValueError as e:
                 st.error(f"⛔ {e}")
                 st.stop()  # DETENER: falta TRM o columnas (sin default, como se acordó)
@@ -1746,13 +1972,33 @@ def main():
         st.success(f"✅ Corte Rakuten ACTIVO: solo transacciones con fecha ≥ {RAKUTEN_FECHA_DESDE}")
     else:
         st.warning("⚠️ Rakuten INACTIVO — `RAKUTEN_FECHA_DESDE` está en None. No se carga ninguna fila "
-                   "(protección anti doble-conteo). Fija la fecha de corte (YYYY-MM-DD) para activar.")
+                   "(protección anti doble-conteo). Fija la fecha de corte (YYYY-MM-DD) para activar. "
+                   "NO activar hasta verificar que el timestamp del CSV es estable entre 2 descargas.")
+
+    # 📌 REGLA OPERATIVA (cargue 1-a-1): igual que Amex — rango amplio SIEMPRE.
+    st.info("📌 Descarga SIEMPRE el export de historial completo ('Rakuten_Activity_All'), NUNCA "
+            "solo 'el último mes': hay compras que asientan tarde y solo salen en exports "
+            "posteriores. Cargar de más NO duplica (el Orden identifica cada transacción y el "
+            "dedup la reemplaza); cargar de menos SÍ pierde compras.")
 
     if rakuten_file:
         # 🔒 BLOQUEO DURO: sin fecha de corte NO se procesa nada (se detiene ANTES de procesar).
         if RAKUTEN_FECHA_DESDE is None:
             st.error("🔒 Cargue Rakuten BLOQUEADO: no hay fecha de corte definida "
                      "(RAKUTEN_FECHA_DESDE=None). Define la fecha de corte antes de cargar.")
+            st.stop()
+
+        # 🛡️ LISTA DE EXCLUSIÓN obligatoria (anti-doble-cobro), igual que Amex.
+        try:
+            tarjetas_cobradas_rk, tarjetas_pendientes_rk = cargar_tarjetas_cobradas()
+            st.caption(f"🛡️ Lista de exclusión cargada: {len(tarjetas_cobradas_rk)} Orden ya "
+                       f"cobrados + {len(tarjetas_pendientes_rk)} pendientes de rematch.")
+            st.caption("⏳ Pendiente: verificar estabilidad del timestamp con una 2ª descarga "
+                       "del CSV (si cambiara, el hash cambia y una cobrada podría re-entrar).")
+        except Exception as e:
+            st.error(f"🔒 Cargue Rakuten BLOQUEADO: no se pudo leer '{TARJETAS_COBRADAS_FILENAME}' "
+                     f"desde Dropbox ({e}). Sin la lista de exclusión se recobrarían "
+                     f"transacciones ya cobradas. NO se procesa nada.")
             st.stop()
 
         try:
@@ -1763,7 +2009,9 @@ def main():
 
         if df_rakuten is not None:
             try:
-                rakuten_may = procesar_rakuten(df_rakuten, fecha_desde=RAKUTEN_FECHA_DESDE)
+                rakuten_may = procesar_rakuten(df_rakuten, fecha_desde=RAKUTEN_FECHA_DESDE,
+                                               cobrados=tarjetas_cobradas_rk,
+                                               pendientes=tarjetas_pendientes_rk)
             except ValueError as e:
                 st.error(f"⛔ {e}")
                 st.stop()  # DETENER: falta TRM o columnas (sin default, como Amex)
@@ -2406,15 +2654,16 @@ def main():
             combinado = agregar_incentivo_amex(combinado, cas, usuario, fecha_carga)
             # ── /[INCENTIVO AMEX] ──
 
-            # ── [AMEX/COMISIÓN 1444] Aislar filas Amex del cálculo de comisión (flag en False) ──
-            # Con AMEX_AFECTA_COMISION_1444=False se retiran las filas Amex de 1444 (Orden
-            # gastoamex_1444_/reembolsoamex_1444_) ANTES del recálculo+comisión y se reincorporan
-            # DESPUÉS. Así la comisión quincenal NO ve el gasto Amex (base intacta) pero el saldo
-            # final SÍ lo incluye. NO se toca el código de comisión; solo se envuelve.
+            # ── [AMEX/COMISIÓN 1444] Aislar filas de tarjeta del cálculo de comisión (flag False) ──
+            # Con AMEX_AFECTA_COMISION_1444=False se retiran las filas de tarjeta de 1444 (Orden
+            # legacy gastoamex_1444_/reembolsoamex_1444_ y 1-a-1 amex_<Reference>/rakuten_<hash>)
+            # ANTES del recálculo+comisión y se reincorporan DESPUÉS. Así la comisión quincenal
+            # NO ve el gasto de tarjeta (base intacta) pero el saldo final SÍ lo incluye.
+            # NO se toca el código de comisión; solo se envuelve.
             _amex_stash_1444 = None
             if cas == "1444" and not AMEX_AFECTA_COMISION_1444:
                 _m_amex = combinado["Orden"].astype(str).str.match(
-                    r"^(?:gastoamex|reembolsoamex)_1444_", na=False
+                    r"^(?:gastoamex|reembolsoamex)_1444_|^(?:amex|rakuten)_", na=False
                 )
                 if _m_amex.any():
                     _amex_stash_1444 = combinado[_m_amex].copy()
