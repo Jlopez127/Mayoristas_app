@@ -331,10 +331,17 @@ AMEX_CARD_MAP = {
     "PAULA HERRERA": "11591",
     "JUAN P CORREAL": "1444",
     "JULIAN SANCHEZ": "13608",
+    # 🔁 K LOPEZ VELANDIA (Kelly) COMPRA PARA 1444 (Maria Moises): sus compras Amex son egresos
+    # de 1444 — corrección de regla de negocio 2026-07-22 (antes se ignoraba, fue un error de
+    # especificación). Su tarjeta (-23003) aparece en el extracto como "K LOPEZ VELANDIA"; se
+    # agrega también la variante "KELLY P LOPEZVELANDIA" por si Amex la etiquetara distinto
+    # (la normalización upper+colapso-espacios NO unifica ambas grafías -> ambas explícitas).
+    "K LOPEZ VELANDIA": "1444",
+    "KELLY P LOPEZVELANDIA": "1444",
+    # ⚠️ Sus PAGOS a la tarjeta ("THANK YOU"/Category vacía) y CRÉDITOS Amazon (AMAZON PAY YOUR
+    # CHARGES / WITH POINTS) siguen EXCLUIDOS por el filtro defensivo de negativos de más abajo:
+    # Kelly es la TITULAR que paga la tarjeta, esos negativos NO son reembolsos de 1444.
 }
-# ⛔ K LOPEZ VELANDIA: SIEMPRE ignorada (compras y reembolsos), sin excepción — decisión de
-# negocio 2026-07-16. NO agregarla al mapa aunque aparezca en extractos o en cobros históricos
-# (aparece también tipeada como "KELLY P LOPEZVELANDIA", misma cuenta -23003).
 AMEX_USUARIOS = {"11591": "Paula Herrera", "1444": "Maria Moises", "13608": "Julian Sanchez"}
 AMEX_TRM_SPREAD = 125  # COP fijo que se suma a la TRM del día
 
