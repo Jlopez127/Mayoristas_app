@@ -12,13 +12,14 @@ Uso:
 
 Entradas:
   - Excel de cobrados CONGELADO (20260710Cobro tarjetas.xlsx). Hojas usadas:
-      'Amex Paula' -> 11591 ; 'Amex Julian' -> 13608 ; 'Amex Correal' -> 1444 (SOLO
-      JUAN P CORREAL: K LOPEZ VELANDIA / KELLY P LOPEZVELANDIA se ignoran SIEMPRE,
-      decisión de negocio 2026-07-16) ; 'RakutenCorreal' -> 1444.
+      'Amex Paula' -> 11591 ; 'Amex Julian' -> 13608 ; 'Amex Correal' -> 1444
+      (JUAN P CORREAL **y** K LOPEZ VELANDIA/KELLY P LOPEZVELANDIA -> 1444: Kelly compra para
+      1444, corrección 2026-07-22) ; 'RakutenCorreal' -> 1444.
       Las demás hojas (Citibank/Robinhood/Capital/JuanDAlfonso) NO aplican.
-  - Extracto Amex (activity*.xlsx, hoja 'Transaction Details', header fila 7) — fuente de
-    los Reference. El extracto actual arranca 2026-01-01: las filas cobradas de 2025 quedan
-    en 'pendientes_rematch' hasta tener el extracto oct-dic 2025.
+  - Extracto(s) Amex (activity*.xlsx, hoja 'Transaction Details', header fila 7) — fuente de
+    los Reference. Acepta VARIOS separados por coma y los combina (dedup por Reference); usar
+    el más completo disponible (activity(3) ene-jul + activity(4) jun-jul). El combinado arranca
+    2026-01-01: las filas cobradas de 2025 quedan en 'pendientes_rematch' hasta el extracto 2025.
   - CSV Rakuten (Rakuten_Activity_All.csv) — fuente de los hash.
 
 Salida (xlsx, 3 hojas):
@@ -58,7 +59,9 @@ import pandas as pd
 # ── Parámetros ────────────────────────────────────────────────────────────────
 DEFAULTS = [
     "/Users/julianlopez/Downloads/20260710Cobro tarjetas.xlsx",
-    "/Users/julianlopez/Library/CloudStorage/OneDrive-Personal/Encargomio/Dash_mayoristas/activity (3).xlsx",
+    # Extracto(s) Amex combinados (coma-separados): activity(3) ene-jul + activity(4) jun-jul.
+    "/Users/julianlopez/Library/CloudStorage/OneDrive-Personal/Encargomio/Dash_mayoristas/activity (3).xlsx,"
+    "/Users/julianlopez/Library/CloudStorage/OneDrive-Personal/Encargomio/Dash_mayoristas/activity (4).xlsx",
     "/Users/julianlopez/Library/CloudStorage/OneDrive-Personal/Encargomio/Dash_mayoristas/Rakuten_Activity_All.csv",
     "tarjetas_cobradas.xlsx",
 ]
@@ -66,27 +69,36 @@ COBRADOS_XLSX, EXTRACTO_AMEX, CSV_RAKUTEN, SALIDA = (
     sys.argv[1:5] if len(sys.argv) >= 5 else DEFAULTS
 )
 FUENTE = "Excel cobrados 20260710"
-EXTRACTO_INICIO = pd.Timestamp("2026-01-01")   # inicio del extracto Amex disponible
-CM_IGNORADOS = {"K LOPEZ VELANDIA", "KELLY P LOPEZVELANDIA"}  # SIEMPRE ignoradas
-HOJAS_AMEX = [  # (hoja, casillero, Card Member esperado)
-    ("Amex Paula", "11591", "PAULA HERRERA"),
-    ("Amex Julian", "13608", "JULIAN SANCHEZ"),
-    ("Amex Correal", "1444", "JUAN P CORREAL"),
+EXTRACTO_INICIO = pd.Timestamp("2026-01-01")   # inicio del extracto Amex combinado disponible
+# Kelly compra para 1444; su tarjeta -23003 aparece en el extracto como "K LOPEZ VELANDIA".
+# En el Excel de cobrados figura con dos grafías -> se unifican a la forma del extracto.
+KELLY_ALIAS = {"KELLY P LOPEZVELANDIA": "K LOPEZ VELANDIA"}
+HOJAS_AMEX = [  # (hoja, casillero, Card Members aceptados -> ese casillero)
+    ("Amex Paula", "11591", ["PAULA HERRERA"]),
+    ("Amex Julian", "13608", ["JULIAN SANCHEZ"]),
+    ("Amex Correal", "1444", ["JUAN P CORREAL", "K LOPEZ VELANDIA"]),  # JP Correal + Kelly
 ]
 
 cobradas, pendientes, revision = [], [], []
+kelly_ordenes = 0  # cuántos Orden de Kelly (-> 1444) entran a la lista (para el reporte)
 
 
 def _norm_cm(s) -> str:
-    return " ".join(str(s).strip().upper().split())
+    n = " ".join(str(s).strip().upper().split())
+    return KELLY_ALIAS.get(n, n)
 
 
-# ═════ AMEX ═════
-ext = pd.read_excel(EXTRACTO_AMEX, sheet_name="Transaction Details", header=6)
+# ═════ AMEX ═════ — combina uno o más extractos (coma-separados), dedup por Reference
+ext_paths = [p.strip() for p in EXTRACTO_AMEX.split(",") if p.strip()]
+ext = pd.concat(
+    [pd.read_excel(p, sheet_name="Transaction Details", header=6) for p in ext_paths],
+    ignore_index=True,
+)
+ext["_ref"] = ext["Reference"].astype(str).str.strip()
+ext = ext.drop_duplicates(subset=["_ref"], keep="first").copy()  # union por Reference (estable)
 ext["_d"] = pd.to_datetime(ext["Date"], format="%m/%d/%Y", errors="coerce")
 ext["_amt"] = pd.to_numeric(ext["Amount"], errors="coerce").round(2)
 ext["_cm"] = ext["Card Member"].map(_norm_cm)
-ext["_ref"] = ext["Reference"].astype(str).str.strip()
 
 # índice: (fecha, monto firmado, CM) -> lista de Reference (ascendente, determinista)
 refs_por_clave: dict = {}
@@ -96,45 +108,46 @@ for k in refs_por_clave:
     refs_por_clave[k].sort()
 
 resumen_amex = {}
-for hoja, cas, cm_esp in HOJAS_AMEX:
+for hoja, cas, cms_ok in HOJAS_AMEX:
     raw = pd.read_excel(COBRADOS_XLSX, sheet_name=hoja, header=None).iloc[:, :6]
     raw.columns = ["fecha", "flag", "desc", "cm", "cta", "usd"]
     d = raw[raw["fecha"].notna() & raw["usd"].notna()].copy()
     d["_d"] = pd.to_datetime(d["fecha"].astype(str), format="%m/%d/%Y", errors="coerce")
     d["_amt"] = pd.to_numeric(d["usd"], errors="coerce").round(2)
-    d["_cm"] = d["cm"].map(_norm_cm)
+    d["_cm"] = d["cm"].map(_norm_cm)  # normaliza + unifica grafía de Kelly
     n_sin_parse = int((d["_d"].isna() | d["_amt"].isna()).sum())
     d = d[d["_d"].notna() & d["_amt"].notna()].copy()
 
-    n_klopez = int(d["_cm"].isin(CM_IGNORADOS).sum())          # ⛔ K Lopez: fuera SIEMPRE
-    n_otros_cm = int((~d["_cm"].isin(CM_IGNORADOS) & (d["_cm"] != cm_esp)).sum())
-    d = d[d["_cm"] == cm_esp].copy()
+    n_otros_cm = int((~d["_cm"].isin(cms_ok)).sum())  # CM no aceptado en esta hoja (no debería haber)
+    n_kelly_hoja = int((d["_cm"] == "K LOPEZ VELANDIA").sum())
+    d = d[d["_cm"].isin(cms_ok)].copy()
 
-    # 2025 (antes del extracto disponible) -> pendientes de rematch
+    # 2025 (antes del extracto combinado) -> pendientes de rematch
     d2025 = d[d["_d"] < EXTRACTO_INICIO]
     for _, r in d2025.iterrows():
         pendientes.append({
             "tarjeta": "amex", "casillero": cas, "hoja_origen": hoja,
             "fecha_compra": r["_d"].strftime("%Y-%m-%d"), "monto_usd": r["_amt"],
-            "card_member": cm_esp, "descripcion_excel": str(r["desc"]).strip(),
-            "motivo": "requiere extracto Amex oct-dic 2025 (fuera del extracto actual)",
+            "card_member": r["_cm"], "descripcion_excel": str(r["desc"]).strip(),
+            "motivo": "requiere extracto Amex oct-dic 2025 (fuera del extracto combinado)",
         })
     d = d[d["_d"] >= EXTRACTO_INICIO]
 
-    # match count-aware por clave
+    # match count-aware por clave (fecha, monto, Card Member) — cada CM usa su propio índice
     n_ok = n_pend = n_sobra = 0
     usd_ok = 0.0
-    grupos = d.groupby(["_d", "_amt"], sort=True)
-    for (fd, amt), g in grupos:
+    for (fd, amt, cm), g in d.groupby(["_d", "_amt", "_cm"], sort=True):
         n_cob = len(g)
-        refs = refs_por_clave.get((fd, amt, cm_esp), [])
+        refs = refs_por_clave.get((fd, amt, cm), [])
         take = min(n_cob, len(refs))
         for ref in refs[:take]:
             cobradas.append({
                 "Orden": f"amex_{ref}", "tarjeta": "amex", "casillero": cas,
                 "fecha_compra": fd.strftime("%Y-%m-%d"), "monto_usd": amt,
-                "nota": "", "fuente": FUENTE,
+                "nota": "Kelly -> 1444" if cm == "K LOPEZ VELANDIA" else "", "fuente": FUENTE,
             })
+        if cm == "K LOPEZ VELANDIA":
+            globals()["kelly_ordenes"] += take
         n_ok += take
         usd_ok += abs(amt) * take
         if n_cob > len(refs) and len(refs) > 0:
@@ -142,7 +155,7 @@ for hoja, cas, cm_esp in HOJAS_AMEX:
             n_sobra += n_cob - len(refs)
             revision.append({
                 "tarjeta": "amex", "casillero": cas, "hoja_origen": hoja,
-                "fecha_compra": fd.strftime("%Y-%m-%d"), "monto_usd": amt,
+                "fecha_compra": fd.strftime("%Y-%m-%d"), "monto_usd": amt, "card_member": cm,
                 "detalle": f"cobrada {n_cob} veces, extracto tiene {len(refs)}",
             })
         if len(refs) == 0:
@@ -151,12 +164,12 @@ for hoja, cas, cm_esp in HOJAS_AMEX:
                 pendientes.append({
                     "tarjeta": "amex", "casillero": cas, "hoja_origen": hoja,
                     "fecha_compra": fd.strftime("%Y-%m-%d"), "monto_usd": amt,
-                    "card_member": cm_esp, "descripcion_excel": str(r["desc"]).strip(),
-                    "motivo": "sin match en extracto del 12-jul (cobro pre-asiento) — "
+                    "card_member": cm, "descripcion_excel": str(r["desc"]).strip(),
+                    "motivo": "sin match en extracto combinado (cobro pre-asiento) — "
                               "rematch con extracto más nuevo",
                 })
     resumen_amex[hoja] = dict(cas=cas, ok=n_ok, usd=usd_ok, pend_2025=len(d2025),
-                              pend_asiento=n_pend, sobras=n_sobra, klopez=n_klopez,
+                              pend_asiento=n_pend, sobras=n_sobra, kelly=n_kelly_hoja,
                               otros_cm=n_otros_cm, sin_parse=n_sin_parse)
 
 # ═════ RAKUTEN ═════
@@ -282,8 +295,9 @@ print(f"TOTAL lista de exclusión: {len(df_cob)} Orden "
 for hoja, s in resumen_amex.items():
     print(f"  {hoja} (cas {s['cas']}): {s['ok']} Orden (${s['usd']:,.2f} USD) | "
           f"pendientes 2025: {s['pend_2025']} | pendientes pre-asiento: {s['pend_asiento']} | "
-          f"cobros sin respaldo (revision): {s['sobras']} | ignoradas K Lopez: {s['klopez']} | "
+          f"cobros sin respaldo (revision): {s['sobras']} | filas Kelly en hoja: {s['kelly']} | "
           f"otros CM: {s['otros_cm']} | sin parse: {s['sin_parse']}")
+print(f"  KELLY -> 1444: {kelly_ordenes} Orden agregados a la lista (compras de Kelly, antes ignoradas)")
 rk_cob = df_cob[df_cob.tarjeta == "rakuten"]
 print(f"  RakutenCorreal (cas 1444): {len(rk_cob)} Orden (${rk_cob.monto_usd.abs().sum():,.2f} USD) "
       f"[transaction exactas: {n_tx_ok} | auth monto exacto: {n_auth_ok} | "
