@@ -469,19 +469,27 @@ def _amex_trm_dia(fecha_iso: str, _cache: dict):
 #     una candidata del HISTÓRICO, del MISMO casillero (el histórico no guarda Card Member).
 #     Sin esto un reembolso podría tomar la TRM de una compra idéntica de OTRO mayorista
 #     (en los extractos reales hay 4 claves (merchant,USD) compartidas entre casilleros).
-#   - REEMBOLSO TOTAL: mismo merchant normalizado + mismo |USD| EXACTO + fecha ANTERIOR + esa
-#     compra no emparejada ya con otro reembolso (1:1, count-aware). Varios candidatos -> la
-#     compra MÁS RECIENTE anterior al reembolso (desempate por Reference/Orden ascendente):
-#     determinista entre corridas, que es lo que exige la idempotencia.
-#   - REEMBOLSO PARCIAL (devolución de parte de una compra): se intenta solo si NO hubo match
-#     exacto. Candidatas = mismo merchant + mismo Card Member/casillero + fecha ANTERIOR +
-#     USD de la compra ESTRICTAMENTE MAYOR + no emparejada. Se empareja SOLO si hay
-#     EXACTAMENTE UNA candidata; con 0 o 2+ NO se empareja (fallback + warning con el conteo).
-#     Regla deliberadamente estricta: con varias candidatas no hay criterio objetivo para
-#     elegir (p.ej. un ajuste de 1 centavo contra 16 compras del mismo merchant) y emparejar
-#     mal sería silencioso. Conversión PROPORCIONAL: COP = round(USD_reembolso * TRM_compra).
-#   - EXTRACTO PRIMERO: si el extracto aporta candidatas, el histórico NO se mira (evita contar
-#     dos veces la misma compra que está en ambos y romper la regla de "exactamente una").
+#   - REEMBOLSO TOTAL (monto exacto), en DOS PASADAS ordenadas — para TODOS los reembolsos se
+#     agota la pasada 1 antes de empezar la 2, así el consumo 1:1 respeta la señal más fuerte:
+#       Pasada 1: mismo Card Member + mismo merchant normalizado + |USD| EXACTO + fecha ANTERIOR
+#                 + no emparejada. Extracto primero, luego histórico.
+#       Pasada 2 (solo los que quedaron sin match): mismo Card Member + |USD| EXACTO al centavo
+#                 + fecha ANTERIOR + no emparejada, SIN exigir merchant. El monto exacto dentro
+#                 del mismo Card Member ya identifica la compra; el merchant solo estorba cuando
+#                 el emisor escribe la descripción de la compra y su reembolso distinta (Amex:
+#                 'AMAZON MARKEPLACE NA PA' en la compra vs 'AMAZON MARKETPLACE ...' en el
+#                 reembolso). Varios candidatos -> la compra MÁS RECIENTE anterior al reembolso.
+#     En ambas pasadas, varios candidatos -> la MÁS RECIENTE anterior (desempate por Reference/
+#     Orden ascendente): determinista entre corridas, que es lo que exige la idempotencia.
+#   - REEMBOLSO PARCIAL (pasada 3, solo los que siguen sin match; NO cambia con lo anterior):
+#     devolución de parte de una compra. Candidatas = mismo merchant + mismo Card Member/
+#     casillero + fecha ANTERIOR + USD de la compra ESTRICTAMENTE MAYOR + no emparejada. Se
+#     empareja SOLO si hay EXACTAMENTE UNA candidata; con 0 o 2+ NO se empareja (fallback +
+#     warning con el conteo). Regla estricta: con varias candidatas no hay criterio objetivo
+#     (un ajuste de 1 centavo contra 16 compras del mismo merchant) y emparejar mal sería
+#     silencioso. Conversión PROPORCIONAL: COP = round(USD_reembolso * TRM_compra).
+#   - EXTRACTO PRIMERO en cada pasada: si el extracto aporta candidatas, el histórico NO se mira
+#     (evita contar dos veces la misma compra que está en ambos y romper el conteo).
 #   - Sin candidato -> comportamiento ANTERIOR (TRM del día del reembolso) + warning listando
 #     los reembolsos para revisión manual.
 # NO altera compras (Amount > 0), ni Orden, ni corte, ni lista de exclusión, ni idempotencia.
@@ -554,44 +562,91 @@ def _resolver_trm_reembolsos(reembolsos, compras, hist_idx):
     'resueltos' = {id_reembolso: (fecha_compra_iso, origen, trm_hist_o_None, es_parcial)};
     origen 'extracto' (la TRM se pide por fecha) u 'historico' (la TRM viene guardada).
     'sin_match' trae 'motivo' y 'n_candidatas' para el warning."""
-    # Índice del extracto por (Card Member, merchant): segmenta y sirve exacto y parcial.
+    # Índice del extracto por (Card Member, merchant): pasada 1 (exacto) y pasada 3 (parcial).
     por_merch: dict = {}
     for c in compras:
         por_merch.setdefault((c["cm"], c["merch"]), []).append(c)
-    for k in por_merch:  # determinista
-        por_merch[k].sort(key=lambda c: (c["fecha"], str(c["id"])))
+    # Índice del extracto por Card Member (sin merchant): pasada 2 (exacto sin merchant).
+    por_cm: dict = {}
+    for c in compras:
+        por_cm.setdefault(c["cm"], []).append(c)
+    for _d in (por_merch, por_cm):  # determinista: fecha asc, luego id asc
+        for k in _d:
+            _d[k].sort(key=lambda c: (c["fecha"], str(c["id"])))
+
     usados_ext, usados_hist = set(), set()
-    resueltos, sin_match, ambiguos = {}, [], []
-    for r in sorted(reembolsos, key=lambda x: (x["fecha"], str(x["id"]))):
+    resueltos, ambiguos = {}, []
+
+    def _tomar_ext(r, cands):
+        elegida = cands[-1]  # la MÁS RECIENTE anterior (lista ordenada), determinista
+        if len({c["trm_fecha"] for c in cands}) > 1:
+            ambiguos.append({**r, "n_candidatas": len(cands)})
+        usados_ext.add(str(elegida["id"]))
+        return (elegida["trm_fecha"], "extracto", None)
+
+    def _tomar_hist(cands):
+        elegida = cands[-1]
+        usados_hist.add(elegida["orden"])
+        return (elegida["fecha"].strftime("%Y-%m-%d"), "historico", elegida["trm"])
+
+    def _hist_por_cas(cas):
+        """Todas las compras del histórico de ese casillero (cualquier merchant), para pasada 2."""
+        out = []
+        for (hc, _hm), lst in hist_idx.items():
+            if hc == cas:
+                out += lst
+        out.sort(key=lambda h: (h["fecha"], h["orden"]))
+        return out
+
+    ordenados = sorted(reembolsos, key=lambda x: (x["fecha"], str(x["id"])))
+
+    # ── PASADA 1: EXACTO con merchant (extracto, luego histórico) — para todos ──
+    restantes = []
+    for r in ordenados:
         usd_r = round(float(r["usd"]), 2)
-        ext = [c for c in por_merch.get((r["cm"], r["merch"]), [])
-               if c["fecha"] < r["fecha"] and str(c["id"]) not in usados_ext]
-        hist = [h for h in hist_idx.get((r["cas"], r["merch"]), [])
-                if h["fecha"] < r["fecha"] and h["orden"] not in usados_hist]
-
-        # 1) REEMBOLSO TOTAL: monto exacto. Extracto primero, luego histórico.
-        ex = [c for c in ext if round(float(c["usd"]), 2) == usd_r]
+        ex = [c for c in por_merch.get((r["cm"], r["merch"]), [])
+              if c["fecha"] < r["fecha"] and str(c["id"]) not in usados_ext
+              and round(float(c["usd"]), 2) == usd_r]
         if ex:
-            elegida = ex[-1]  # más reciente anterior (lista ordenada)
-            if len({c["trm_fecha"] for c in ex}) > 1:
-                ambiguos.append({**r, "n_candidatas": len(ex)})
-            usados_ext.add(str(elegida["id"]))
-            resueltos[r["id"]] = (elegida["trm_fecha"], "extracto", None, False)
+            resueltos[r["id"]] = (*_tomar_ext(r, ex), False)
             continue
-        hx = [h for h in hist if abs(float(h["usd"]) - usd_r) < 0.005]
+        hx = [h for h in hist_idx.get((r["cas"], r["merch"]), [])
+              if h["fecha"] < r["fecha"] and h["orden"] not in usados_hist
+              and abs(float(h["usd"]) - usd_r) < 0.005]
         if hx:
-            elegida = hx[-1]
-            usados_hist.add(elegida["orden"])
-            resueltos[r["id"]] = (elegida["fecha"].strftime("%Y-%m-%d"), "historico",
-                                  elegida["trm"], False)
+            resueltos[r["id"]] = (*_tomar_hist(hx), False)
             continue
+        restantes.append(r)
 
-        # 2) REEMBOLSO PARCIAL: compra estrictamente mayor y UNA SOLA candidata.
-        #    Extracto primero; el histórico solo se mira si el extracto no aporta ninguna
-        #    (una misma compra puede estar en ambos y falsearía el conteo).
-        pe = [c for c in ext if round(float(c["usd"]), 2) > usd_r]
-        pool, origen = (pe, "extracto") if pe else (
-            [h for h in hist if round(float(h["usd"]), 2) > usd_r], "historico")
+    # ── PASADA 2: EXACTO sin merchant, mismo Card Member (los que quedaron sin match) ──
+    restantes2 = []
+    for r in restantes:
+        usd_r = round(float(r["usd"]), 2)
+        ex = [c for c in por_cm.get(r["cm"], [])
+              if c["fecha"] < r["fecha"] and str(c["id"]) not in usados_ext
+              and round(float(c["usd"]), 2) == usd_r]
+        if ex:
+            resueltos[r["id"]] = (*_tomar_ext(r, ex), False)
+            continue
+        hx = [h for h in _hist_por_cas(r["cas"])
+              if h["fecha"] < r["fecha"] and h["orden"] not in usados_hist
+              and abs(float(h["usd"]) - usd_r) < 0.005]
+        if hx:
+            resueltos[r["id"]] = (*_tomar_hist(hx), False)
+            continue
+        restantes2.append(r)
+
+    # ── PASADA 3: PARCIAL con merchant, EXACTAMENTE UNA candidata (extracto primero) ──
+    sin_match = []
+    for r in restantes2:
+        usd_r = round(float(r["usd"]), 2)
+        pe = [c for c in por_merch.get((r["cm"], r["merch"]), [])
+              if c["fecha"] < r["fecha"] and str(c["id"]) not in usados_ext
+              and round(float(c["usd"]), 2) > usd_r]
+        ph = [h for h in hist_idx.get((r["cas"], r["merch"]), [])
+              if h["fecha"] < r["fecha"] and h["orden"] not in usados_hist
+              and round(float(h["usd"]), 2) > usd_r]
+        pool, origen = (pe, "extracto") if pe else (ph, "historico")
         if len(pool) == 1:
             elegida = pool[0]
             if origen == "extracto":
