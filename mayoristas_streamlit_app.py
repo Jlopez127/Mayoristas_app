@@ -302,6 +302,47 @@ def _cobradas_info(msg: str):
         pass
 
 
+def _cobradas_warn(msg: str):
+    """st.warning si Streamlit está disponible; en dry-run (sin st) no rompe."""
+    try:
+        st.warning(msg)
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=600)  # cache 10 min: no re-descargar de Dropbox en cada rerun
+def cargar_hist_tarjetas():
+    """Lee de Dropbox (SOLO LECTURA) el histórico vigente y devuelve UN DataFrame con las filas
+    de tarjeta ya cargadas (Orden amex_* / rakuten_*) de todas las hojas. Sirve únicamente para
+    darle a un reembolso la TRM de su compra original cuando esa compra ya no está en el
+    extracto. NO es una defensa anti-doble-cobro: si falla, el cargue continúa con el
+    comportamiento anterior (TRM del día del reembolso) — por eso el caller ignora el error."""
+    cfg = st.secrets["dropbox"]
+    _, res = dbx.files_download(cfg["remote_path"])
+    hojas = pd.read_excel(io.BytesIO(res.content), sheet_name=None)
+    partes = []
+    for _dfh in hojas.values():
+        if "Orden" not in _dfh.columns:
+            continue
+        _o = _dfh["Orden"].astype(str).str.strip()
+        _sel = _dfh[_o.str.startswith("amex_") | _o.str.startswith("rakuten_")]
+        if len(_sel):
+            partes.append(_sel)
+    return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
+
+
+def _hist_tarjetas_para_trm():
+    """Envoltorio NO bloqueante de cargar_hist_tarjetas(): si Dropbox falla devuelve None y el
+    cargue sigue igual que antes (los reembolsos sin compra en el extracto caen al fallback con
+    warning). Nunca detiene el proceso: esto mejora la conversión, no protege contra recobro."""
+    try:
+        return cargar_hist_tarjetas()
+    except Exception as e:
+        _cobradas_info(f"ℹ️ No se pudo leer el histórico para la TRM de reembolsos ({e}); "
+                       f"los reembolsos sin compra en el extracto usarán la TRM de su día.")
+        return None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Cargue "Tarjeta Amex" 1-a-1: cada transacción del extracto -> UNA fila propia en el
 # histórico (ya NO se acumula por día), lista para entrar a conciliacion_<cas>.
@@ -413,7 +454,116 @@ def _amex_trm_dia(fecha_iso: str, _cache: dict):
     return trm
 
 
-def procesar_amex(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None) -> dict[str, pd.DataFrame]:
+# ──────────────────────────────────────────────────────────────────────────────
+# REEMBOLSO CON LA TRM DE SU COMPRA ORIGINAL (neteo exacto en COP).
+# PROBLEMA: un reembolso convertido con la TRM de SU día no cancela la compra que revierte
+# (caso real: 2 compras eBay 15-jul TRM 3.377,11 vs sus 2 reembolsos 17-jul TRM 3.346,41 ->
+# residuo de 41.350 COP a cargo del mayorista, que no compró nada).
+# SOLUCIÓN: al reembolsar, se busca la COMPRA ORIGINAL y se usa SU TRM -> el Monto COP del
+# reembolso queda idéntico al de la compra y el neto da exactamente 0.
+#   - Universo de búsqueda: TODAS las compras del extracto del mismo Card Member/tarjeta,
+#     SIN filtrar por corte ni por lista de cobradas (la compra original puede ser vieja o ya
+#     cobrada). Si no está en el extracto, se busca en el HISTÓRICO ya cargado (filas
+#     amex_/rakuten_ de gasto) y se usa la TRM guardada en esa fila.
+#   - Criterio: mismo merchant normalizado + mismo |USD| exacto + fecha ANTERIOR al reembolso
+#     + esa compra no emparejada ya con otro reembolso (1:1, count-aware).
+#   - Varios candidatos -> se toma la compra MÁS RECIENTE anterior al reembolso (desempate por
+#     Reference/Orden ascendente): determinista entre corridas, que es lo que exige la
+#     idempotencia. Cuando esos candidatos tienen TRM distintas se cuenta aparte y se avisa.
+#   - Sin candidato -> comportamiento ANTERIOR (TRM del día del reembolso) + warning listando
+#     los reembolsos para revisión manual.
+# NO altera compras (Amount > 0), ni Orden, ni corte, ni lista de exclusión, ni idempotencia.
+# ──────────────────────────────────────────────────────────────────────────────
+def _norm_merchant(s) -> str:
+    """Merchant/Description normalizado para emparejar: colapsa espacios + MAYÚSCULAS."""
+    return " ".join(str(s).split()).upper()
+
+
+def _norm_merchant_refund_rk(s) -> str:
+    """Merchant de un REFUND de Rakuten. Rakuten nombra el reembolso "Refund from <MERCHANT>",
+    así que sin quitar ese prefijo NUNCA coincidiría con el merchant de la compra. Verificado
+    en el CSV real: 'Refund from JD 638 000000638' <-> compra 'JD 638 000000638'."""
+    v = _norm_merchant(s)
+    return v[len("REFUND FROM "):].strip() if v.startswith("REFUND FROM ") else v
+
+
+def _indice_compras_historico(hist_df, prefijo: str, etiqueta: str) -> dict:
+    """Índice {(merchant_norm, usd_2dec): [(fecha, trm, orden), ...]} de las COMPRAS de tarjeta
+    YA CARGADAS en el histórico, para reembolsos cuya compra original no está en el extracto.
+    'hist_df' = DataFrame con las filas de tarjeta del histórico (Orden/Monto/TRM/Fecha/
+    'Nombre del producto'). El USD se recupera como Monto/TRM (la TRM guardada ya incluye el
+    spread, así que la división devuelve el USD original). Devuelve {} si no hay datos usables."""
+    idx: dict = {}
+    if hist_df is None or not len(hist_df):
+        return idx
+    d = hist_df.copy()
+    d.columns = [str(c).strip() for c in d.columns]
+    for col in ("Orden", "Monto", "TRM", "Fecha", "Nombre del producto"):
+        if col not in d.columns:
+            return idx
+    d = d[d["Orden"].astype(str).str.strip().str.startswith(prefijo)].copy()
+    d["_trm"] = pd.to_numeric(d["TRM"], errors="coerce")
+    d["_monto"] = pd.to_numeric(d["Monto"], errors="coerce")
+    d["_fecha"] = pd.to_datetime(d["Fecha"], errors="coerce")
+    d = d[d["_trm"].notna() & (d["_trm"] > 0) & d["_monto"].notna() & d["_fecha"].notna()]
+    # solo las filas de GASTO (una compra); los reembolsos ya cargados no son candidatos
+    _pref = f"{etiqueta} - gasto - "
+    _np = d["Nombre del producto"].astype(str)
+    d = d[_np.str.startswith(_pref)].copy()
+    if not len(d):
+        return idx
+    d["_merch"] = d["Nombre del producto"].astype(str).str[len(_pref):].map(_norm_merchant)
+    d["_usd"] = (d["_monto"] / d["_trm"]).round(2)
+    for _, r in d.iterrows():
+        idx.setdefault((r["_merch"], float(r["_usd"])), []).append(
+            (r["_fecha"], float(r["_trm"]), str(r["Orden"]).strip())
+        )
+    for k in idx:  # determinista: fecha asc, luego Orden asc
+        idx[k].sort(key=lambda t: (t[0], t[2]))
+    return idx
+
+
+def _resolver_trm_reembolsos(reembolsos, compras, hist_idx):
+    """Empareja cada reembolso con su compra original y devuelve
+    (resueltos, sin_match, ambiguos_trm).
+      reembolsos: lista de dicts {id, fecha (Timestamp), merch, usd, etiqueta}
+                  — se procesan en orden (fecha, id) ascendente: determinista.
+      compras:    lista de dicts {id, fecha, merch, usd, trm_fecha} del EXTRACTO (universo
+                  completo, sin filtrar por corte/lista). trm_fecha = día cuya TRM se usará.
+      hist_idx:   índice de _indice_compras_historico (fallback si no está en el extracto).
+    'resueltos' = {id_reembolso: (fecha_compra_iso, origen, trm_hist_o_None)} donde origen es
+    'extracto' (la TRM se pedirá por fecha) o 'historico' (la TRM viene guardada)."""
+    disponibles: dict = {}
+    for c in compras:
+        disponibles.setdefault((c["merch"], round(float(c["usd"]), 2)), []).append(c)
+    for k in disponibles:  # determinista
+        disponibles[k].sort(key=lambda c: (c["fecha"], str(c["id"])))
+    hist_usados: dict = {}
+    resueltos, sin_match, ambiguos = {}, [], []
+    for r in sorted(reembolsos, key=lambda x: (x["fecha"], str(x["id"]))):
+        clave = (r["merch"], round(float(r["usd"]), 2))
+        cands = [c for c in disponibles.get(clave, []) if c["fecha"] < r["fecha"]]
+        if cands:
+            elegida = cands[-1]  # la MÁS RECIENTE anterior al reembolso (lista ya ordenada)
+            if len({c["trm_fecha"] for c in cands}) > 1:
+                ambiguos.append({**r, "n_candidatas": len(cands)})
+            disponibles[clave].remove(elegida)  # 1:1: no se reutiliza
+            resueltos[r["id"]] = (elegida["trm_fecha"], "extracto", None)
+            continue
+        # fallback: la compra original no está en el extracto -> buscarla en el histórico
+        usados = hist_usados.setdefault(clave, set())
+        hc = [t for t in hist_idx.get(clave, []) if t[0] < r["fecha"] and t[2] not in usados]
+        if hc:
+            f_h, trm_h, orden_h = hc[-1]
+            usados.add(orden_h)
+            resueltos[r["id"]] = (f_h.strftime("%Y-%m-%d"), "historico", trm_h)
+            continue
+        sin_match.append(r)
+    return resueltos, sin_match, ambiguos
+
+
+def procesar_amex(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None,
+                  hist_tarjetas=None) -> dict[str, pd.DataFrame]:
     """Transforma la hoja 'Transaction Details' de Amex en {amex_<cas>: DF} con UNA fila COP por
     transacción (1-a-1, Orden = amex_<Reference>; ver bloque de arriba). Levanta ValueError si
     falta la TRM de cualquier día con movimiento, o si alguna fila no trae Reference válido.
@@ -421,7 +571,10 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=
     'cobrados' (OBLIGATORIO si fecha_desde está activo) = set de Orden ya cobrados
     (tarjetas_cobradas.xlsx): esas transacciones se EXCLUYEN (anti-doble-cobro).
     'pendientes' (opcional) = DataFrame 'pendientes_rematch' de la misma lista: cobros reales
-    aún sin Orden; las transacciones que los matcheen también se EXCLUYEN."""
+    aún sin Orden; las transacciones que los matcheen también se EXCLUYEN.
+    'hist_tarjetas' (opcional) = filas de tarjeta YA CARGADAS en el histórico (Orden/Monto/TRM/
+    Fecha/'Nombre del producto'): solo se usa para darle a un reembolso la TRM de su compra
+    original cuando esa compra no está en el extracto. No afecta qué filas se generan."""
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     for col in ("Card Member", "Date", "Amount", "Reference"):
@@ -447,6 +600,23 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=
     # Fecha de transacción (Amex viene MM/DD/YYYY)
     df["_fecha"] = pd.to_datetime(df["Date"], format="%m/%d/%Y", errors="coerce")
     df = df[df["_fecha"].notna()].copy()
+
+    # 🔁 UNIVERSO DE COMPRAS para emparejar reembolsos (ver bloque "REEMBOLSO CON LA TRM DE SU
+    # COMPRA ORIGINAL"): se captura ANTES del corte y ANTES de la lista de exclusión, porque la
+    # compra que revierte un reembolso puede ser vieja o ya estar cobrada. Solo lectura: este
+    # universo NO genera filas, únicamente presta la TRM/fecha de la compra.
+    _u = df[pd.to_numeric(df["Amount"], errors="coerce") > 0].copy()
+    _compras_universo = [
+        {
+            "id": str(r["Reference"]).strip().lstrip("'"),
+            "fecha": r["_fecha"],
+            "merch": _norm_merchant(r.get("Description", "")),
+            "usd": round(float(pd.to_numeric(r["Amount"], errors="coerce")), 2),
+            "trm_fecha": r["_fecha"].strftime("%Y-%m-%d"),
+        }
+        for _, r in _u.iterrows()
+    ]
+
     if fecha_desde is not None:
         df = df[df["_fecha"] >= pd.Timestamp(fecha_desde)]
 
@@ -540,10 +710,39 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=
     _desc = df.get("Description", pd.Series("", index=df.index)).fillna("")
     df["_desc"] = _desc.astype(str).map(lambda s: " ".join(s.split()))
 
+    # 🔁 REEMBOLSO -> TRM DE SU COMPRA ORIGINAL (neteo exacto en COP). Solo toca los Ingreso.
+    _reembolsos = [
+        {"id": r["_ref"], "fecha": r["_fecha"], "merch": _norm_merchant(r["_desc"]),
+         "usd": round(float(r["_usd"]), 2)}
+        for _, r in df[df["_tipo"] == "Ingreso"].iterrows()
+    ]
+    _trm_ok, _trm_sin_match, _trm_ambiguos = _resolver_trm_reembolsos(
+        _reembolsos, _compras_universo,
+        _indice_compras_historico(hist_tarjetas, "amex_", "Tarjeta Amex"),
+    )
+    if _trm_sin_match:
+        _cobradas_warn(
+            "⚠️ Amex: {} reembolso(s) sin compra original identificable (ni en el extracto ni "
+            "en el histórico) — se usa la TRM de su propio día, como antes. REVISAR a mano: {}"
+            .format(len(_trm_sin_match),
+                    "; ".join(f"{x['fecha']:%Y-%m-%d} USD {x['usd']:.2f} {x['merch'][:40]}"
+                              for x in _trm_sin_match[:10]))
+        )
+    if _trm_ambiguos:
+        _cobradas_info(
+            f"ℹ️ Amex: {len(_trm_ambiguos)} reembolso(s) tenían varias compras candidatas con "
+            f"TRM distintas; se tomó la compra MÁS RECIENTE anterior al reembolso."
+        )
+
     # TRM por día (+125). Recolecta TODOS los días faltantes antes de decidir (sin default).
+    # Incluye los días de las COMPRAS ORIGINALES de los reembolsos emparejados (su TRM es la
+    # que se aplica), no solo los días de las filas que se van a generar.
     trm_cache: dict = {}
     faltantes = set()
-    for f_iso in df["_fecha_iso"].unique():
+    _dias = set(df["_fecha_iso"].unique()) | {
+        f for f, origen, _ in _trm_ok.values() if origen == "extracto"
+    }
+    for f_iso in sorted(_dias):
         if _amex_trm_dia(f_iso, trm_cache) is None:
             faltantes.add(f_iso)
     if faltantes:
@@ -557,8 +756,15 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=
     for _, r in df.iterrows():
         cas, tipo, f_iso = r["_cas"], r["_tipo"], r["_fecha_iso"]
         trm = trm_cache[f_iso]
-        monto = round(float(r["_usd"]) * trm)  # COP, POSITIVO
         etq = "gasto" if tipo == "Egreso" else "reembolso"
+        # Reembolso emparejado: se convierte con la TRM de la COMPRA (no la del día del
+        # reembolso) -> el COP del reembolso queda igual al de la compra y el neto da 0.
+        _m = _trm_ok.get(r["_ref"]) if tipo == "Ingreso" else None
+        if _m:
+            _f_compra, _origen, _trm_hist = _m
+            trm = _trm_hist if _origen == "historico" else trm_cache[_f_compra]
+            etq = f"reembolso (TRM compra {_f_compra})"
+        monto = round(float(r["_usd"]) * trm)  # COP, POSITIVO
         filas.append({
             "Fecha": f_iso,
             "Tipo": tipo,
@@ -639,7 +845,8 @@ def _rakuten_parse_amount(x) -> float:
     return -v if neg else v
 
 
-def procesar_rakuten(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None) -> dict[str, pd.DataFrame]:
+def procesar_rakuten(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None,
+                     hist_tarjetas=None) -> dict[str, pd.DataFrame]:
     """Transforma el CSV Rakuten en {rakuten_1444: DF} con UNA fila COP por transacción
     (1-a-1, Orden = rakuten_<sha1-12>; ver bloque de arriba). Filtra por `Type`. Levanta
     ValueError si falta la TRM de cualquier día con movimiento. 'fecha_desde' descarta
@@ -678,6 +885,23 @@ def procesar_rakuten(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendient
     # Fecha (solo día) y monto USD absoluto (Amount == 0 se descarta)
     df["_fecha"] = pd.to_datetime(df["Date"], format="%Y/%m/%d, %H:%M:%S", errors="coerce")
     df = df[df["_fecha"].notna()].copy()
+
+    # 🔁 UNIVERSO DE COMPRAS (TRANSACTION) para emparejar REFUND: igual que en Amex, se captura
+    # ANTES del corte y de la lista de exclusión (la compra revertida puede ser vieja/ya cobrada).
+    _u = df[(df["_type"] == "TRANSACTION")].copy()
+    _u["_amt_u"] = _u["Amount"].map(_rakuten_parse_amount)
+    _u = _u[_u["_amt_u"].notna() & (_u["_amt_u"] != 0)]
+    _compras_universo = [
+        {
+            "id": f"{r['_fecha']:%Y-%m-%d %H:%M:%S}|{r['_amt_u']}|{_norm_merchant(r['Merchant'])}",
+            "fecha": r["_fecha"],
+            "merch": _norm_merchant(r["Merchant"]),
+            "usd": round(abs(float(r["_amt_u"])), 2),
+            "trm_fecha": r["_fecha"].strftime("%Y-%m-%d"),
+        }
+        for _, r in _u.iterrows()
+    ]
+
     if fecha_desde is not None:
         df = df[df["_fecha"] >= pd.Timestamp(fecha_desde)]
     df["_amount"] = df["Amount"].map(_rakuten_parse_amount)
@@ -737,10 +961,38 @@ def procesar_rakuten(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendient
     if df.empty:
         return {}
 
+    # 🔁 REFUND -> TRM DE SU COMPRA ORIGINAL (neteo exacto en COP). Solo toca los Ingreso.
+    _reembolsos = [
+        {"id": r["_orden"], "fecha": r["_fecha"], "merch": _norm_merchant_refund_rk(r["Merchant"]),
+         "usd": round(float(r["_usd"]), 2)}
+        for _, r in df[df["_tipo"] == "Ingreso"].iterrows()
+    ]
+    _trm_ok, _trm_sin_match, _trm_ambiguos = _resolver_trm_reembolsos(
+        _reembolsos, _compras_universo,
+        _indice_compras_historico(hist_tarjetas, "rakuten_", "Tarjeta Rakuten"),
+    )
+    if _trm_sin_match:
+        _cobradas_warn(
+            "⚠️ Rakuten: {} REFUND sin compra original identificable (ni en el CSV ni en el "
+            "histórico) — se usa la TRM de su propio día, como antes. REVISAR a mano: {}"
+            .format(len(_trm_sin_match),
+                    "; ".join(f"{x['fecha']:%Y-%m-%d} USD {x['usd']:.2f} {x['merch'][:40]}"
+                              for x in _trm_sin_match[:10]))
+        )
+    if _trm_ambiguos:
+        _cobradas_info(
+            f"ℹ️ Rakuten: {len(_trm_ambiguos)} REFUND tenían varias compras candidatas con TRM "
+            f"distintas; se tomó la compra MÁS RECIENTE anterior al reembolso."
+        )
+
     # TRM por día (+125), misma función que Amex. Recolecta faltantes antes de decidir (sin default).
+    # Incluye los días de las COMPRAS ORIGINALES de los REFUND emparejados.
     trm_cache: dict = {}
     faltantes = set()
-    for f_iso in df["_fecha_iso"].unique():
+    _dias = set(df["_fecha_iso"].unique()) | {
+        f for f, origen, _ in _trm_ok.values() if origen == "extracto"
+    }
+    for f_iso in sorted(_dias):
         if _amex_trm_dia(f_iso, trm_cache) is None:
             faltantes.add(f_iso)
     if faltantes:
@@ -755,8 +1007,14 @@ def procesar_rakuten(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendient
     for _, r in df.iterrows():
         tipo, f_iso = r["_tipo"], r["_fecha_iso"]
         trm = trm_cache[f_iso]
-        monto = round(float(r["_usd"]) * trm)  # COP, POSITIVO
         etq = "gasto" if tipo == "Egreso" else "reembolso"
+        # REFUND emparejado: TRM de la COMPRA original -> neto exacto 0 en COP.
+        _m = _trm_ok.get(r["_orden"]) if tipo == "Ingreso" else None
+        if _m:
+            _f_compra, _origen, _trm_hist = _m
+            trm = _trm_hist if _origen == "historico" else trm_cache[_f_compra]
+            etq = f"reembolso (TRM compra {_f_compra})"
+        monto = round(float(r["_usd"]) * trm)  # COP, POSITIVO
         merch = " ".join(str(r["Merchant"]).split())
         filas.append({
             "Fecha": f_iso,
@@ -1947,7 +2205,8 @@ def main():
             try:
                 amex_may = procesar_amex(df_amex, fecha_desde=AMEX_FECHA_DESDE,
                                          cobrados=tarjetas_cobradas,
-                                         pendientes=tarjetas_pendientes)
+                                         pendientes=tarjetas_pendientes,
+                                         hist_tarjetas=_hist_tarjetas_para_trm())
             except ValueError as e:
                 st.error(f"⛔ {e}")
                 st.stop()  # DETENER: falta TRM o columnas (sin default, como se acordó)
@@ -2018,7 +2277,8 @@ def main():
             try:
                 rakuten_may = procesar_rakuten(df_rakuten, fecha_desde=RAKUTEN_FECHA_DESDE,
                                                cobrados=tarjetas_cobradas_rk,
-                                               pendientes=tarjetas_pendientes_rk)
+                                               pendientes=tarjetas_pendientes_rk,
+                                               hist_tarjetas=_hist_tarjetas_para_trm())
             except ValueError as e:
                 st.error(f"⛔ {e}")
                 st.stop()  # DETENER: falta TRM o columnas (sin default, como Amex)
