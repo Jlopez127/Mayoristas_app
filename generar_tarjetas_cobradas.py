@@ -52,6 +52,7 @@ mayoristas_streamlit_app.py (clave "Date|Amount|Merchant|seq" sobre las filas
 TRANSACTION/REFUND con monto != 0; sha1[:12]). Si aquello cambia, esto debe cambiar igual.
 El dry-run cruza ambas salidas para verificar que coinciden.
 """
+import datetime
 import hashlib
 import sys
 import pandas as pd
@@ -63,10 +64,12 @@ DEFAULTS = [
     "/Users/julianlopez/Library/CloudStorage/OneDrive-Personal/Encargomio/Dash_mayoristas/activity (3).xlsx,"
     "/Users/julianlopez/Library/CloudStorage/OneDrive-Personal/Encargomio/Dash_mayoristas/activity (4).xlsx",
     "/Users/julianlopez/Library/CloudStorage/OneDrive-Personal/Encargomio/Dash_mayoristas/Rakuten_Activity_All.csv",
+    # CSV Robinhood (export completo).
+    "/Users/julianlopez/Downloads/53fa9510-b899-438c-9c3c-7ea05980d12a.csv",
     "tarjetas_cobradas.xlsx",
 ]
-COBRADOS_XLSX, EXTRACTO_AMEX, CSV_RAKUTEN, SALIDA = (
-    sys.argv[1:5] if len(sys.argv) >= 5 else DEFAULTS
+COBRADOS_XLSX, EXTRACTO_AMEX, CSV_RAKUTEN, CSV_ROBINHOOD, SALIDA = (
+    sys.argv[1:6] if len(sys.argv) >= 6 else DEFAULTS
 )
 FUENTE = "Excel cobrados 20260710"
 EXTRACTO_INICIO = pd.Timestamp("2026-01-01")   # inicio del extracto Amex combinado disponible
@@ -276,6 +279,131 @@ sin_cobrar = tx[ventana & ~tx.index.isin(consumidos)]
 pre_ventana = tx[tx["_fecha"] < rk["dt"].min()]
 refunds = d[d["_type"] == "REFUND"]
 
+# ═════ ROBINHOOD ═════ (hoja 'RobinhoodCorreal' — pegado crudo del CSV; trae Correal + Maria)
+# El Orden REPLICA exactamente procesar_robinhood: robinhood_<sha1-12 de Date|Time|Amount|Merchant|seq>
+# con seq sobre TODO el set 1444 (Correal + Maria) en orden de archivo, ANTES de filtrar Status.
+# Match CARDHOLDER-AWARE (la hoja mezcla 181 Correal + 13 Maria): cada cobro contra su fila CSV
+# Posted Purchase/Refund del MISMO cardholder por (fecha + |amount| + merchant), count-aware 1:1,
+# fallback ±3 días. Clave RELAJADA (sin la hora): el Excel guarda la hora del AUTH y el CSV la del
+# ASIENTO, que difiere -> el minuto exacto no matchea (verificado: la hora estricta perdía 21
+# compras ya cobradas). Los que no matcheen -> pendientes_rematch.
+ROBINHOOD_CARDMAP = {"Juan Pablo Correal Perez": "1444", "Maria Moises": "1444"}
+# 2 in-window ya-cobrados que asentaron con monto DISTINTO al auth cobrado por el backoffice
+# (la lista por monto exacto no los atrapa): se excluyen a mano. (cardholder, fecha, |amount|, merchant)
+ROBINHOOD_MANUAL = [
+    ("Juan Pablo Correal Perez", "2026-05-30", 172.29, "Uniqlo"),   # auth $172.78 -> asiento $172.29
+    ("Juan Pablo Correal Perez", "2026-06-15", 622.98, "Hilton"),   # auth $772.98 -> asiento $622.98+$150
+]
+
+
+def _norm_merch_rb(s) -> str:
+    return " ".join(str(s).split()).upper()
+
+
+def _frac_to_time(v):
+    """Fracción Excel (0..1) o datetime.time -> datetime.time (reconstrucción determinista)."""
+    if isinstance(v, datetime.time):
+        return v
+    try:
+        t = round(float(v) * 1440)
+        return datetime.time((t // 60) % 24, t % 60)
+    except Exception:
+        return None
+
+
+# CSV Robinhood -> filas 1444 con Orden (idéntico a procesar_robinhood)
+rob = pd.read_csv(CSV_ROBINHOOD)
+rob["_cas"] = rob["Cardholder"].astype(str).str.strip().map(ROBINHOOD_CARDMAP)
+rob = rob[rob["_cas"].notna()].copy().reset_index(drop=True)
+_rk = (rob["Date"].astype(str) + "|" + rob["Time"].astype(str) + "|" +
+       rob["Amount"].astype(str) + "|" + rob["Merchant"].astype(str))
+_rseq = _rk.groupby(_rk).cumcount().astype(str)
+rob["_orden"] = "robinhood_" + (_rk + "|" + _rseq).map(
+    lambda s: hashlib.sha1(s.encode("utf-8")).hexdigest()[:12])
+assert rob["_orden"].is_unique, "❌ Orden Robinhood duplicado en el CSV — revisar esquema"
+# candidatas generables: Posted Purchase/Refund
+robg = rob[(rob["Status"].astype(str).str.strip() == "Posted") &
+           (rob["Type"].astype(str).str.strip().isin(["Purchase", "Refund"]))].copy()
+robg["_dt"] = pd.to_datetime(robg["Date"], errors="coerce")
+robg["_amt"] = pd.to_numeric(robg["Amount"], errors="coerce").abs().round(2)
+robg["_m"] = robg["Merchant"].map(_norm_merch_rb)
+robg["_ch"] = robg["Cardholder"].astype(str).str.strip()
+
+# hoja RobinhoodCorreal (pegado crudo): date/time(fracción)/cardholder/amount/merchant/desc/.../
+# points/balance/status/type/merchant/desc
+rc = pd.read_excel(COBRADOS_XLSX, sheet_name="RobinhoodCorreal", header=None)
+rc = rc[rc[0].map(lambda v: not isinstance(v, str))].copy()   # fuera fila 'Total'/encabezado
+rc["amt"] = pd.to_numeric(rc[3], errors="coerce")
+n_rc_inval = int(rc["amt"].isna().sum())
+rc = rc[rc["amt"].notna()].copy()
+rc["dt"] = pd.to_datetime(rc[0]); rc["dtk"] = rc["dt"].dt.strftime("%Y-%m-%d")
+rc["aamt"] = rc["amt"].abs().round(2); rc["m"] = rc[4].map(_norm_merch_rb)
+rc["ch"] = rc[2].astype(str).str.strip()
+
+# match cardholder-aware por (cardholder, fecha, |amount|, merchant), count-aware 1:1
+por_key = {}
+for i, x in robg.iterrows():
+    por_key.setdefault((x["_ch"], x["_dt"].strftime("%Y-%m-%d"), x["_amt"], x["_m"]), []).append(i)
+rob_usados, rob_fb = set(), 0
+n_rob_ok = 0
+_pend_rob = []
+for _, x in rc.iterrows():
+    k = (x["ch"], x["dtk"], x["aamt"], x["m"])
+    libres = [i for i in por_key.get(k, []) if i not in rob_usados]
+    if libres:
+        rob_usados.add(libres[0])
+        cobradas.append({"Orden": robg.loc[libres[0], "_orden"], "tarjeta": "robinhood",
+                         "casillero": "1444", "fecha_compra": x["dtk"],
+                         "monto_usd": round(float(x["amt"]), 2), "nota": "match exacto",
+                         "fuente": FUENTE})
+        n_rob_ok += 1
+    else:
+        _pend_rob.append(x)
+# fallback ±3 días (mismo cardholder + merchant + |amount|)
+_still = []
+for x in _pend_rob:
+    cand = robg[(robg["_ch"] == x["ch"]) & (robg["_amt"] == x["aamt"]) & (robg["_m"] == x["m"]) &
+                (robg["_dt"].between(x["dt"] - pd.Timedelta(days=3), x["dt"] + pd.Timedelta(days=3)))]
+    cand = [i for i in cand.index if i not in rob_usados]
+    if cand:
+        rob_usados.add(cand[0]); rob_fb += 1; n_rob_ok += 1
+        cobradas.append({"Orden": robg.loc[cand[0], "_orden"], "tarjeta": "robinhood",
+                         "casillero": "1444", "fecha_compra": x["dtk"],
+                         "monto_usd": round(float(x["amt"]), 2),
+                         "nota": f"match fallback ±3d (CSV {robg.loc[cand[0],'_dt'].strftime('%Y-%m-%d')})",
+                         "fuente": FUENTE})
+    else:
+        _still.append(x)
+# no matcheados -> pendientes (cobros sin fila firme en el CSV: auth con monto distinto / ausentes)
+n_rob_pend = 0
+for x in _still:
+    n_rob_pend += 1
+    pendientes.append({"tarjeta": "robinhood", "casillero": "1444", "hoja_origen": "RobinhoodCorreal",
+                       "fecha_compra": x["dtk"], "monto_usd": abs(float(x["amt"])),
+                       "card_member": x["ch"], "descripcion_excel": str(x[4]).strip(),
+                       "motivo": "cobro sin fila firme en el CSV (auth con monto distinto / ausente) — "
+                                 "rematch con CSV más nuevo"})
+# 2 in-window ya-cobrados con monto asiento != auth: excluir a mano (Orden desde el CSV)
+n_rob_manual = 0
+for ch, fkm, amt, merch in ROBINHOOD_MANUAL:
+    hit = robg[(robg["_ch"] == ch) & (robg["_dt"].dt.strftime("%Y-%m-%d") == fkm) &
+               (robg["_amt"] == round(amt, 2)) & (robg["_m"] == _norm_merch_rb(merch))]
+    if not len(hit):
+        raise SystemExit(f"❌ ROBINHOOD_MANUAL no encontrado en el CSV: {ch} {fkm} ${amt} {merch}")
+    o = robg.loc[hit.index[0], "_orden"]
+    if o in rob_usados:
+        continue  # ya estaba en la lista por match
+    rob_usados.add(o); n_rob_manual += 1
+    cobradas.append({"Orden": o, "tarjeta": "robinhood", "casillero": "1444", "fecha_compra": fkm,
+                     "monto_usd": round(amt, 2),
+                     "nota": "EXCLUSION MANUAL: asentó con monto distinto al auth cobrado por backoffice",
+                     "fuente": FUENTE})
+# informativo Robinhood (por Orden, no por índice: rob_usados mezcla índices de match y Orden
+# de la exclusión manual). Las que ENTRARÁN = Posted Purchase/Refund ≥ corte cuyo Orden NO está
+# en la lista de cobradas Robinhood.
+_rob_en_lista = {c["Orden"] for c in cobradas if c["tarjeta"] == "robinhood"}
+rob_sin_cobrar = robg[(robg["_dt"] >= pd.Timestamp("2026-04-14")) & (~robg["_orden"].isin(_rob_en_lista))]
+
 # ═════ Salida ═════
 df_cob = pd.DataFrame(cobradas, columns=["Orden", "tarjeta", "casillero", "fecha_compra",
                                          "monto_usd", "nota", "fuente"])
@@ -291,7 +419,8 @@ with pd.ExcelWriter(SALIDA, engine="openpyxl") as w:
 
 print(f"═════ tarjetas_cobradas generado: {SALIDA} ═════")
 print(f"TOTAL lista de exclusión: {len(df_cob)} Orden "
-      f"({(df_cob.tarjeta == 'amex').sum()} amex + {(df_cob.tarjeta == 'rakuten').sum()} rakuten)")
+      f"({(df_cob.tarjeta == 'amex').sum()} amex + {(df_cob.tarjeta == 'rakuten').sum()} rakuten + "
+      f"{(df_cob.tarjeta == 'robinhood').sum()} robinhood)")
 for hoja, s in resumen_amex.items():
     print(f"  {hoja} (cas {s['cas']}): {s['ok']} Orden (${s['usd']:,.2f} USD) | "
           f"pendientes 2025: {s['pend_2025']} | pendientes pre-asiento: {s['pend_asiento']} | "
@@ -313,4 +442,11 @@ print(f"  ⚠️ PENDIENTE-DECISIÓN: {len(pre_ventana)} TRANSACTION del CSV ant
       f"lista; si ya se cobraron por otra vía, agregarlas antes de activar Rakuten.")
 print(f"  Nota: {len(refunds)} REFUND del CSV no están en el Excel de cobrados -> entrarán como "
       f"Ingreso al activar (verificar que no se hayan devuelto ya por otra vía).")
+rb_cob = df_cob[df_cob.tarjeta == "robinhood"]
+print(f"  RobinhoodCorreal (cas 1444): {len(rb_cob)} Orden (${rb_cob.monto_usd.abs().sum():,.2f} USD) "
+      f"[match exacto: {n_rob_ok - rob_fb} | fallback ±3d: {rob_fb} | exclusión manual in-window: "
+      f"{n_rob_manual}] | pendientes: {n_rob_pend} | filas inválidas hoja: {n_rc_inval}")
+print(f"  Robinhood SIN cobrar (≥14-abr, entrarán al cargue): {len(rob_sin_cobrar)} "
+      f"(${rob_sin_cobrar['_amt'].sum():,.2f}) | in-window ≤22-jun tras exclusión: "
+      f"{int((rob_sin_cobrar['_dt'] <= pd.Timestamp('2026-06-22')).sum())} (esperado 0)")
 print(f"Pendientes de rematch totales: {len(df_pen)} | Revision: {len(df_rev)}")

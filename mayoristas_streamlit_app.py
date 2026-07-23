@@ -1144,13 +1144,295 @@ def procesar_rakuten(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendient
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Cargue "Tarjeta Robinhood" (módulo PARALELO a Rakuten, lógica propia; NO reusa procesar_*).
+# SOLO 2 Cardholders -> casillero 1444: "Juan Pablo Correal Perez" y "Maria Moises" (el resto se
+# IGNORA). Fuente: CSV Robinhood (10 cols: Date, Time, Cardholder, Amount, Points, Balance,
+# Status, Type, Merchant, Description).
+#   - FILTRO por Status (NO por signo): solo "Posted" entra; "Pending"/"Declined"/otros se
+#     IGNORAN (pendiente aún no firme; declinada nunca se cobró). Status desconocido -> ignorar
+#     + st.warning.
+#   - FILTRO por Type: Purchase -> Egreso ; Refund -> Ingreso (Monto = abs). Payment/Fee/Other
+#     se IGNORAN. Type desconocido -> ignorar + st.warning.
+#   - Orden 1-a-1 = "robinhood_<sha1-12 de 'Date|Time|Amount|Merchant|seq'>" con los valores
+#     CRUDOS del CSV + seq = nº de ocurrencia (0,1,...) de esa clave exacta. Duplicados exactos
+#     son compras reales distintas (verificado Kocespay.Korea x2 el 2026-07-23 1:19 AM $1.15 ->
+#     2 Orden). El Orden se calcula sobre TODO el set 1444 (ANTES de filtrar por Status), para
+#     que el seq sea estable aunque una fila pase de Pending a Posted entre descargas.
+#     FAIL-LOUD ante colisión de hash (dos claves distintas -> mismo ID).
+#   - USD -> COP con la MISMA TRM que Amex (_amex_trm_dia: datos.gov.co, +125). *** SIN respaldo:
+#     si falta la TRM de un día con movimiento, LEVANTA ValueError. ***
+#   - Reembolsos (Refund): usan la TRM de su compra original (_resolver_trm_reembolsos, 3 pasadas
+#     ya implementadas) para netear exacto. El merchant del Refund viene como "Refund: <merchant>"
+#     -> se normaliza (_norm_merchant_refund_robin) para que coincida con la compra.
+#   - Motivo = "Tarjeta Robinhood" (tag EXACTO que captura el incentivo combinado de 1444).
+#   - 🚩 BLINDAJE VENTANA MANUAL (patrón auth-vs-asiento): toda fila ENTRANTE con FECHA <=
+#     ROBINHOOD_VENTANA_MANUAL_FIN (2026-06-22, fin de los bloques manuales del backoffice) se
+#     marca para REVISIÓN con st.warning y NO se asume aprobada. El Excel de cobrados guarda los
+#     montos de AUTH y el CSV los de ASIENTO; cuando difieren, la lista por monto EXACTO no atrapa
+#     el ya-cobrado (Uniqlo 172.78 auth -> 172.29 asiento; Hilton 772.98 -> 622.98+150). Por eso
+#     los 2 in-window ya identificados se excluyen a mano en la lista (robinhood_2401ad154e35 /
+#     robinhood_618c4f5efdbf) y cualquier futuro in-window queda visible para aprobación manual.
+#     Fuera de la ventana, flujo normal.
+# ──────────────────────────────────────────────────────────────────────────────
+ROBINHOOD_CASILLERO = "1444"
+ROBINHOOD_USUARIO = "Maria Moises"
+# Cardholder EXACTO -> casillero (el resto se ignora). Santiago/Carlos Largo, Largo Kelly, etc. NO.
+ROBINHOOD_CARDMAP = {"Juan Pablo Correal Perez": "1444", "Maria Moises": "1444"}
+ROBINHOOD_TIPO_MAP = {"PURCHASE": "Egreso", "REFUND": "Ingreso"}  # el resto se ignora
+ROBINHOOD_TIPOS_IGNORAR = {"PAYMENT", "FEE", "OTHER"}
+ROBINHOOD_STATUS_OK = "POSTED"
+ROBINHOOD_STATUS_IGNORAR = {"PENDING", "DECLINED", "OTHER"}
+ROBINHOOD_COLS = ["Date", "Time", "Cardholder", "Amount", "Points", "Balance",
+                  "Status", "Type", "Merchant", "Description"]
+
+# 🚦 FECHA DE CORTE del cargue Robinhood — MISMAS 3 reglas que Amex/Rakuten (la LISTA manda; el
+#   corte es solo límite de sanidad). 2026-04-14 = inicio de la ventana de cobrados del backoffice
+#   (primer bloque "Compra Robinhood del 14 al 26 Abril"). Un pendiente pre-corte que asiente
+#   después SÍ entra si no está en la lista (regla de negocio: NUNCA dejar de cobrar). None ->
+#   INACTIVO (kill switch).
+ROBINHOOD_FECHA_DESDE = "2026-04-14"
+# Fin de la ventana de bloques manuales del backoffice: dentro de ella, las entrantes se marcan
+# para revisión (blindaje auth-vs-asiento). Fuera, flujo normal.
+ROBINHOOD_VENTANA_MANUAL_FIN = "2026-06-22"
+
+
+def _norm_merchant_refund_robin(s) -> str:
+    """Merchant de un Refund Robinhood: viene como 'Refund: <merchant>' -> se quita el prefijo
+    para que coincida con el merchant de la compra original. Verificado en el CSV real:
+    'Refund: Hilton' <-> compra 'Hilton'."""
+    v = _norm_merchant(s)
+    for p in ("REFUND: ", "REFUND FROM "):
+        if v.startswith(p):
+            return v[len(p):].strip()
+    return v
+
+
+def procesar_robinhood(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None,
+                       hist_tarjetas=None) -> dict[str, pd.DataFrame]:
+    """Transforma el CSV Robinhood en {robinhood_1444: DF} con UNA fila COP por transacción
+    (1-a-1, Orden = robinhood_<sha1-12>; ver bloque de arriba). Filtra por Status ('Posted') y
+    Type (Purchase/Refund). Levanta ValueError si falta la TRM de cualquier día con movimiento.
+    'fecha_desde' descarta transacciones anteriores; None -> no procesa. 'cobrados' (OBLIGATORIO
+    si fecha_desde activo) = set de Orden ya cobrados: se EXCLUYEN. 'pendientes' (opcional) =
+    'pendientes_rematch': cobros sin fila firme en el CSV; los que matcheen (fecha+monto+merchant)
+    se EXCLUYEN. 'hist_tarjetas' = filas de tarjeta del histórico para la TRM de reembolsos."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    faltan = [c for c in ROBINHOOD_COLS if c not in df.columns]
+    if faltan:
+        raise ValueError(f"El CSV Robinhood no tiene las columnas esperadas: {', '.join(faltan)}.")
+
+    # INACTIVO sin fecha de corte: no se procesa nada (columnas validadas ANTES).
+    if fecha_desde is None:
+        return {}
+    # 🛡️ LISTA DE EXCLUSIÓN obligatoria: procesar sin lista recobraría lo ya cobrado.
+    if cobrados is None:
+        raise ValueError(
+            "Falta la lista de exclusión 'tarjetas cobradas' (cobrados=None). "
+            "No se procesa nada: sin la lista se recobrarían transacciones ya cobradas."
+        )
+
+    # Cardholder -> casillero (ignora los que no están en el mapeo)
+    df["_cas"] = df["Cardholder"].astype(str).str.strip().map(ROBINHOOD_CARDMAP)
+    df = df[df["_cas"].notna()].copy()
+    if df.empty:
+        return {}
+
+    # 1-a-1: Orden determinista sobre TODO el set 1444 (antes de filtrar Status) -> seq estable.
+    _clave = (df["Date"].astype(str) + "|" + df["Time"].astype(str) + "|" +
+              df["Amount"].astype(str) + "|" + df["Merchant"].astype(str))
+    _seq = _clave.groupby(_clave).cumcount().astype(str)
+    df["_orden"] = "robinhood_" + (_clave + "|" + _seq).map(
+        lambda s: hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
+    )
+    if df["_orden"].duplicated().any():
+        raise ValueError(
+            "Colisión de hash en el Orden Robinhood (dos transacciones distintas generaron el "
+            "mismo ID). No se genera ningún movimiento; reporta este archivo."
+        )
+
+    # Status: solo Posted. Desconocidos (ni Posted ni Pending/Declined/Other) -> avisar + ignorar.
+    df["_st"] = df["Status"].astype(str).str.strip().str.upper()
+    _st_conoc = {ROBINHOOD_STATUS_OK} | ROBINHOOD_STATUS_IGNORAR
+    _st_desc = sorted(set(df["_st"].unique()) - _st_conoc)
+    if _st_desc:
+        _rakuten_warn("⚠️ Robinhood: Status NO reconocidos (ignorados): "
+                      f"{', '.join(_st_desc)}. Revisa si Robinhood agregó un estado nuevo.")
+    df = df[df["_st"] == ROBINHOOD_STATUS_OK].copy()
+
+    # Type: Purchase/Refund. Desconocidos -> avisar + ignorar (no cargar a ciegas).
+    df["_type"] = df["Type"].astype(str).str.strip().str.upper()
+    _ty_conoc = set(ROBINHOOD_TIPO_MAP) | ROBINHOOD_TIPOS_IGNORAR
+    _ty_desc = sorted(set(df["_type"].unique()) - _ty_conoc)
+    if _ty_desc:
+        _rakuten_warn("⚠️ Robinhood: Type NO reconocidos (ignorados): "
+                      f"{', '.join(_ty_desc)}. Revisa si Robinhood agregó un tipo nuevo.")
+    df["_tipo"] = df["_type"].map(ROBINHOOD_TIPO_MAP)
+    df = df[df["_tipo"].notna()].copy()
+
+    # Fecha (Robinhood viene YYYY-MM-DD) y monto USD absoluto (Amount == 0 se descarta)
+    df["_fecha"] = pd.to_datetime(df["Date"], format="%Y-%m-%d", errors="coerce")
+    df = df[df["_fecha"].notna()].copy()
+    df["_amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+    df = df[df["_amount"].notna() & (df["_amount"] != 0)].copy()
+
+    # 🔁 UNIVERSO DE COMPRAS (Purchase) para emparejar Refund: se captura ANTES del corte y de la
+    # lista (la compra revertida puede ser vieja/ya cobrada). Solo lectura (presta TRM/fecha).
+    _u = df[df["_tipo"] == "Egreso"].copy()
+    _compras_universo = [
+        {
+            "id": r["_orden"],
+            "fecha": r["_fecha"],
+            "merch": _norm_merchant(r["Merchant"]),
+            "usd": round(abs(float(r["_amount"])), 2),
+            "cm": str(r["Cardholder"]).strip(),   # segmentación por Cardholder (Correal / Maria)
+            "cas": ROBINHOOD_CASILLERO,
+            "trm_fecha": r["_fecha"].strftime("%Y-%m-%d"),
+        }
+        for _, r in _u.iterrows()
+    ]
+
+    if fecha_desde is not None:
+        df = df[df["_fecha"] >= pd.Timestamp(fecha_desde)]
+    df["_usd"] = df["_amount"].abs()
+    df["_fecha_iso"] = df["_fecha"].dt.strftime("%Y-%m-%d")
+    if df.empty:
+        return {}
+
+    # 🛡️ Anti-doble-cobro (defensa PRINCIPAL): excluir Orden ya en la lista de cobradas.
+    _ya = df["_orden"].isin(cobrados)
+    if _ya.any():
+        _cobradas_info(f"🛡️ Robinhood: {int(_ya.sum())} transacciones ya cobradas "
+                       f"(lista de exclusión) — excluidas del cargue.")
+        df = df[~_ya].copy()
+    if df.empty:
+        return {}
+
+    # 🛡️ ESCUDO DE PENDIENTES: cobros reales sin fila firme en el CSV (auth). Si una transacción
+    # matchea un pendiente por (fecha compra, monto USD, merchant) se excluye. Count-aware,
+    # desempate por Orden ascendente (determinista).
+    if pendientes is not None and len(pendientes) and "tarjeta" in pendientes.columns:
+        _p = pendientes[pendientes["tarjeta"].astype(str).str.strip().str.lower() == "robinhood"]
+        if len(_p):
+            _pk: dict = {}
+            for _, _rp in _p.iterrows():
+                _k = (str(_rp["fecha_compra"]).strip()[:10],
+                      round(abs(float(_rp["monto_usd"])), 2),
+                      _norm_merchant(_rp["descripcion_excel"] if "descripcion_excel" in _p.columns else ""))
+                _pk[_k] = _pk.get(_k, 0) + 1
+            _mn = df["Merchant"].map(_norm_merchant)
+            _a2 = df["_usd"].round(2)
+            _drop = []
+            for _k, _n in _pk.items():
+                _m = df[(df["_fecha_iso"] == _k[0]) & (_a2 == _k[1]) & (_mn == _k[2])]
+                if len(_m):
+                    _drop += list(_m.sort_values("_orden").index[:_n])
+            if _drop:
+                _cobradas_info(f"🛡️ Robinhood: {len(_drop)} transacciones matchean cobros "
+                               f"PENDIENTES de rematch — excluidas del cargue.")
+                df = df.drop(index=_drop)
+    if df.empty:
+        return {}
+
+    # 🔁 Refund -> TRM DE SU COMPRA ORIGINAL (neteo exacto). Solo toca los Ingreso.
+    _reembolsos = [
+        {"id": r["_orden"], "fecha": r["_fecha"], "merch": _norm_merchant_refund_robin(r["Merchant"]),
+         "usd": round(float(r["_usd"]), 2),
+         "cm": str(r["Cardholder"]).strip(), "cas": ROBINHOOD_CASILLERO}
+        for _, r in df[df["_tipo"] == "Ingreso"].iterrows()
+    ]
+    _trm_ok, _trm_sin_match, _trm_ambiguos = _resolver_trm_reembolsos(
+        _reembolsos, _compras_universo,
+        _indice_compras_historico(hist_tarjetas, "robinhood_", "Tarjeta Robinhood"),
+    )
+    if _trm_sin_match:
+        _cobradas_warn(
+            "⚠️ Robinhood: {} Refund sin compra original identificable (ni total ni parcial) "
+            "— se usa la TRM de su propio día, como antes. REVISAR a mano: {}"
+            .format(len(_trm_sin_match),
+                    "; ".join(f"{x['fecha']:%Y-%m-%d} USD {x['usd']:.2f} {x['merch'][:36]} "
+                              f"[{x['motivo']}]" for x in _trm_sin_match[:10]))
+        )
+    if _trm_ambiguos:
+        _cobradas_info(
+            f"ℹ️ Robinhood: {len(_trm_ambiguos)} Refund tenían varias compras candidatas con TRM "
+            f"distintas; se tomó la compra MÁS RECIENTE anterior al reembolso."
+        )
+
+    # TRM por día (+125). Incluye los días de las COMPRAS ORIGINALES de los Refund emparejados.
+    trm_cache: dict = {}
+    faltantes = set()
+    _dias = set(df["_fecha_iso"].unique()) | {
+        f for f, origen, _, _p in _trm_ok.values() if origen == "extracto"
+    }
+    for f_iso in sorted(_dias):
+        if _amex_trm_dia(f_iso, trm_cache) is None:
+            faltantes.add(f_iso)
+    if faltantes:
+        dias = ", ".join(sorted(faltantes))
+        raise ValueError(
+            f"Sin TRM (datos.gov.co) para los días con movimiento Robinhood: {dias}. "
+            f"No se genera ningún movimiento (no hay TRM de respaldo)."
+        )
+
+    cas = ROBINHOOD_CASILLERO
+    filas = []
+    for _, r in df.iterrows():
+        tipo, f_iso = r["_tipo"], r["_fecha_iso"]
+        trm = trm_cache[f_iso]
+        etq = "gasto" if tipo == "Egreso" else "reembolso"
+        _m = _trm_ok.get(r["_orden"]) if tipo == "Ingreso" else None
+        if _m:
+            _f_compra, _origen, _trm_hist, _parcial = _m
+            trm = _trm_hist if _origen == "historico" else trm_cache[_f_compra]
+            etq = f"reembolso{' parcial' if _parcial else ''} (TRM compra {_f_compra})"
+        monto = round(float(r["_usd"]) * trm)  # COP, POSITIVO
+        merch = " ".join(str(r["Merchant"]).split())
+        filas.append({
+            "Fecha": f_iso,
+            "Tipo": tipo,
+            "Monto": monto,
+            "Orden": r["_orden"],
+            "Motivo": "Tarjeta Robinhood",
+            "TRM": round(trm, 2),
+            "Usuario": ROBINHOOD_USUARIO,
+            "Casillero": cas,
+            "Estado de Orden": "",
+            "Nombre del producto": f"Tarjeta Robinhood - {etq} - {merch}",
+        })
+
+    out = pd.DataFrame(filas)
+    if out.empty:
+        return {}
+
+    # 🚩 BLINDAJE VENTANA MANUAL: entrantes con FECHA <= 22-jun -> marcar para REVISIÓN (no
+    # asumir aprobadas). Los 2 in-window ya-cobrados están excluidos por la lista; esto atrapa
+    # cualquier NUEVO in-window por el patrón auth-vs-asiento.
+    _fin = pd.Timestamp(ROBINHOOD_VENTANA_MANUAL_FIN)
+    _rev = out[pd.to_datetime(out["Fecha"], errors="coerce") <= _fin]
+    if len(_rev):
+        _det = "; ".join(
+            f"{x['Fecha']} {x['Tipo']} USD {float(x['Monto'])/float(x['TRM']):.2f} "
+            f"{x['Nombre del producto'].split(' - ')[-1][:28]}" for _, x in _rev.head(15).iterrows()
+        )
+        _cobradas_warn(
+            f"🚩 Robinhood: {len(_rev)} transacción(es) ENTRANTE(s) con fecha ≤ "
+            f"{ROBINHOOD_VENTANA_MANUAL_FIN} (ventana de bloques manuales del backoffice) — "
+            f"REVISAR/APROBAR antes de cargar (posible ya-cobrado auth-vs-asiento): {_det}"
+        )
+
+    return {f"robinhood_{cas}": out.reset_index(drop=True)}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # INCENTIVO AMEX MENSUAL (cashback). Por cada mes CERRADO, agrega un Ingreso al casillero
 # = INCENTIVO_COP_POR_USD * USD_neto, donde USD_neto = Σ(USD egresos Amex) − Σ(USD ingresos Amex)
 # y USD_fila = Monto_COP / TRM_fila (la TRM del histórico YA incluye el spread +125, así que
 # COP/TRM recupera el USD original — no se ajusta spread).
 #   - Solo casilleros Amex (AMEX_USUARIOS: 11591, 1444, 13608).
-#   - Identifica las filas de tarjeta por Motivo EXACTO ∈ {"Tarjeta Amex", "Tarjeta Rakuten"} y
-#     SUMA ambas al mismo incentivo mensual de 1444 (un solo incentivoamex_1444_<mes>), EXCLUYENDO
+#   - Identifica las filas de tarjeta por Motivo EXACTO ∈ {"Tarjeta Amex", "Tarjeta Rakuten",
+#     "Tarjeta Robinhood"} y SUMA todas al mismo incentivo mensual de 1444 (un solo
+#     incentivoamex_1444_<mes>), EXCLUYENDO
 #     las propias filas de incentivo. (Motivo exacto = más robusto que buscar el texto "amex".)
 #   - Idempotente: Orden único incentivoamex_<cas>_<YYYY-MM> + chequeo de existencia (no recrea
 #     ni recalcula un mes ya creado; queda congelado).
@@ -1206,7 +1488,7 @@ def agregar_incentivo_amex(combinado, cas, usuario, fecha_carga):
     # Más robusto que el texto "amex" suelto (evita falsos positivos si un merchant se llamara
     # "Rakuten X"/"Amex Y"). Nota: las filas backoffice legacy "Compra Amex" (Motivo vacío) NO
     # entran — son pre-INCENTIVO_MES_INICIO, fuera de la ventana del incentivo.
-    es_tarjeta = motivo_s.str.strip().isin(["Tarjeta Amex", "Tarjeta Rakuten"])
+    es_tarjeta = motivo_s.str.strip().isin(["Tarjeta Amex", "Tarjeta Rakuten", "Tarjeta Robinhood"])
     es_incentivo = orden_s.str.startswith("incentivoamex_") | motivo_s.str.strip().eq("Incentivo Amex")
     tarjeta_mask = es_tarjeta & ~es_incentivo & tipo_u.isin(["EGRESO", "INGRESO"])
 
@@ -2401,6 +2683,74 @@ def main():
         st.info("📂 Aún no subes el CSV de Tarjeta Rakuten")
 
 
+    # 3.4) Tarjeta Robinhood (cargue propio, SOLO Correal + Maria Moises / 1444)
+    st.markdown("---")
+    st.header("3.4) Tarjeta Robinhood")
+
+    robinhood_file = st.file_uploader(
+        "Sube el CSV de actividad Robinhood (columnas: Date, Time, Cardholder, Amount, Points, "
+        "Balance, Status, Type, Merchant, Description)",
+        type=["csv"],
+        key="robinhood_uploader"
+    )
+
+    robinhood_may = {}  # dict global para usar después en conciliaciones (solo 1444)
+
+    # Estado del corte de fecha (MUY visible), igual que Amex/Rakuten
+    if ROBINHOOD_FECHA_DESDE:
+        st.success(f"✅ Corte Robinhood ACTIVO: solo transacciones con fecha ≥ {ROBINHOOD_FECHA_DESDE}")
+    else:
+        st.warning("⚠️ Robinhood INACTIVO — `ROBINHOOD_FECHA_DESDE` está en None. No se carga "
+                   "ninguna fila (protección anti doble-conteo). Fija la fecha de corte (YYYY-MM-DD).")
+
+    # 📌 REGLA OPERATIVA (cargue 1-a-1): igual que Amex/Rakuten — rango amplio SIEMPRE.
+    st.info("📌 Descarga SIEMPRE el export de historial completo de Robinhood, NUNCA solo 'el "
+            "último mes': hay compras que asientan tarde y solo salen en exports posteriores. "
+            "Cargar de más NO duplica (el Orden identifica cada transacción y el dedup la "
+            "reemplaza); cargar de menos SÍ pierde compras.")
+
+    if robinhood_file:
+        # 🔒 BLOQUEO DURO: sin fecha de corte NO se procesa nada (se detiene ANTES de procesar).
+        if ROBINHOOD_FECHA_DESDE is None:
+            st.error("🔒 Cargue Robinhood BLOQUEADO: no hay fecha de corte definida "
+                     "(ROBINHOOD_FECHA_DESDE=None). Define la fecha de corte antes de cargar.")
+            st.stop()
+
+        # 🛡️ LISTA DE EXCLUSIÓN obligatoria (anti-doble-cobro), igual que Amex/Rakuten.
+        try:
+            tarjetas_cobradas_rb, tarjetas_pendientes_rb = cargar_tarjetas_cobradas()
+            st.caption(f"🛡️ Lista de exclusión cargada: {len(tarjetas_cobradas_rb)} Orden ya "
+                       f"cobrados + {len(tarjetas_pendientes_rb)} pendientes de rematch.")
+        except Exception as e:
+            st.error(f"🔒 Cargue Robinhood BLOQUEADO: no se pudo leer '{TARJETAS_COBRADAS_FILENAME}' "
+                     f"desde Dropbox ({e}). Sin la lista de exclusión se recobrarían "
+                     f"transacciones ya cobradas. NO se procesa nada.")
+            st.stop()
+
+        try:
+            df_robinhood = pd.read_csv(robinhood_file)
+        except Exception as e:
+            st.error(f"❌ No se pudo leer el CSV Robinhood: {e}")
+            df_robinhood = None
+
+        if df_robinhood is not None:
+            try:
+                robinhood_may = procesar_robinhood(df_robinhood, fecha_desde=ROBINHOOD_FECHA_DESDE,
+                                                   cobrados=tarjetas_cobradas_rb,
+                                                   pendientes=tarjetas_pendientes_rb,
+                                                   hist_tarjetas=_hist_tarjetas_para_trm())
+            except ValueError as e:
+                st.error(f"⛔ {e}")
+                st.stop()  # DETENER: falta TRM o columnas (sin default, como Amex/Rakuten)
+            if not robinhood_may:
+                st.info("No hay transacciones Robinhood (Posted Purchase/Refund) desde la fecha de corte.")
+            else:
+                for key, dfr in robinhood_may.items():
+                    st.dataframe(dfr, use_container_width=True)
+    else:
+        st.info("📂 Aún no subes el CSV de Tarjeta Robinhood")
+
+
     # 3) Ingresos Nathalia Ospina (CA1633)
     st.header("4) Ingresos Nathalia Ospina (CA1633)")
     nat_files = st.file_uploader(
@@ -2867,9 +3217,12 @@ def main():
         # >>> NUEVO: TARJETA RAKUTEN — módulo paralelo, SOLO 1444 (get devuelve None para el resto) <<<
         rakuten = rakuten_may.get(f"rakuten_{cas}") if 'rakuten_may' in locals() else None
 
+        # >>> NUEVO: TARJETA ROBINHOOD — módulo paralelo, SOLO 1444 (get devuelve None para el resto) <<<
+        robinhood = robinhood_may.get(f"robinhood_{cas}") if 'robinhood_may' in locals() else None
+
         # 3) Armar la lista de DataFrames válidos
         frames = []
-        for df in (inc, egr, ext, env, cons, amex, rakuten):  # rakuten solo aporta 1444
+        for df in (inc, egr, ext, env, cons, amex, rakuten, robinhood):  # rakuten/robinhood solo 1444
             if df is not None and not df.empty:
                 frames.append(df)
 
@@ -3033,14 +3386,14 @@ def main():
 
             # ── [AMEX/COMISIÓN 1444] Aislar filas de tarjeta del cálculo de comisión (flag False) ──
             # Con AMEX_AFECTA_COMISION_1444=False se retiran las filas de tarjeta de 1444 (Orden
-            # legacy gastoamex_1444_/reembolsoamex_1444_ y 1-a-1 amex_<Reference>/rakuten_<hash>)
-            # ANTES del recálculo+comisión y se reincorporan DESPUÉS. Así la comisión quincenal
-            # NO ve el gasto de tarjeta (base intacta) pero el saldo final SÍ lo incluye.
-            # NO se toca el código de comisión; solo se envuelve.
+            # legacy gastoamex_1444_/reembolsoamex_1444_ y 1-a-1 amex_<Reference>/rakuten_<hash>/
+            # robinhood_<hash>) ANTES del recálculo+comisión y se reincorporan DESPUÉS. Así la
+            # comisión quincenal NO ve el gasto de tarjeta (base intacta) pero el saldo final SÍ
+            # lo incluye. NO se toca el código de comisión; solo se envuelve.
             _amex_stash_1444 = None
             if cas == "1444" and not AMEX_AFECTA_COMISION_1444:
                 _m_amex = combinado["Orden"].astype(str).str.match(
-                    r"^(?:gastoamex|reembolsoamex)_1444_|^(?:amex|rakuten)_", na=False
+                    r"^(?:gastoamex|reembolsoamex)_1444_|^(?:amex|rakuten|robinhood)_", na=False
                 )
                 if _m_amex.any():
                     _amex_stash_1444 = combinado[_m_amex].copy()
