@@ -27,17 +27,201 @@ dbx = dropbox.Dropbox(
     oauth2_refresh_token=cfg_dbx["refresh_token"],
 )
 def upload_to_dropbox(data: bytes):
-    """Sube (o sobrescribe) un archivo a Dropbox."""
+    """Sube (o sobrescribe) un archivo a Dropbox.
+
+    🛡️ CAPA C: ANTES de sobrescribir el histórico vivo sube una copia de respaldo con
+    WriteMode.add (nunca sobrescribe), para que ninguna corrida pueda destruir el estado
+    anterior sin dejar rastro recuperable. Si el respaldo no se puede crear, NO se escribe.
+    """
     cfg = st.secrets["dropbox"]
+    remote = cfg["remote_path"]
+
+    # --- 🛟 respaldo previo del estado vivo (capa C) ---
+    try:
+        _md, _resp = dbx.files_download(remote)
+        ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+        carpeta = str(PurePosixPath(remote).parent)
+        stem = PurePosixPath(remote).stem
+        backup_path = f"{carpeta}/{stem}_backup_{ts}.xlsx"
+        dbx.files_upload(_resp.content, backup_path, mode=dropbox.files.WriteMode.add)
+        st.info(f"🛟 Respaldo previo creado: `{backup_path}` ({len(_resp.content):,} bytes)")
+    except dropbox.exceptions.ApiError as e:
+        if _es_not_found(e):
+            st.info("🛟 No hay histórico previo en Dropbox: se omite el respaldo (primera subida).")
+        else:
+            st.error(f"⛔ No se pudo crear el respaldo previo ({e}). NO se escribió el histórico.")
+            st.stop()
+    except Exception as e:
+        st.error(f"⛔ No se pudo crear el respaldo previo ({e}). NO se escribió el histórico.")
+        st.stop()
+
     try:
         dbx.files_upload(
             data,
-            cfg["remote_path"],
+            remote,
             mode=dropbox.files.WriteMode.overwrite
         )
         st.success("✅ Histórico subido a Dropbox")
     except Exception as e:
         st.error(f"❌ Error subiendo a Dropbox: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# 🛡️ BLINDAJE DE PERSISTENCIA DEL HISTÓRICO — capas A y B
+#
+# Contexto: main() no reconstruye las hojas desde las fuentes, las ACUMULA sobre el
+# histórico que sube el operador y deduplica por 'Orden'. Eso preserva bien lo existente,
+# PERO la subida final es un overwrite: si el archivo que subió el operador está rezagado
+# respecto a Dropbox, todo lo escrito en el intervalo se pierde en silencio (fue el caso
+# del 24-jul-2026, que borró 128 filas robinhood_ cargadas la noche anterior).
+#   · CAPA A (guard_frescura_historico): check de concurrencia. Si la salida perdería Orden
+#     que hoy existen en Dropbox, se detiene la app en vez de escribir.
+#   · CAPA B (preservar_filas_tarjeta): reinyecta las filas de tarjeta del vivo que la
+#     corrida actual no trae (no hay extractos de tarjeta en toda corrida).
+# Ninguna de las dos toca el dedup, los egresos positivos, el "Saldo al cierre",
+# recalcular_totales_diarios, ENVIOS_BLOQUEADOS ni la comisión de 1444.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+# Prefijos de 'Orden' que identifican filas escritas por los módulos de tarjeta.
+TARJETA_ORDEN_RE = r"^(?:amex_|rakuten_|robinhood_|gastoamex|reembolsoamex)"
+
+
+def _es_not_found(e: Exception) -> bool:
+    """True si el ApiError de Dropbox es un 'archivo no encontrado'."""
+    try:
+        return bool(e.error.is_path() and e.error.get_path().is_not_found())
+    except Exception:
+        return "not_found" in str(e)
+
+
+def _leer_historico_vivo() -> dict:
+    """Descarga el histórico que AHORA MISMO vive en Dropbox -> {hoja: DataFrame}.
+
+    Devuelve {} si todavía no existe (primera subida). Cualquier otro fallo se propaga:
+    sin poder leer el estado vivo no se puede garantizar que la escritura no destruya datos.
+    """
+    cfg = st.secrets["dropbox"]
+    try:
+        _md, resp = dbx.files_download(cfg["remote_path"])
+    except dropbox.exceptions.ApiError as e:
+        if _es_not_found(e):
+            return {}
+        raise
+    return pd.read_excel(io.BytesIO(resp.content), sheet_name=None)
+
+
+def _norm_orden(serie: pd.Series) -> pd.Series:
+    """Normaliza 'Orden' igual que el dedup de main() (línea ~3301)."""
+    return serie.astype(str).str.strip().str.replace(".0", "", regex=False)
+
+
+def _ordenes_significativas(df: pd.DataFrame) -> set:
+    """Orden no vacíos de una hoja. Los TOTAL llevan Orden='' y quedan fuera a propósito."""
+    if df is None or df.empty or "Orden" not in df.columns:
+        return set()
+    o = _norm_orden(df["Orden"])
+    return set(o[~o.str.lower().isin({"", "nan", "none", "nat", "<na>"})])
+
+
+def _orden_removible(orden: str) -> bool:
+    """True si es LEGÍTIMO que un Orden exista en el vivo y no en la salida:
+    envíos bloqueados (se purgan por diseño, línea ~3311) y comisiones quincenales de 1444
+    (se recalculan y pueden retirarse cuando la quincena deja de tener Total negativo)."""
+    norm = " ".join(str(orden).strip().lower().split())
+    return norm in ENVIOS_BLOQUEADOS or norm.startswith("comision de (")
+
+
+def preservar_filas_tarjeta(historico: dict, vivo=None) -> dict:
+    """🛡️ CAPA B — reinyecta desde el histórico VIVO las filas de tarjeta que la salida no trae.
+
+    Una corrida sin extractos de tarjeta no regenera esas filas; si además parte de un
+    histórico rezagado, el overwrite las borraría. Se recuperan por prefijo de 'Orden' y se
+    recalculan los TOTAL SOLO de las hojas efectivamente tocadas.
+    """
+    if vivo is None:
+        vivo = _leer_historico_vivo()
+    if not vivo:
+        return historico
+
+    reinyectadas = []
+    for hoja, df_vivo in vivo.items():
+        if hoja not in historico or df_vivo is None or df_vivo.empty:
+            continue
+        if "Orden" not in df_vivo.columns:
+            continue
+
+        o_vivo = _norm_orden(df_vivo["Orden"])
+        mask_tarj = o_vivo.str.match(TARJETA_ORDEN_RE, na=False)
+        if not mask_tarj.any():
+            continue
+
+        df_out = asegurar_columnas_historico(historico[hoja].copy())
+        faltan_mask = mask_tarj & ~o_vivo.isin(_ordenes_significativas(df_out))
+        if not faltan_mask.any():
+            continue
+
+        faltantes = asegurar_columnas_historico(df_vivo[faltan_mask].copy())
+        for c in df_out.columns:
+            if c not in faltantes.columns:
+                faltantes[c] = ""
+        combinado = pd.concat([df_out, faltantes[list(df_out.columns)]], ignore_index=True)
+
+        # Recalcular TOTAL solo en hojas de saldo (las que ya los llevan).
+        if combinado["Tipo"].astype(str).str.strip().str.upper().eq("TOTAL").any():
+            cas = str(hoja).split(" - ")[0].strip()
+            usuarios = combinado["Usuario"].astype(str).str.strip()
+            usuarios = usuarios[~usuarios.str.lower().isin({"", "nan", "none"})]
+            usuario = usuarios.mode().iloc[0] if not usuarios.empty else ""
+            combinado = recalcular_totales_diarios(combinado, usuario=usuario, cas=cas)
+
+        historico[hoja] = combinado
+        reinyectadas.append((hoja, int(faltan_mask.sum())))
+
+    if reinyectadas:
+        detalle = " · ".join(f"{h}: +{n}" for h, n in reinyectadas)
+        st.warning(
+            "🛡️ Se reinyectaron filas de TARJETA que el histórico subido no traía y que sí "
+            f"existen en Dropbox ({detalle}). Se recalcularon los totales de esas hojas."
+        )
+    return historico
+
+
+def guard_frescura_historico(historico: dict) -> None:
+    """🛡️ CAPA A — check de concurrencia, JUSTO ANTES de subir.
+
+    Compara el histórico vivo de Dropbox contra lo que se va a escribir. Si el vivo tiene
+    hojas u 'Orden' que la salida no tiene, el overwrite borraría datos: se detiene la app.
+    """
+    vivo = _leer_historico_vivo()
+    if not vivo:
+        return
+
+    hojas_perdidas = [h for h in vivo if h not in historico]
+    perdidas = {}
+    for hoja, df_vivo in vivo.items():
+        if hoja not in historico:
+            continue
+        faltan = _ordenes_significativas(df_vivo) - _ordenes_significativas(historico[hoja])
+        faltan = sorted(o for o in faltan if not _orden_removible(o))
+        if faltan:
+            perdidas[hoja] = faltan
+
+    if not hojas_perdidas and not perdidas:
+        return
+
+    st.error(
+        "⛔ SUBIDA BLOQUEADA — el histórico que se iba a escribir PERDERÍA datos que ahora "
+        "mismo existen en Dropbox. Lo más probable es que el archivo que subiste a la app esté "
+        "rezagado (alguien escribió el histórico después de que lo descargaste). "
+        "Vuelve a descargar el histórico de Dropbox y repite la corrida."
+    )
+    for h in hojas_perdidas:
+        st.error(f"🚨 Desaparecería la hoja completa «{h}»")
+    for hoja, ords in perdidas.items():
+        st.error(f"🚨 «{hoja}»: se perderían {len(ords)} Orden")
+        with st.expander(f"Ver Orden en riesgo — {hoja}"):
+            st.write(", ".join(ords[:200]) + (" …" if len(ords) > 200 else ""))
+    st.stop()
 
 
 
@@ -1207,6 +1391,42 @@ def _norm_merchant_refund_robin(s) -> str:
     return v
 
 
+def _robinhood_clave_y_seq(df: pd.DataFrame):
+    """Clave e índice de repetición del Orden Robinhood (1-a-1), SIN la hora.
+
+    Robinhood reexpide el MISMO movimiento con la hora corrida ±1h entre descargas
+    (5 casos verificados comparando las descargas del 23-jul y 29-jul-2026). Con 'Time'
+    dentro del hash eso cambiaba el Orden, dejaba huérfanas las entradas de la lista de
+    exclusión y habría re-cobrado transacciones ya cobradas. Por eso la clave es
+    Date|Amount|Merchant y el 'seq' desempata las repeticiones exactas del mismo día.
+
+    El 'seq' se asigna sobre un ORDEN CANÓNICO y NO sobre el orden de lectura del archivo,
+    para que dos descargas den siempre el mismo seq a la misma transacción. El orden canónico
+    es (clave, cargable, hora):
+      · CARGABLE primero. Solo las filas Posted+Purchase/Refund pueden llegar al histórico,
+        así que son las únicas cuyo Orden importa; numerarlas antes que las Declined/Pending
+        las aísla de ellas. Sin esto, el 27-abr-2026 la compra Dolphin $2.456,72 (Posted) y
+        un intento Declined del mismo día/monto/comercio se intercambiaban el seq cuando solo
+        una de las dos corría de hora -> la lista protegía a la Declined y RE-COBRABA la real.
+      · La hora solo desempata entre filas cargables del mismo día (un corrimiento horario
+        afecta por igual a las de esa fecha, así que el orden relativo se conserva) y NUNCA
+        entra en el hash.
+    """
+    clave = (df["Date"].astype(str) + "|" + df["Amount"].astype(str) + "|" +
+             df["Merchant"].astype(str))
+    hora = pd.to_datetime(df["Time"].astype(str).str.strip(),
+                          format="%I:%M %p", errors="coerce")
+    cargable = (
+        df["Status"].astype(str).str.strip().str.upper().eq(ROBINHOOD_STATUS_OK)
+        & df["Type"].astype(str).str.strip().str.upper().isin(set(ROBINHOOD_TIPO_MAP))
+    )
+    canon = pd.DataFrame(
+        {"_k": clave, "_c": (~cargable).astype(int), "_h": hora}
+    ).sort_values(["_k", "_c", "_h"], kind="mergesort", na_position="last")
+    seq = canon.groupby("_k").cumcount().reindex(df.index).astype(str)
+    return clave, seq
+
+
 def procesar_robinhood(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None,
                        hist_tarjetas=None) -> dict[str, pd.DataFrame]:
     """Transforma el CSV Robinhood en {robinhood_1444: DF} con UNA fila COP por transacción
@@ -1239,9 +1459,7 @@ def procesar_robinhood(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendie
         return {}
 
     # 1-a-1: Orden determinista sobre TODO el set 1444 (antes de filtrar Status) -> seq estable.
-    _clave = (df["Date"].astype(str) + "|" + df["Time"].astype(str) + "|" +
-              df["Amount"].astype(str) + "|" + df["Merchant"].astype(str))
-    _seq = _clave.groupby(_clave).cumcount().astype(str)
+    _clave, _seq = _robinhood_clave_y_seq(df)
     df["_orden"] = "robinhood_" + (_clave + "|" + _seq).map(
         lambda s: hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
     )
@@ -3705,6 +3923,10 @@ def main():
         
         
         
+        # 🛡️ CAPA B — recuperar del histórico VIVO las filas de tarjeta que esta corrida no
+        # trae (toda corrida sin extractos de tarjeta). Va justo antes de serializar.
+        historico = preservar_filas_tarjeta(historico)
+
         # generar excel en memoria
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -3740,7 +3962,11 @@ def main():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     
-        # 2) Subida automática a Dropbox (DESACTIVADA mientras probamos)
+        # 🛡️ CAPA A — check de concurrencia contra el estado vivo de Dropbox. Si la escritura
+        # perdería Orden que hoy existen allá, detiene la app ANTES de tocar producción.
+        guard_frescura_historico(historico)
+
+        # 2) Subida automática a Dropbox (con respaldo previo automático, capa C)
         upload_to_dropbox(data_bytes)
     else:
         st.info("📂 Aún no subes tu histórico")

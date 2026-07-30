@@ -280,8 +280,9 @@ pre_ventana = tx[tx["_fecha"] < rk["dt"].min()]
 refunds = d[d["_type"] == "REFUND"]
 
 # ═════ ROBINHOOD ═════ (hoja 'RobinhoodCorreal' — pegado crudo del CSV; trae Correal + Maria)
-# El Orden REPLICA exactamente procesar_robinhood: robinhood_<sha1-12 de Date|Time|Amount|Merchant|seq>
-# con seq sobre TODO el set 1444 (Correal + Maria) en orden de archivo, ANTES de filtrar Status.
+# El Orden REPLICA exactamente procesar_robinhood: robinhood_<sha1-12 de Date|Amount|Merchant|seq>
+# (SIN la hora: Robinhood la corre ±1h entre descargas y eso invalidaba el Orden), con seq sobre
+# TODO el set 1444 (Correal + Maria) en ORDEN CANÓNICO (clave, hora), ANTES de filtrar Status.
 # Match CARDHOLDER-AWARE (la hoja mezcla 181 Correal + 13 Maria): cada cobro contra su fila CSV
 # Posted Purchase/Refund del MISMO cardholder por (fecha + |amount| + merchant), count-aware 1:1,
 # fallback ±3 días. Clave RELAJADA (sin la hora): el Excel guarda la hora del AUTH y el CSV la del
@@ -315,9 +316,16 @@ def _frac_to_time(v):
 rob = pd.read_csv(CSV_ROBINHOOD)
 rob["_cas"] = rob["Cardholder"].astype(str).str.strip().map(ROBINHOOD_CARDMAP)
 rob = rob[rob["_cas"].notna()].copy().reset_index(drop=True)
-_rk = (rob["Date"].astype(str) + "|" + rob["Time"].astype(str) + "|" +
-       rob["Amount"].astype(str) + "|" + rob["Merchant"].astype(str))
-_rseq = _rk.groupby(_rk).cumcount().astype(str)
+_rk = (rob["Date"].astype(str) + "|" + rob["Amount"].astype(str) + "|" +
+       rob["Merchant"].astype(str))
+_rh = pd.to_datetime(rob["Time"].astype(str).str.strip(), format="%I:%M %p", errors="coerce")
+# Orden canónico (clave, cargable, hora): las Posted+Purchase/Refund se numeran PRIMERO para
+# que las Declined/Pending no puedan intercambiarles el seq si solo una corre de hora.
+_rcarg = (rob["Status"].astype(str).str.strip().str.upper().eq("POSTED")
+          & rob["Type"].astype(str).str.strip().str.upper().isin({"PURCHASE", "REFUND"}))
+_rcanon = pd.DataFrame({"_k": _rk, "_c": (~_rcarg).astype(int), "_h": _rh}).sort_values(
+    ["_k", "_c", "_h"], kind="mergesort", na_position="last")
+_rseq = _rcanon.groupby("_k").cumcount().reindex(rob.index).astype(str)
 rob["_orden"] = "robinhood_" + (_rk + "|" + _rseq).map(
     lambda s: hashlib.sha1(s.encode("utf-8")).hexdigest()[:12])
 assert rob["_orden"].is_unique, "❌ Orden Robinhood duplicado en el CSV — revisar esquema"
