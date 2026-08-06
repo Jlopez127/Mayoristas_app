@@ -457,10 +457,12 @@ TARJETAS_COBRADAS_FILENAME = "tarjetas_cobradas.xlsx"
 @st.cache_data(ttl=600)  # cache 10 min: no re-descargar de Dropbox en cada rerun
 def cargar_tarjetas_cobradas():
     """Lee de Dropbox la lista de exclusión y devuelve (set de Orden ya cobrados, DataFrame de
-    'pendientes_rematch'). Los pendientes son cobros REALES aún sin Orden (pre-asiento): el
-    escudo también los excluye, por match fecha+monto (+CardMember en Amex). PROPAGA la
-    excepción si el archivo no existe / no se puede leer / está vacío: el caller debe hacer
-    st.stop() — sin lista NO se procesa (se recobraría)."""
+    'pendientes_rematch', DataFrame completo de 'cobradas'). Los pendientes son cobros REALES
+    aún sin Orden (pre-asiento): el escudo también los excluye, por match fecha+monto
+    (+CardMember en Amex). El 3er valor son los cobros CON SUS ATRIBUTOS, para la segunda
+    barrera anti-recobro (ver bloque 'SEGUNDA BARRERA'). PROPAGA la excepción si el archivo no
+    existe / no se puede leer / está vacío: el caller debe hacer st.stop() — sin lista NO se
+    procesa (se recobraría)."""
     cfg = st.secrets["dropbox"]
     path = str(PurePosixPath(cfg["remote_path"]).parent / TARJETAS_COBRADAS_FILENAME)
     _, res = dbx.files_download(path)
@@ -475,7 +477,7 @@ def cargar_tarjetas_cobradas():
         pendientes = pd.read_excel(xls, sheet_name="pendientes_rematch")
     except Exception:
         pendientes = pd.DataFrame()  # sin hoja de pendientes -> escudo solo por Orden
-    return ordenes, pendientes
+    return ordenes, pendientes, df
 
 
 def _cobradas_info(msg: str):
@@ -494,13 +496,156 @@ def _cobradas_warn(msg: str):
         pass
 
 
+# ══════════════════════════════════════════════════════════════════════════════════════
+# 🛡️ SEGUNDA BARRERA ANTI-RECOBRO — POR ATRIBUTOS (independiente del hash)
+#
+# PROBLEMA (verificado 2026-08-06): el anti-recobro dependía SOLO del 'Orden'. Robinhood
+# re-expide la MISMA transacción con la FECHA corrida un día al asentar (6 cobros de mayo
+# cambiaron de día entre dos descargas del CSV: Tory Burch 06→07-may, Costco 05→06-may,
+# Shein 02→01-may…). Como 'Date' entra en el hash, el Orden cambia -> la entrada de la
+# lista queda HUÉRFANA -> la transacción YA COBRADA vuelve a entrar y se recobra.
+# En ese caso solo la ventana manual de Robinhood (≤22-jun) las marcó; una transacción de
+# julio en adelante no habría tenido ninguna red.
+#
+# SOLUCIÓN: además del Orden, comparar ATRIBUTOS que NO dependen del hash. La lista guarda
+# por cada cobro: merchant_norm, usd_abs, fecha_attr, card_norm, casillero (columnas que
+# agrega enriquecer_tarjetas_cobradas.py). Una entrante se excluye si empata con un cobro
+# por casillero + |USD| EXACTO + merchant normalizado + fecha dentro de ±3 días.
+#
+# 🔒 SOLO COMPITEN LOS COBROS HUÉRFANOS — clave para no bloquear compras legítimas:
+#   un cobro cuyo Orden el extracto SIGUE generando ya hace su trabajo en la barrera 1, así
+#   que se excluye del universo de esta barrera. Sin esto, un cobro vivo bloquearía por
+#   atributos a una SEGUNDA compra real idéntica (mismo día/monto/comercio), que es un caso
+#   real y frecuente (compras por ítem del mismo carrito).
+#   Además, un cobro cuya fecha cae fuera del rango del extracto (±3 días) tampoco compite:
+#   si el extracto no cubre esa fecha no se puede saber si su Orden se habría generado.
+#
+# CONSUMO 1:1: cada cobro huérfano tapa como máximo UNA entrante. Dos compras reales
+# idénticas con un solo cobro huérfano -> una se excluye y la otra ENTRA (se cobra).
+#
+# DETERMINISTA: entrantes en orden (fecha, Orden); candidatos por (|Δfecha|, fecha, Orden).
+#
+# ⚠️ NO reemplaza al Orden para IDENTIDAD/dedup: el Orden sigue siendo el ID de la fila y el
+# dedup por 'Orden' de main() no se toca. Esta es una barrera ADICIONAL solo anti-recobro.
+# ⚠️ Un cobro SIN merchant_norm en la lista NO participa (casillero+USD+fecha sin merchant
+# generaría falsos positivos que dejarían de cobrar compras reales).
+# ══════════════════════════════════════════════════════════════════════════════════════
+ANTIRECOBRO_ATTR_DIAS = 3          # ventana de fecha para considerar "la misma transacción"
+ANTIRECOBRO_ATTR_ACTIVO = True     # 🚦 kill switch: False -> solo barrera por Orden (como antes)
+ANTIRECOBRO_ATTR_COLS = ("merchant_norm", "usd_abs", "fecha_attr")
+
+
+def _aviso_barrera_atributos(cobrados_df) -> None:
+    """Hace VISIBLE en la UI si la segunda barrera está activa. Una lista sin las columnas de
+    atributos (o con pocos merchant) deja el cargue con la protección de antes — hay que
+    saberlo ANTES de cargar, no descubrirlo tras un recobro."""
+    if not ANTIRECOBRO_ATTR_ACTIVO:
+        st.warning("⚠️ Segunda barrera anti-recobro DESACTIVADA (ANTIRECOBRO_ATTR_ACTIVO=False): "
+                   "solo protege el Orden. Una transacción re-fechada por el emisor se recobraría.")
+        return
+    faltan = [c for c in ANTIRECOBRO_ATTR_COLS
+              if cobrados_df is None or c not in getattr(cobrados_df, "columns", [])]
+    if faltan:
+        st.warning(
+            f"⚠️ La lista de exclusión NO trae las columnas de atributos ({', '.join(faltan)}): "
+            f"la segunda barrera anti-recobro queda INACTIVA y solo protege el Orden. "
+            f"Corre `enriquecer_tarjetas_cobradas.py` y sube la lista enriquecida a Dropbox."
+        )
+        return
+    _n = len(cobrados_df)
+    _con = int((cobrados_df["merchant_norm"].astype(str).str.strip() != "").sum())
+    st.caption(f"🛡️ Segunda barrera anti-recobro (atributos) ACTIVA: {_con}/{_n} cobros con "
+               f"merchant utilizable, ventana ±{ANTIRECOBRO_ATTR_DIAS} días.")
+
+
+def _cobros_huerfanos_attr(cobrados_df, tarjeta: str, ordenes_extracto: set, rango) -> list:
+    """Cobros de 'tarjeta' que perdieron su Orden: el extracto actual NO lo genera, su fecha
+    cae dentro del rango cubierto por el extracto (±ANTIRECOBRO_ATTR_DIAS) y traen los
+    atributos necesarios. Son los ÚNICOS que pueden excluir por atributos."""
+    if cobrados_df is None or not len(cobrados_df):
+        return []
+    d = cobrados_df.copy()
+    d.columns = [str(c).strip() for c in d.columns]
+    req = ("Orden", "tarjeta", "casillero", "merchant_norm", "usd_abs", "fecha_attr")
+    if any(c not in d.columns for c in req):
+        return []          # lista sin enriquecer -> barrera inactiva (el caller avisa)
+    d = d[d["tarjeta"].astype(str).str.strip().str.lower() == tarjeta].copy()
+    if not len(d):
+        return []
+    d["_f"] = pd.to_datetime(d["fecha_attr"], errors="coerce")
+    d["_m"] = d["merchant_norm"].astype(str).map(_norm_merchant)
+    d["_u"] = pd.to_numeric(d["usd_abs"], errors="coerce").round(2)
+    d["_c"] = d["casillero"].map(_cas_str)
+    d = d[d["_f"].notna() & d["_u"].notna() & (d["_m"].str.strip() != "")]
+    # huérfano = su Orden ya no lo genera el extracto
+    d = d[~d["Orden"].astype(str).str.strip().isin(ordenes_extracto)]
+    if rango is not None and len(d):
+        ini, fin = rango
+        tol = pd.Timedelta(days=ANTIRECOBRO_ATTR_DIAS)
+        d = d[(d["_f"] >= ini - tol) & (d["_f"] <= fin + tol)]
+    return [
+        {"orden": str(r["Orden"]).strip(), "fecha": r["_f"], "merch": r["_m"],
+         "usd": float(r["_u"]), "cas": r["_c"]}
+        for _, r in d.sort_values(["_f", "Orden"], kind="mergesort").iterrows()
+    ]
+
+
+def _excluir_por_atributos(df, cobrados_df, tarjeta: str, ordenes_extracto: set, rango,
+                           etiqueta: str):
+    """🛡️ Barrera 2. 'df' debe traer _fecha (Timestamp), _usd, _cas, _orden y _merch_attr
+    (merchant normalizado, sin prefijo de reembolso). Devuelve la lista de índices a excluir;
+    avisa por st.warning con el detalle (entrante vs cobro y la diferencia de días)."""
+    if not ANTIRECOBRO_ATTR_ACTIVO or df is None or not len(df):
+        return []
+    huerf = _cobros_huerfanos_attr(cobrados_df, tarjeta, ordenes_extracto, rango)
+    if not huerf:
+        return []
+    # índice de cobros huérfanos por (casillero, merchant, usd) — consumo 1:1
+    por_k: dict = {}
+    for h in huerf:
+        por_k.setdefault((h["cas"], h["merch"], round(h["usd"], 2)), []).append(h)
+    usados, drop, detalle = set(), [], []
+    tol = pd.Timedelta(days=ANTIRECOBRO_ATTR_DIAS)
+    orden_entrantes = df.sort_values(["_fecha", "_orden"], kind="mergesort").index
+    for i in orden_entrantes:
+        r = df.loc[i]
+        k = (_cas_str(r["_cas"]), _norm_merchant(r["_merch_attr"]), round(float(r["_usd"]), 2))
+        cands = [h for h in por_k.get(k, [])
+                 if h["orden"] not in usados and abs(h["fecha"] - r["_fecha"]) <= tol]
+        if not cands:
+            continue
+        # el más cercano en fecha; desempate determinista por (fecha, Orden)
+        elegido = sorted(cands, key=lambda h: (abs(h["fecha"] - r["_fecha"]), h["fecha"], h["orden"]))[0]
+        usados.add(elegido["orden"])
+        drop.append(i)
+        detalle.append(
+            f"{r['_fecha']:%Y-%m-%d} USD {float(r['_usd']):.2f} {str(r['_merch_attr'])[:26]} "
+            f"[{r['_orden']}] ≡ cobro {elegido['orden']} del {elegido['fecha']:%Y-%m-%d} "
+            f"({int((r['_fecha'] - elegido['fecha']).days):+d}d)"
+        )
+    if drop:
+        _cobradas_warn(
+            f"🛡️ {etiqueta}: {len(drop)} transacción(es) YA COBRADA(S) detectadas POR ATRIBUTOS "
+            f"(su Orden cambió entre descargas — el emisor la re-fechó/re-expidió) — EXCLUIDAS "
+            f"del cargue, NO se recobran: " + "; ".join(detalle[:15])
+            + (" …" if len(detalle) > 15 else "")
+        )
+    return drop
+
+
 @st.cache_data(ttl=600)  # cache 10 min: no re-descargar de Dropbox en cada rerun
 def cargar_hist_tarjetas():
     """Lee de Dropbox (SOLO LECTURA) el histórico vigente y devuelve UN DataFrame con las filas
-    de tarjeta ya cargadas (Orden amex_* / rakuten_*) de todas las hojas. Sirve únicamente para
-    darle a un reembolso la TRM de su compra original cuando esa compra ya no está en el
-    extracto. NO es una defensa anti-doble-cobro: si falla, el cargue continúa con el
-    comportamiento anterior (TRM del día del reembolso) — por eso el caller ignora el error."""
+    de tarjeta ya cargadas (Orden amex_* / rakuten_* / robinhood_*) de todas las hojas. Sirve
+    únicamente para darle a un reembolso la TRM de su compra original cuando esa compra ya no
+    está en el extracto. NO es una defensa anti-doble-cobro: si falla, el cargue continúa con
+    el comportamiento anterior (TRM del día del reembolso) — por eso el caller ignora el error.
+
+    🐛 FIX 2026-08-06: faltaba 'robinhood_' — los Refund de Robinhood cuya compra original ya
+    no estaba en el extracto NO encontraban su TRM en el histórico (índice vacío) y caían al
+    fallback silencioso (TRM del día del reembolso), dejando un residuo en COP a cargo del
+    mayorista. Robinhood es la tarjeta con más filas cargadas del histórico (128), así que el
+    índice ahora sí aporta."""
     cfg = st.secrets["dropbox"]
     _, res = dbx.files_download(cfg["remote_path"])
     hojas = pd.read_excel(io.BytesIO(res.content), sheet_name=None)
@@ -509,7 +654,7 @@ def cargar_hist_tarjetas():
         if "Orden" not in _dfh.columns:
             continue
         _o = _dfh["Orden"].astype(str).str.strip()
-        _sel = _dfh[_o.str.startswith("amex_") | _o.str.startswith("rakuten_")]
+        _sel = _dfh[_o.str.startswith(("amex_", "rakuten_", "robinhood_"))]
         if len(_sel):
             partes.append(_sel)
     return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
@@ -848,7 +993,7 @@ def _resolver_trm_reembolsos(reembolsos, compras, hist_idx):
 
 
 def procesar_amex(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None,
-                  hist_tarjetas=None) -> dict[str, pd.DataFrame]:
+                  hist_tarjetas=None, cobrados_df=None) -> dict[str, pd.DataFrame]:
     """Transforma la hoja 'Transaction Details' de Amex en {amex_<cas>: DF} con UNA fila COP por
     transacción (1-a-1, Orden = amex_<Reference>; ver bloque de arriba). Levanta ValueError si
     falta la TRM de cualquier día con movimiento, o si alguna fila no trae Reference válido.
@@ -859,7 +1004,10 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=
     aún sin Orden; las transacciones que los matcheen también se EXCLUYEN.
     'hist_tarjetas' (opcional) = filas de tarjeta YA CARGADAS en el histórico (Orden/Monto/TRM/
     Fecha/'Nombre del producto'): solo se usa para darle a un reembolso la TRM de su compra
-    original cuando esa compra no está en el extracto. No afecta qué filas se generan."""
+    original cuando esa compra no está en el extracto. No afecta qué filas se generan.
+    'cobrados_df' (opcional) = hoja 'cobradas' COMPLETA con atributos: habilita la SEGUNDA
+    BARRERA anti-recobro (excluye una transacción ya cobrada cuyo Orden cambió entre
+    descargas). Sin él, el comportamiento es el anterior (solo barrera por Orden)."""
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     for col in ("Card Member", "Date", "Amount", "Reference"):
@@ -904,6 +1052,13 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=
         }
         for _, r in _u.iterrows()
     ]
+
+    # 🛡️ Universo de Orden y rango de fechas del extracto (para la SEGUNDA BARRERA): se toma
+    # ANTES del corte y de la lista, sobre todas las filas mapeadas. Un cobro cuyo Orden esté
+    # aquí NO es huérfano y no compite por atributos.
+    _ref_univ = df["Reference"].astype(str).str.strip().str.lstrip("'")
+    _ordenes_universo = set(("amex_" + _ref_univ)[_ref_univ.str.fullmatch(r"\d+", na=False)])
+    _rango_extracto = (df["_fecha"].min(), df["_fecha"].max()) if len(df) else None
 
     if fecha_desde is not None:
         df = df[df["_fecha"] >= pd.Timestamp(fecha_desde)]
@@ -997,6 +1152,17 @@ def procesar_amex(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=
     # Description limpio para 'Nombre del producto' (colapsa los espacios múltiples del extracto)
     _desc = df.get("Description", pd.Series("", index=df.index)).fillna("")
     df["_desc"] = _desc.astype(str).map(lambda s: " ".join(s.split()))
+
+    # 🛡️ SEGUNDA BARRERA ANTI-RECOBRO (por atributos): atrapa una transacción ya cobrada cuyo
+    # Orden cambió entre descargas. Va DESPUÉS de la lista y de los pendientes, y ANTES de la
+    # TRM (no se piden TRM de días cuyo movimiento quedó excluido).
+    df["_merch_attr"] = df["_desc"].map(_norm_merchant)
+    _drop_attr = _excluir_por_atributos(df, cobrados_df, "amex", _ordenes_universo,
+                                        _rango_extracto, "Amex")
+    if _drop_attr:
+        df = df.drop(index=_drop_attr)
+    if df.empty:
+        return {}
 
     # 🔁 REEMBOLSO -> TRM DE SU COMPRA ORIGINAL (neteo exacto en COP). Solo toca los Ingreso.
     _reembolsos = [
@@ -1135,7 +1301,7 @@ def _rakuten_parse_amount(x) -> float:
 
 
 def procesar_rakuten(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None,
-                     hist_tarjetas=None) -> dict[str, pd.DataFrame]:
+                     hist_tarjetas=None, cobrados_df=None) -> dict[str, pd.DataFrame]:
     """Transforma el CSV Rakuten en {rakuten_1444: DF} con UNA fila COP por transacción
     (1-a-1, Orden = rakuten_<sha1-12>; ver bloque de arriba). Filtra por `Type`. Levanta
     ValueError si falta la TRM de cualquier día con movimiento. 'fecha_desde' descarta
@@ -1174,6 +1340,19 @@ def procesar_rakuten(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendient
     # Fecha (solo día) y monto USD absoluto (Amount == 0 se descarta)
     df["_fecha"] = pd.to_datetime(df["Date"], format="%Y/%m/%d, %H:%M:%S", errors="coerce")
     df = df[df["_fecha"].notna()].copy()
+
+    # 🛡️ Universo de Orden y rango del extracto para la SEGUNDA BARRERA. Se calcula sobre TODAS
+    # las TRANSACTION/REFUND con monto != 0 del CSV (antes del corte y de la lista) — el mismo
+    # universo con el que se generó la lista de cobradas, para que 'huérfano' signifique lo
+    # mismo en ambos lados.
+    _uu = df.copy()
+    _uu["_a"] = _uu["Amount"].map(_rakuten_parse_amount)
+    _uu = _uu[_uu["_a"].notna() & (_uu["_a"] != 0)]
+    _ku = (_uu["Date"].astype(str) + "|" + _uu["Amount"].astype(str) + "|" + _uu["Merchant"].astype(str))
+    _su = _ku.groupby(_ku).cumcount().astype(str)
+    _ordenes_universo = set("rakuten_" + (_ku + "|" + _su).map(
+        lambda s: hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]))
+    _rango_extracto = (df["_fecha"].min(), df["_fecha"].max()) if len(df) else None
 
     # 🔁 UNIVERSO DE COMPRAS (TRANSACTION) para emparejar REFUND: igual que en Amex, se captura
     # ANTES del corte y de la lista de exclusión (la compra revertida puede ser vieja/ya cobrada).
@@ -1251,6 +1430,17 @@ def procesar_rakuten(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendient
             _cobradas_info(f"🛡️ Rakuten: {len(_drop)} transacciones matchean cobros PENDIENTES "
                            f"de rematch (auth ya cobrados) — excluidas del cargue.")
             df = df.drop(index=_drop)
+    if df.empty:
+        return {}
+
+    # 🛡️ SEGUNDA BARRERA ANTI-RECOBRO (por atributos). El merchant de un REFUND lleva el prefijo
+    # "Refund from " -> se normaliza igual que en la lista para que compare contra la compra.
+    df["_cas"] = RAKUTEN_CASILLERO
+    df["_merch_attr"] = df["Merchant"].map(_norm_merchant_refund_rk)
+    _drop_attr = _excluir_por_atributos(df, cobrados_df, "rakuten", _ordenes_universo,
+                                        _rango_extracto, "Rakuten")
+    if _drop_attr:
+        df = df.drop(index=_drop_attr)
     if df.empty:
         return {}
 
@@ -1428,7 +1618,7 @@ def _robinhood_clave_y_seq(df: pd.DataFrame):
 
 
 def procesar_robinhood(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None,
-                       hist_tarjetas=None) -> dict[str, pd.DataFrame]:
+                       hist_tarjetas=None, cobrados_df=None) -> dict[str, pd.DataFrame]:
     """Transforma el CSV Robinhood en {robinhood_1444: DF} con UNA fila COP por transacción
     (1-a-1, Orden = robinhood_<sha1-12>; ver bloque de arriba). Filtra por Status ('Posted') y
     Type (Purchase/Refund). Levanta ValueError si falta la TRM de cualquier día con movimiento.
@@ -1468,6 +1658,12 @@ def procesar_robinhood(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendie
             "Colisión de hash en el Orden Robinhood (dos transacciones distintas generaron el "
             "mismo ID). No se genera ningún movimiento; reporta este archivo."
         )
+
+    # 🛡️ Universo de Orden y rango del extracto para la SEGUNDA BARRERA: TODO el set 1444, antes
+    # de filtrar Status/Type/corte/lista (mismo universo con el que se generó la lista).
+    _ordenes_universo = set(df["_orden"])
+    _f_univ = pd.to_datetime(df["Date"], format="%Y-%m-%d", errors="coerce")
+    _rango_extracto = (_f_univ.min(), _f_univ.max()) if _f_univ.notna().any() else None
 
     # Status: solo Posted. Desconocidos (ni Posted ni Pending/Declined/Other) -> avisar + ignorar.
     df["_st"] = df["Status"].astype(str).str.strip().str.upper()
@@ -1549,6 +1745,17 @@ def procesar_robinhood(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendie
                 _cobradas_info(f"🛡️ Robinhood: {len(_drop)} transacciones matchean cobros "
                                f"PENDIENTES de rematch — excluidas del cargue.")
                 df = df.drop(index=_drop)
+    if df.empty:
+        return {}
+
+    # 🛡️ SEGUNDA BARRERA ANTI-RECOBRO (por atributos) — el motivo por el que existe: Robinhood
+    # re-fecha la transacción al asentar y su Orden cambia. El merchant de un Refund viene como
+    # "Refund: <merchant>" -> se normaliza igual que en la lista.
+    df["_merch_attr"] = df["Merchant"].map(_norm_merchant_refund_robin)
+    _drop_attr = _excluir_por_atributos(df, cobrados_df, "robinhood", _ordenes_universo,
+                                        _rango_extracto, "Robinhood")
+    if _drop_attr:
+        df = df.drop(index=_drop_attr)
     if df.empty:
         return {}
 
@@ -2794,9 +3001,10 @@ def main():
         # 🛡️ LISTA DE EXCLUSIÓN obligatoria (2ª llave, anti-doble-cobro): sin lista NO se
         # procesa nada — procesar a ciegas recobraría todo lo ya cobrado.
         try:
-            tarjetas_cobradas, tarjetas_pendientes = cargar_tarjetas_cobradas()
+            tarjetas_cobradas, tarjetas_pendientes, tarjetas_cobradas_df = cargar_tarjetas_cobradas()
             st.caption(f"🛡️ Lista de exclusión cargada: {len(tarjetas_cobradas)} Orden ya "
                        f"cobrados + {len(tarjetas_pendientes)} pendientes de rematch.")
+            _aviso_barrera_atributos(tarjetas_cobradas_df)
         except Exception as e:
             st.error(f"🔒 Cargue Amex BLOQUEADO: no se pudo leer '{TARJETAS_COBRADAS_FILENAME}' "
                      f"desde Dropbox ({e}). Sin la lista de exclusión se recobrarían "
@@ -2816,7 +3024,8 @@ def main():
                 amex_may = procesar_amex(df_amex, fecha_desde=AMEX_FECHA_DESDE,
                                          cobrados=tarjetas_cobradas,
                                          pendientes=tarjetas_pendientes,
-                                         hist_tarjetas=_hist_tarjetas_para_trm())
+                                         hist_tarjetas=_hist_tarjetas_para_trm(),
+                                         cobrados_df=tarjetas_cobradas_df)
             except ValueError as e:
                 st.error(f"⛔ {e}")
                 st.stop()  # DETENER: falta TRM o columnas (sin default, como se acordó)
@@ -2866,9 +3075,10 @@ def main():
 
         # 🛡️ LISTA DE EXCLUSIÓN obligatoria (anti-doble-cobro), igual que Amex.
         try:
-            tarjetas_cobradas_rk, tarjetas_pendientes_rk = cargar_tarjetas_cobradas()
+            tarjetas_cobradas_rk, tarjetas_pendientes_rk, tarjetas_cobradas_rk_df = cargar_tarjetas_cobradas()
             st.caption(f"🛡️ Lista de exclusión cargada: {len(tarjetas_cobradas_rk)} Orden ya "
                        f"cobrados + {len(tarjetas_pendientes_rk)} pendientes de rematch.")
+            _aviso_barrera_atributos(tarjetas_cobradas_rk_df)
             st.caption("⏳ Pendiente: verificar estabilidad del timestamp con una 2ª descarga "
                        "del CSV (si cambiara, el hash cambia y una cobrada podría re-entrar).")
         except Exception as e:
@@ -2888,7 +3098,8 @@ def main():
                 rakuten_may = procesar_rakuten(df_rakuten, fecha_desde=RAKUTEN_FECHA_DESDE,
                                                cobrados=tarjetas_cobradas_rk,
                                                pendientes=tarjetas_pendientes_rk,
-                                               hist_tarjetas=_hist_tarjetas_para_trm())
+                                               hist_tarjetas=_hist_tarjetas_para_trm(),
+                                               cobrados_df=tarjetas_cobradas_rk_df)
             except ValueError as e:
                 st.error(f"⛔ {e}")
                 st.stop()  # DETENER: falta TRM o columnas (sin default, como Amex)
@@ -2936,9 +3147,10 @@ def main():
 
         # 🛡️ LISTA DE EXCLUSIÓN obligatoria (anti-doble-cobro), igual que Amex/Rakuten.
         try:
-            tarjetas_cobradas_rb, tarjetas_pendientes_rb = cargar_tarjetas_cobradas()
+            tarjetas_cobradas_rb, tarjetas_pendientes_rb, tarjetas_cobradas_rb_df = cargar_tarjetas_cobradas()
             st.caption(f"🛡️ Lista de exclusión cargada: {len(tarjetas_cobradas_rb)} Orden ya "
                        f"cobrados + {len(tarjetas_pendientes_rb)} pendientes de rematch.")
+            _aviso_barrera_atributos(tarjetas_cobradas_rb_df)
         except Exception as e:
             st.error(f"🔒 Cargue Robinhood BLOQUEADO: no se pudo leer '{TARJETAS_COBRADAS_FILENAME}' "
                      f"desde Dropbox ({e}). Sin la lista de exclusión se recobrarían "
@@ -2956,7 +3168,8 @@ def main():
                 robinhood_may = procesar_robinhood(df_robinhood, fecha_desde=ROBINHOOD_FECHA_DESDE,
                                                    cobrados=tarjetas_cobradas_rb,
                                                    pendientes=tarjetas_pendientes_rb,
-                                                   hist_tarjetas=_hist_tarjetas_para_trm())
+                                                   hist_tarjetas=_hist_tarjetas_para_trm(),
+                                                   cobrados_df=tarjetas_cobradas_rb_df)
             except ValueError as e:
                 st.error(f"⛔ {e}")
                 st.stop()  # DETENER: falta TRM o columnas (sin default, como Amex/Rakuten)
