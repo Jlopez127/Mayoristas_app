@@ -2885,6 +2885,85 @@ COBROS_MENSUALES_CONF = {
     "1444": {"inicio": "2026-03-01", "monto": 930_000},
 }
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TARIFA MÍNIMA DE ENVÍO por casillero (regla de negocio, envíos — NADA que ver con tarjetas).
+#
+# Un envío por debajo del mínimo se SUBE al mínimo exacto del día. El mínimo se fija en USD y se
+# convierte a COP con la TRM del día del envío:
+#     minimo_cop = round(USD * _amex_trm_dia(fecha))      # _amex_trm_dia YA incluye el +125
+#
+#   - SOLO SUBE: un envío igual o por encima del mínimo NO se toca.
+#   - Se aplica sobre 'combinado' (histórico + lo nuevo) en main(), así que cubre de una sola vez
+#     los envíos YA CARGADOS y los que entren en la corrida. Por eso NO va dentro de
+#     procesar_envios_mayoristas, que solo ve el archivo nuevo.
+#   - IDEMPOTENTE por construcción: subir al mínimo EXACTO es un punto fijo (en la siguiente
+#     corrida Monto == mínimo y la condición '<' ya no se cumple).
+#   - FAIL-SOFT (al revés que las tarjetas): si falta la TRM de un día —pasa con envíos fechados
+#     hoy/mañana, cuando datos.gov.co aún no publica— se AVISA y la fila queda INTACTA. NO se
+#     aborta el cargue: la regla se reevalúa en cada corrida y se auto-corrige cuando la TRM
+#     aparezca. Con fail-loud, un envío de hoy bloquearía toda la carga.
+#   - La TRM usada se escribe en la columna 'TRM' de las filas ajustadas (hoy vacía en los envíos)
+#     como rastro de auditoría. VERIFICADO 2026-08-10 que es invisible para el resto del sistema:
+#     Dash.py descarta la columna TRM para toda hoja que no sea 1444 (`load_data`, línea ~75), y
+#     en el generador solo la leen las funciones de tarjeta, que filtran por prefijo de 'Orden'
+#     (amex_/rakuten_/robinhood_/capital_) o por Motivo exacto "Tarjeta *" — nunca "Envio".
+#
+# 1633: la tarifa mínima entra en vigor el 2026-08-04 (los 1.998 envíos anteriores NO se tocan).
+# ──────────────────────────────────────────────────────────────────────────────
+TARIFA_MINIMA_ENVIO_USD = {"1633": 14.4}   # casillero -> USD mínimo por envío
+TARIFA_MINIMA_ENVIO_DESDE = "2026-08-04"   # fecha de envío desde la que aplica (>= estricto)
+
+
+def aplicar_tarifa_minima_envios(combinado: pd.DataFrame, cas: str, usd: float, desde: str):
+    """Sube al mínimo del día los envíos de 'cas' con Fecha >= 'desde' que estén por debajo.
+
+    Devuelve (df, resumen). 'resumen' = {"ajustadas": n, "cop": total_subido, "sin_trm": [fechas],
+    "detalle": [(fecha, orden, antes, despues)]} para mostrarlo en la UI.
+    NO toca: filas que no sean envíos, envíos anteriores al corte, ni envíos ya en o sobre el
+    mínimo. Ver el bloque de arriba para el porqué de cada decisión.
+    """
+    resumen = {"ajustadas": 0, "cop": 0.0, "sin_trm": [], "detalle": [], "evaluadas": 0}
+    if combinado is None or combinado.empty:
+        return combinado, resumen
+
+    df = combinado.copy()
+    for c in ("Motivo", "Fecha", "Monto"):
+        if c not in df.columns:
+            return combinado, resumen
+    if "TRM" not in df.columns:
+        df["TRM"] = ""
+
+    _fecha = pd.to_datetime(df["Fecha"], errors="coerce")
+    _monto = pd.to_numeric(df["Monto"], errors="coerce")
+    # 🔒 Filtro ESTRICTO: solo envíos y solo con fecha >= corte. Todo lo anterior queda idéntico.
+    _sel = (
+        df["Motivo"].astype(str).str.strip().str.casefold().eq("envio")
+        & _fecha.notna()
+        & (_fecha >= pd.Timestamp(desde))
+        & _monto.notna()
+    )
+    if not _sel.any():
+        return combinado, resumen
+    resumen["evaluadas"] = int(_sel.sum())
+
+    trm_cache: dict = {}
+    for f_iso in sorted(_fecha[_sel].dt.strftime("%Y-%m-%d").unique()):
+        trm = _amex_trm_dia(f_iso, trm_cache)   # ya incluye el spread de +125
+        if trm is None:
+            resumen["sin_trm"].append(f_iso)
+            continue                            # FAIL-SOFT: esas filas quedan intactas
+        minimo = round(float(usd) * float(trm))
+        _dia = _sel & _fecha.dt.strftime("%Y-%m-%d").eq(f_iso) & (_monto < minimo)
+        for i in df.index[_dia]:
+            antes = float(_monto.loc[i])
+            df.at[i, "Monto"] = minimo
+            df.at[i, "TRM"] = round(float(trm), 2)   # rastro de auditoría
+            resumen["ajustadas"] += 1
+            resumen["cop"] += minimo - antes
+            resumen["detalle"].append((f_iso, str(df.at[i, "Orden"]), antes, minimo))
+    return df, resumen
+
 def aplicar_cobro_contabilidad_mensual(historico, hoja, casillero, usuario, fecha_carga, inicio_yyyymm, monto, etiqueta_base="cobro contabilidad"):
     """
     Agrega un Egreso mensual fijo con Fecha = último día de cada mes, desde 'inicio_yyyymm'
@@ -4244,6 +4323,30 @@ def main():
                     inicio_yyyymm=cfg["inicio"], monto=cfg["monto"], etiqueta_base="cobro contabilidad"
                 )
                 combinado = tmp_hist[hoja].copy()
+            # -------------------------------------------------------------------------
+
+            # ---- Tarifa MÍNIMA de envío (parametrizada por casillero) ----
+            # Va sobre 'combinado' (histórico + lo nuevo) y ANTES del recálculo de totales, para
+            # que el saldo del día ya incorpore los envíos subidos al mínimo. Cubre de una sola
+            # vez los envíos ya cargados y los nuevos. Ver el bloque de TARIFA_MINIMA_ENVIO_USD.
+            if cas in TARIFA_MINIMA_ENVIO_USD:
+                combinado, _tm = aplicar_tarifa_minima_envios(
+                    combinado, cas,
+                    usd=TARIFA_MINIMA_ENVIO_USD[cas],
+                    desde=TARIFA_MINIMA_ENVIO_DESDE,
+                )
+                if _tm["ajustadas"]:
+                    st.info(
+                        f"📦 Tarifa mínima {cas}: {_tm['ajustadas']} envío(s) subidos al mínimo de "
+                        f"USD {TARIFA_MINIMA_ENVIO_USD[cas]} (desde {TARIFA_MINIMA_ENVIO_DESDE}) — "
+                        f"+COP {_tm['cop']:,.0f} en total."
+                    )
+                if _tm["sin_trm"]:
+                    st.warning(
+                        f"⚠️ Tarifa mínima {cas}: sin TRM para {', '.join(_tm['sin_trm'])} — "
+                        f"esos envíos quedaron SIN ajustar (se corrigen solos en la próxima "
+                        f"corrida, cuando datos.gov.co publique la TRM)."
+                    )
             # -------------------------------------------------------------------------
 
             # ── [INCENTIVO AMEX] Cashback mensual (25 COP x USD neto Amex del mes cerrado).
