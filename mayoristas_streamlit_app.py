@@ -83,7 +83,7 @@ def upload_to_dropbox(data: bytes):
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
 # Prefijos de 'Orden' que identifican filas escritas por los módulos de tarjeta.
-TARJETA_ORDEN_RE = r"^(?:amex_|rakuten_|robinhood_|gastoamex|reembolsoamex)"
+TARJETA_ORDEN_RE = r"^(?:amex_|rakuten_|robinhood_|capital_|gastoamex|reembolsoamex)"
 
 
 def _es_not_found(e: Exception) -> bool:
@@ -529,6 +529,15 @@ def _cobradas_warn(msg: str):
 # dedup por 'Orden' de main() no se toca. Esta es una barrera ADICIONAL solo anti-recobro.
 # ⚠️ Un cobro SIN merchant_norm en la lista NO participa (casillero+USD+fecha sin merchant
 # generaría falsos positivos que dejarían de cobrar compras reales).
+#
+# 🔏 SIGNO EN LA LLAVE (agregado 2026-08-10 por Capital). La llave era (casillero, merchant, |USD|)
+# — CIEGA AL SIGNO. En Amex/Rakuten/Robinhood eso no molesta porque el reembolso se nombra distinto
+# ("Refund from X" / "Refund: X"), pero en Capital One la Description de un reembolso es IDÉNTICA a
+# la de su compra y el monto también: 16 de los 20 reembolsos del extracto caen a ≤3 días de su
+# propia compra. Sin signo, un cobro-compra huérfano taparía al reembolso entrante (y viceversa).
+# Ahora la lista puede traer una columna 'signo' ("Egreso"/"Ingreso") y la entrante su '_tipo_attr':
+# el cobro solo compite si los signos coinciden. RETROCOMPATIBLE: 'signo' vacío o ausente = comodín,
+# así que las 2.221 entradas amex/rakuten/robinhood se comportan EXACTAMENTE igual que antes.
 # ══════════════════════════════════════════════════════════════════════════════════════
 ANTIRECOBRO_ATTR_DIAS = 3          # ventana de fecha para considerar "la misma transacción"
 ANTIRECOBRO_ATTR_ACTIVO = True     # 🚦 kill switch: False -> solo barrera por Orden (como antes)
@@ -577,6 +586,12 @@ def _cobros_huerfanos_attr(cobrados_df, tarjeta: str, ordenes_extracto: set, ran
     d["_u"] = pd.to_numeric(d["usd_abs"], errors="coerce").round(2)
     d["_c"] = d["casillero"].map(_cas_str)
     d = d[d["_f"].notna() & d["_u"].notna() & (d["_m"].str.strip() != "")]
+    # 🔏 SIGNO (opcional, ver bloque de arriba): columna 'signo' con "Egreso"/"Ingreso". Las
+    # entradas viejas (amex/rakuten/robinhood) NO la traen -> "" = comodín, comportamiento idéntico
+    # al de antes. Solo Capital la puebla.
+    d["_s"] = (d["signo"].astype(str).str.strip().str.title()
+               if "signo" in d.columns else "")
+    d.loc[~d["_s"].isin(["Egreso", "Ingreso"]), "_s"] = ""
     # huérfano = su Orden ya no lo genera el extracto
     d = d[~d["Orden"].astype(str).str.strip().isin(ordenes_extracto)]
     if rango is not None and len(d):
@@ -585,7 +600,7 @@ def _cobros_huerfanos_attr(cobrados_df, tarjeta: str, ordenes_extracto: set, ran
         d = d[(d["_f"] >= ini - tol) & (d["_f"] <= fin + tol)]
     return [
         {"orden": str(r["Orden"]).strip(), "fecha": r["_f"], "merch": r["_m"],
-         "usd": float(r["_u"]), "cas": r["_c"]}
+         "usd": float(r["_u"]), "cas": r["_c"], "signo": r["_s"]}
         for _, r in d.sort_values(["_f", "Orden"], kind="mergesort").iterrows()
     ]
 
@@ -606,12 +621,17 @@ def _excluir_por_atributos(df, cobrados_df, tarjeta: str, ordenes_extracto: set,
         por_k.setdefault((h["cas"], h["merch"], round(h["usd"], 2)), []).append(h)
     usados, drop, detalle = set(), [], []
     tol = pd.Timedelta(days=ANTIRECOBRO_ATTR_DIAS)
+    _hay_signo = "_tipo_attr" in df.columns
     orden_entrantes = df.sort_values(["_fecha", "_orden"], kind="mergesort").index
     for i in orden_entrantes:
         r = df.loc[i]
         k = (_cas_str(r["_cas"]), _norm_merchant(r["_merch_attr"]), round(float(r["_usd"]), 2))
+        # 🔏 el cobro solo compite si su signo coincide con el de la entrante. Un cobro sin signo
+        # ("" = entradas viejas) sigue siendo comodín: amex/rakuten/robinhood no cambian.
+        _tipo = str(r["_tipo_attr"]).strip() if _hay_signo else ""
         cands = [h for h in por_k.get(k, [])
-                 if h["orden"] not in usados and abs(h["fecha"] - r["_fecha"]) <= tol]
+                 if h["orden"] not in usados and abs(h["fecha"] - r["_fecha"]) <= tol
+                 and (not h["signo"] or not _tipo or h["signo"] == _tipo)]
         if not cands:
             continue
         # el más cercano en fecha; desempate determinista por (fecha, Orden)
@@ -636,7 +656,7 @@ def _excluir_por_atributos(df, cobrados_df, tarjeta: str, ordenes_extracto: set,
 @st.cache_data(ttl=600)  # cache 10 min: no re-descargar de Dropbox en cada rerun
 def cargar_hist_tarjetas():
     """Lee de Dropbox (SOLO LECTURA) el histórico vigente y devuelve UN DataFrame con las filas
-    de tarjeta ya cargadas (Orden amex_* / rakuten_* / robinhood_*) de todas las hojas. Sirve
+    de tarjeta ya cargadas (Orden amex_* / rakuten_* / robinhood_* / capital_*) de todas las hojas. Sirve
     únicamente para darle a un reembolso la TRM de su compra original cuando esa compra ya no
     está en el extracto. NO es una defensa anti-doble-cobro: si falla, el cargue continúa con
     el comportamiento anterior (TRM del día del reembolso) — por eso el caller ignora el error.
@@ -654,7 +674,7 @@ def cargar_hist_tarjetas():
         if "Orden" not in _dfh.columns:
             continue
         _o = _dfh["Orden"].astype(str).str.strip()
-        _sel = _dfh[_o.str.startswith(("amex_", "rakuten_", "robinhood_"))]
+        _sel = _dfh[_o.str.startswith(("amex_", "rakuten_", "robinhood_", "capital_"))]
         if len(_sel):
             partes.append(_sel)
     return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
@@ -1850,13 +1870,354 @@ def procesar_robinhood(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendie
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Cargue "Tarjeta Capital" (Capital One, 4ª tarjeta; módulo PARALELO, NO reusa procesar_*).
+# SOLO Julian Sanchez -> casillero 13608. Fuente: CSV Capital One
+#   (columnas: Transaction Date, Posted Date, Card No., Description, Category, Debit, Credit).
+#
+#   - SEGMENTACIÓN: se procesan SOLO las filas con Card No. == CAPITAL_CARD_NO ("1484"). Si el
+#     CSV trae otras tarjetas se IGNORAN con aviso (Capital One deja bajar varias en un export).
+#
+#   - 💵 REGLA UNIFICADA (decisión 2026-08-10), idéntica a las otras 3 tarjetas:
+#       Debit                       -> Egreso  (gasto)
+#       Credit  Category=Merchandise-> Ingreso (devolución por cancelación: RESTA)
+#       Credit  Category=Payment/Credit ("ELECTRONIC PAYMENT") -> IGNORAR (pago a la tarjeta:
+#               es un abono del propio tarjetahabiente, ni suma ni resta)
+#     Los Credit "Merchandise" son reembolsos eBay reales y el backoffice SÍ los netaba en sus
+#     bloques manuales (p.ej. el cobro 152228 = 7.088,34 Debit − 5.583,00 Credit).
+#     ⚠️ ANTI-DOBLE-ABONO: por eso los cobros-reembolso de la hoja congelada TAMBIÉN van a la
+#     lista de exclusión (ver generar_capital_cobradas.py). Sin ellos, 4 reembolsos de julio ya
+#     abonados dentro de los bloques 155110/155839 se abonarían por segunda vez.
+#
+#   - USD -> COP con la MISMA TRM que Amex (_amex_trm_dia: datos.gov.co, +125), por el día de
+#     Transaction Date. *** SIN TRM de respaldo: si falta la de un día con movimiento, ValueError. ***
+#
+#   - 1-a-1: cada movimiento cargable -> UNA fila propia. Capital One NO trae ID nativo (no hay
+#     Reference) -> Orden determinista por transacción:
+#       clave = "<Transaction Date>|<Debit>|<Credit>|<Description>|<seq>"
+#       Orden = "capital_" + sha1(clave, utf-8)[:12]
+#     · Debit y Credit van como campos SEPARADOS (uno vacío): eso es lo que distingue una compra
+#       de su reembolso, que en Capital comparten Description y monto. Verificado: 145/145 y
+#       88/88 claves únicas en los dos extractos reales.
+#     · Se usa TRANSACTION DATE (fecha de compra), no Posted Date: es la fecha con la que el
+#       backoffice armó todos sus bloques ("del 9 al 13 Julio") y la que quedó en los cobros.
+#     · VERIFICADO (2026-08-10) que Capital One NO re-fecha al asentar: de los 72 cobros de la
+#       hoja congelada "Capital Julian" que caen dentro del rango del extracto, los 72 coinciden
+#       con Transaction Date EXACTO, y 0 aparecen re-fechados. El lag Posted−Transaction es
+#       0..2 días y no altera Transaction Date.
+#     · La Description trae el order-id de eBay ("EBAY O*nn-nnnnn-nnnnn"), casi un ID nativo:
+#       0 colisiones de clave en el extracto (145/145 y 88/88 únicas). El 'seq' queda como red
+#       de seguridad de costo cero para dos compras idénticas el mismo día.
+#     · seq sobre ORDEN CANÓNICO (clave, Posted Date) y NO sobre el orden de lectura, para que
+#       dos descargas den el mismo seq a la misma transacción (misma razón que Robinhood).
+#     Con el dedup existente por Orden (keep="last") el cargue es IDEMPOTENTE.
+#
+#   - Motivo = "Tarjeta Capital" (tag EXACTO que captura el incentivo; ver agregar_incentivo_amex).
+#   - REEMBOLSOS: cada Ingreso se convierte a COP con la TRM DE SU COMPRA ORIGINAL (las mismas
+#     3 pasadas de _resolver_trm_reembolsos que usan Amex/Rakuten/Robinhood), para que compra y
+#     devolución neteen en 0 y no quede residuo cambiario. En Capital el merchant del reembolso
+#     es la MISMA Description de la compra, así que no hay prefijo que quitar.
+#   - COMISIÓN: 13608 NO tiene comisión quincenal (el bloque de comisión es `if cas == "1444"`).
+#     Estas filas mueven el saldo de 13608 y nada más.
+# ──────────────────────────────────────────────────────────────────────────────
+CAPITAL_CASILLERO = "13608"
+CAPITAL_USUARIO = "Julian Sanchez"
+CAPITAL_CARD_NO = "1484"
+CAPITAL_COLS = ["Transaction Date", "Posted Date", "Card No.", "Description", "Category",
+                "Debit", "Credit"]
+CAPITAL_CAT_PAGO = "Payment/Credit"   # pagos a la tarjeta: se ignoran SIEMPRE
+CAPITAL_CAT_COMPRA = "Merchandise"
+# 🚦 PERILLA: False (decisión vigente) -> los Credit de 'Merchandise' entran como Ingreso
+# (devolución) con la TRM de su compra original. True -> se ignora TODO Credit (comportamiento
+# anterior al 2026-08-10; deja el reembolso a cargo del mayorista).
+CAPITAL_IGNORAR_CREDITOS = False
+
+# 🚦 FECHA DE CORTE del cargue Capital — MISMAS 3 reglas que Amex/Rakuten/Robinhood:
+#   1. el histórico de cobrados MANDA (la LISTA decide, no el corte);
+#   2. el corte es solo límite de sanidad para no procesar historia irrelevante;
+#   3. todo lo nuevo fuera de lista/pendientes se toma (nunca dejar de cobrar).
+#   - None -> INACTIVO (kill switch de emergencia).
+CAPITAL_FECHA_DESDE = "2026-07-01"
+
+
+def _capital_cargables(df: pd.DataFrame) -> pd.Series:
+    """Máscara de las filas que PUEDEN llegar al histórico: Debit > 0 (compra) o, si la perilla
+    lo permite, Credit > 0 de Category 'Merchandise' (devolución). Los Credit de
+    'Payment/Credit' (pagos a la tarjeta) nunca son cargables."""
+    deb = pd.to_numeric(df["Debit"], errors="coerce")
+    cre = pd.to_numeric(df["Credit"], errors="coerce")
+    cat = df["Category"].astype(str).str.strip()
+    m = deb.notna() & (deb > 0)
+    if not CAPITAL_IGNORAR_CREDITOS:
+        m = m | (cre.notna() & (cre > 0) & cat.eq(CAPITAL_CAT_COMPRA))
+    return m
+
+
+def _capital_clave_y_seq(df: pd.DataFrame):
+    """Clave e índice de repetición del Orden Capital (1-a-1).
+
+    Clave = Transaction Date | Debit | Credit | Description (valores CRUDOS del CSV: Capital One
+    los escribe siempre como YYYY-MM-DD y \\d+\\.\\d{2}, verificado sobre 145 filas sin excepción).
+    Debit y Credit son campos SEPARADOS (uno vacío): es lo único que distingue una compra de su
+    reembolso, que comparten Description y monto.
+    El 'seq' se asigna sobre un ORDEN CANÓNICO (clave, Posted Date) y NO sobre el orden de
+    lectura, para que dos descargas den el mismo seq a la misma transacción. Dos filas con la
+    misma clave son idénticas en todo lo que se hashea, así que da igual cuál recibe 0 o 1.
+    Se espera recibir SOLO filas cargables (ver _capital_cargables): las ignoradas no generan
+    Orden y por tanto no pueden robarle un seq a un movimiento real.
+    """
+    clave = (df["Transaction Date"].astype(str).str.strip() + "|"
+             + df["Debit"].astype(str).str.strip() + "|"
+             + df["Credit"].astype(str).str.strip() + "|"
+             + df["Description"].astype(str).str.strip())
+    canon = pd.DataFrame(
+        {"_k": clave, "_p": df["Posted Date"].astype(str).str.strip()}
+    ).sort_values(["_k", "_p"], kind="mergesort")
+    seq = canon.groupby("_k").cumcount().reindex(df.index).astype(str)
+    return clave, seq
+
+
+def _capital_orden(clave: pd.Series, seq: pd.Series) -> pd.Series:
+    """Orden 1-a-1 de Capital: capital_<sha1-12 de 'clave|seq'>."""
+    return "capital_" + (clave + "|" + seq).map(
+        lambda s: hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
+    )
+
+
+def procesar_capital(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None,
+                     hist_tarjetas=None, cobrados_df=None) -> dict[str, pd.DataFrame]:
+    """Transforma el CSV Capital One en {capital_13608: DF} con UNA fila COP por COMPRA (Debit),
+    1-a-1, Orden = capital_<sha1-12> (ver bloque de arriba). Ignora todos los Credit. Levanta
+    ValueError si falta la TRM de cualquier día con movimiento. 'fecha_desde' descarta
+    transacciones anteriores; None -> no procesa nada. 'cobrados' (OBLIGATORIO si fecha_desde
+    está activo) = set de Orden ya cobrados: esas transacciones se EXCLUYEN. 'cobrados_df' = la
+    lista completa con atributos, para la segunda barrera anti-recobro. 'hist_tarjetas' = filas
+    de tarjeta del histórico, para darle a una devolución la TRM de su compra original cuando esa
+    compra ya no está en el extracto.
+    'pendientes' se acepta por simetría de firma con los otros módulos pero NO se usa: Capital no
+    tiene auth pendientes de rematch."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    faltan = [c for c in CAPITAL_COLS if c not in df.columns]
+    if faltan:
+        raise ValueError(f"El CSV Capital One no tiene las columnas esperadas: {', '.join(faltan)}.")
+
+    # INACTIVO sin fecha de corte: no se procesa nada (se validan columnas ANTES).
+    if fecha_desde is None:
+        return {}
+
+    # 🛡️ LISTA DE EXCLUSIÓN obligatoria: procesar sin lista recobraría lo ya cobrado.
+    if cobrados is None:
+        raise ValueError(
+            "Falta la lista de exclusión 'tarjetas cobradas' (cobrados=None). "
+            "No se procesa nada: sin la lista se recobrarían transacciones ya cobradas."
+        )
+
+    # 🔒 SEGMENTACIÓN POR TARJETA: solo la 1484 (Julian). Otras se ignoran con aviso.
+    _card = df["Card No."].astype(str).str.strip()
+    _otras = sorted(set(_card.unique()) - {CAPITAL_CARD_NO})
+    if _otras:
+        _cobradas_warn(
+            f"⚠️ Capital: el CSV trae {int((~_card.eq(CAPITAL_CARD_NO)).sum())} fila(s) de otras "
+            f"tarjetas ({', '.join(_otras)}) — IGNORADAS. Solo se carga la {CAPITAL_CARD_NO} "
+            f"(casillero {CAPITAL_CASILLERO})."
+        )
+    df = df[_card.eq(CAPITAL_CARD_NO)].copy()
+    if df.empty:
+        return {}
+
+    # Category desconocida -> FAIL-LOUD (no cargar a ciegas si Capital One agrega un tipo nuevo).
+    _cat = df["Category"].astype(str).str.strip()
+    _cat_desconocidas = sorted(set(_cat.unique()) - {CAPITAL_CAT_COMPRA, CAPITAL_CAT_PAGO})
+    if _cat_desconocidas:
+        raise ValueError(
+            f"Capital: Category NO reconocida en el CSV: {', '.join(_cat_desconocidas)}. "
+            f"Esperadas: '{CAPITAL_CAT_COMPRA}' / '{CAPITAL_CAT_PAGO}'. No se genera ningún "
+            f"movimiento (revisa si Capital One agregó una categoría nueva)."
+        )
+
+    df["_debit"] = pd.to_numeric(df["Debit"], errors="coerce")
+    df["_credit"] = pd.to_numeric(df["Credit"], errors="coerce")
+    # Una fila con Debit Y Credit a la vez sería un formato inesperado -> fail-loud.
+    if (df["_debit"].notna() & df["_credit"].notna()).any():
+        raise ValueError(
+            "Capital: hay filas con Debit y Credit simultáneos (formato inesperado). "
+            "No se genera ningún movimiento."
+        )
+
+    df["_fecha"] = pd.to_datetime(df["Transaction Date"], errors="coerce")
+    if df["_fecha"].isna().any():
+        raise ValueError(
+            f"Capital: {int(df['_fecha'].isna().sum())} fila(s) con 'Transaction Date' ilegible. "
+            f"No se genera ningún movimiento."
+        )
+
+    # Rango del extracto (sobre TODAS las filas, incluidas las ignoradas) para la 2ª barrera.
+    _rango_extracto = (df["_fecha"].min(), df["_fecha"].max()) if len(df) else None
+
+    # 💵 CLASIFICACIÓN (regla unificada): Debit -> Egreso, Credit 'Merchandise' -> Ingreso,
+    # Credit 'Payment/Credit' -> IGNORAR (pago a la tarjeta, ni suma ni resta).
+    _es_merch = _cat.eq(CAPITAL_CAT_COMPRA)
+    _m_pago = df["_credit"].notna() & (df["_credit"] > 0) & ~_es_merch
+    _m_dev = df["_credit"].notna() & (df["_credit"] > 0) & _es_merch
+    if _m_pago.any():
+        _cobradas_info(
+            f"ℹ️ Capital: {int(_m_pago.sum())} pago(s) a la tarjeta ignorados "
+            f"(USD {float(df.loc[_m_pago, '_credit'].sum()):,.2f}) — no son devolución."
+        )
+    if CAPITAL_IGNORAR_CREDITOS and _m_dev.any():
+        _cobradas_warn(
+            f"⚠️ Capital: {int(_m_dev.sum())} devolución(es) de '{CAPITAL_CAT_COMPRA}' "
+            f"(USD {float(df.loc[_m_dev, '_credit'].sum()):,.2f}) NO se abonan al mayorista "
+            f"(CAPITAL_IGNORAR_CREDITOS=True)."
+        )
+
+    # Solo lo cargable. El Orden se calcula sobre ESTE universo (antes del corte y de la lista),
+    # para que el 'seq' no dependa de qué filas se filtren después.
+    df = df[_capital_cargables(df)].copy()
+    if df.empty:
+        return {}
+    _clave, _seq = _capital_clave_y_seq(df)
+    df["_orden"] = _capital_orden(_clave, _seq)
+    # FAIL-LOUD: una colisión de hash entre claves distintas colapsaría dos movimientos en uno.
+    if df["_orden"].duplicated().any():
+        raise ValueError(
+            "Colisión de hash en el Orden Capital (dos transacciones distintas generaron el "
+            "mismo ID). No se genera ningún movimiento; reporta este archivo."
+        )
+    _ordenes_universo = set(df["_orden"])
+    df["_tipo"] = np.where(df["_debit"].notna() & (df["_debit"] > 0), "Egreso", "Ingreso")
+    df["_usd"] = df["_debit"].fillna(df["_credit"]).abs()
+    df["_merch_attr"] = df["Description"].map(_norm_merchant)
+
+    # 🔁 UNIVERSO DE COMPRAS para emparejar los reembolsos: se captura ANTES del corte y de la
+    # lista (la compra revertida puede ser vieja o ya cobrada). Solo presta fecha/TRM.
+    _compras_universo = [
+        {
+            "id": r["_orden"],
+            "fecha": r["_fecha"],
+            "merch": r["_merch_attr"],
+            "usd": round(float(r["_usd"]), 2),
+            # Capital es de UNA sola tarjeta: se puebla 'cm' igual que Rakuten para que
+            # _resolver_trm_reembolsos aplique la misma regla sin casos especiales.
+            "cm": CAPITAL_USUARIO,
+            "cas": CAPITAL_CASILLERO,
+            "trm_fecha": r["_fecha"].strftime("%Y-%m-%d"),
+        }
+        for _, r in df[df["_tipo"] == "Egreso"].iterrows()
+    ]
+
+    if fecha_desde is not None:
+        df = df[df["_fecha"] >= pd.Timestamp(fecha_desde)].copy()
+    if df.empty:
+        return {}
+    df["_fecha_iso"] = df["_fecha"].dt.strftime("%Y-%m-%d")
+
+    # 🛡️ Anti-doble-cobro / anti-doble-abono (defensa PRINCIPAL): excluir los movimientos cuyo
+    # Orden ya está en la lista. Cubre por igual compras ya cobradas y reembolsos YA ABONADOS
+    # por el backoffice dentro de sus bloques manuales. Va ANTES de la TRM.
+    _ya = df["_orden"].isin(cobrados)
+    if _ya.any():
+        _neg = df[_ya & (df["_tipo"] == "Egreso")]
+        _pos = df[_ya & (df["_tipo"] == "Ingreso")]
+        _cobradas_info(
+            f"🛡️ Capital: {int(_ya.sum())} movimiento(s) ya liquidados (lista de exclusión) — "
+            f"excluidos: {len(_neg)} compra(s) ya cobrada(s) USD {float(_neg['_usd'].sum()):,.2f} "
+            f"+ {len(_pos)} devolución(es) YA ABONADA(S) USD {float(_pos['_usd'].sum()):,.2f}."
+        )
+        df = df[~_ya].copy()
+    if df.empty:
+        return {}
+
+    # 🛡️ SEGUNDA BARRERA ANTI-RECOBRO (por atributos, independiente del hash): tapa el caso en
+    # que Capital One re-expidiera un movimiento ya liquidado con la fecha corrida. Aquí el
+    # 'merchant' es la Description (trae el order-id de eBay) -> emparejamiento muy preciso.
+    # 🔏 La llave incluye el SIGNO: sin él, un cobro-compra huérfano taparía al reembolso de esa
+    # misma compra (misma Description y mismo monto, a ≤3 días).
+    df["_cas"] = CAPITAL_CASILLERO
+    df["_tipo_attr"] = df["_tipo"]
+    _drop_attr = _excluir_por_atributos(df, cobrados_df, "capital", _ordenes_universo,
+                                        _rango_extracto, "Capital")
+    if _drop_attr:
+        df = df.drop(index=_drop_attr)
+    if df.empty:
+        return {}
+
+    # 🔁 Reembolso -> TRM DE SU COMPRA ORIGINAL (neteo exacto). Solo toca los Ingreso.
+    _reembolsos = [
+        {"id": r["_orden"], "fecha": r["_fecha"], "merch": r["_merch_attr"],
+         "usd": round(float(r["_usd"]), 2),
+         "cm": CAPITAL_USUARIO, "cas": CAPITAL_CASILLERO}
+        for _, r in df[df["_tipo"] == "Ingreso"].iterrows()
+    ]
+    _trm_ok, _trm_sin_match, _trm_ambiguos = _resolver_trm_reembolsos(
+        _reembolsos, _compras_universo,
+        _indice_compras_historico(hist_tarjetas, "capital_", "Tarjeta Capital"),
+    )
+    if _trm_sin_match:
+        _cobradas_warn(
+            "⚠️ Capital: {} devolución(es) sin compra original identificable (ni total ni "
+            "parcial) — se usa la TRM de su propio día. REVISAR a mano: {}"
+            .format(len(_trm_sin_match),
+                    "; ".join(f"{x['fecha']:%Y-%m-%d} USD {x['usd']:.2f} {x['merch'][:36]} "
+                              f"[{x['motivo']}]" for x in _trm_sin_match[:10]))
+        )
+    if _trm_ambiguos:
+        _cobradas_info(
+            f"ℹ️ Capital: {len(_trm_ambiguos)} devolución(es) tenían varias compras candidatas "
+            f"con TRM distintas; se tomó la compra MÁS RECIENTE anterior al reembolso."
+        )
+
+    # TRM por día (+125). Incluye los días de las COMPRAS ORIGINALES de los reembolsos casados.
+    trm_cache: dict = {}
+    _dias = set(df["_fecha_iso"].unique()) | {
+        f for f, origen, _t, _p in _trm_ok.values() if origen == "extracto"
+    }
+    faltantes = {f for f in sorted(_dias) if _amex_trm_dia(f, trm_cache) is None}
+    if faltantes:
+        raise ValueError(
+            f"Sin TRM (datos.gov.co) para los días con movimiento Capital: "
+            f"{', '.join(sorted(faltantes))}. No se genera ningún movimiento "
+            f"(no hay TRM de respaldo)."
+        )
+
+    filas = []
+    for _, r in df.iterrows():
+        tipo, f_iso = r["_tipo"], r["_fecha_iso"]
+        trm = trm_cache[f_iso]
+        etq = "gasto" if tipo == "Egreso" else "reembolso"
+        _m = _trm_ok.get(r["_orden"]) if tipo == "Ingreso" else None
+        if _m:
+            _f_compra, _origen, _trm_hist, _parcial = _m
+            trm = _trm_hist if _origen == "historico" else trm_cache[_f_compra]
+            etq = f"reembolso{' parcial' if _parcial else ''} (TRM compra {_f_compra})"
+        desc = " ".join(str(r["Description"]).split())
+        filas.append({
+            "Fecha": f_iso,
+            "Tipo": tipo,
+            "Monto": round(float(r["_usd"]) * trm),   # COP, POSITIVO (el signo lo lleva 'Tipo')
+            "Orden": r["_orden"],
+            "Motivo": "Tarjeta Capital",
+            "TRM": round(trm, 2),
+            "Usuario": CAPITAL_USUARIO,
+            "Casillero": CAPITAL_CASILLERO,
+            "Estado de Orden": "",
+            "Nombre del producto": f"Tarjeta Capital - {etq} - {desc}",
+        })
+
+    out = pd.DataFrame(filas)
+    if out.empty:
+        return {}
+    return {f"capital_{CAPITAL_CASILLERO}": out.reset_index(drop=True)}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # INCENTIVO AMEX MENSUAL (cashback). Por cada mes CERRADO, agrega un Ingreso al casillero
 # = INCENTIVO_COP_POR_USD * USD_neto, donde USD_neto = Σ(USD egresos Amex) − Σ(USD ingresos Amex)
 # y USD_fila = Monto_COP / TRM_fila (la TRM del histórico YA incluye el spread +125, así que
 # COP/TRM recupera el USD original — no se ajusta spread).
 #   - Solo casilleros Amex (AMEX_USUARIOS: 11591, 1444, 13608).
 #   - Identifica las filas de tarjeta por Motivo EXACTO ∈ {"Tarjeta Amex", "Tarjeta Rakuten",
-#     "Tarjeta Robinhood"} y SUMA todas al mismo incentivo mensual de 1444 (un solo
+#     "Tarjeta Robinhood", "Tarjeta Capital"} y SUMA todas al mismo incentivo mensual de 1444 (un solo
 #     incentivoamex_1444_<mes>), EXCLUYENDO
 #     las propias filas de incentivo. (Motivo exacto = más robusto que buscar el texto "amex".)
 #   - Idempotente: Orden único incentivoamex_<cas>_<YYYY-MM> + chequeo de existencia (no recrea
@@ -1913,7 +2274,8 @@ def agregar_incentivo_amex(combinado, cas, usuario, fecha_carga):
     # Más robusto que el texto "amex" suelto (evita falsos positivos si un merchant se llamara
     # "Rakuten X"/"Amex Y"). Nota: las filas backoffice legacy "Compra Amex" (Motivo vacío) NO
     # entran — son pre-INCENTIVO_MES_INICIO, fuera de la ventana del incentivo.
-    es_tarjeta = motivo_s.str.strip().isin(["Tarjeta Amex", "Tarjeta Rakuten", "Tarjeta Robinhood"])
+    es_tarjeta = motivo_s.str.strip().isin(["Tarjeta Amex", "Tarjeta Rakuten", "Tarjeta Robinhood",
+                                            "Tarjeta Capital"])
     es_incentivo = orden_s.str.startswith("incentivoamex_") | motivo_s.str.strip().eq("Incentivo Amex")
     tarjeta_mask = es_tarjeta & ~es_incentivo & tipo_u.isin(["EGRESO", "INGRESO"])
 
@@ -3182,6 +3544,78 @@ def main():
         st.info("📂 Aún no subes el CSV de Tarjeta Robinhood")
 
 
+    st.markdown("---")
+    st.header("3.5) Tarjeta Capital")
+
+    capital_file = st.file_uploader(
+        "Sube el CSV de Capital One (columnas: Transaction Date, Posted Date, Card No., "
+        "Description, Category, Debit, Credit)",
+        type=["csv"],
+        key="capital_uploader"
+    )
+
+    capital_may = {}  # dict global para usar después en conciliaciones (solo 13608)
+
+    # Estado del corte de fecha (MUY visible), igual que Amex/Rakuten/Robinhood
+    if CAPITAL_FECHA_DESDE:
+        st.success(f"✅ Corte Capital ACTIVO: solo transacciones con fecha ≥ {CAPITAL_FECHA_DESDE}")
+    else:
+        st.warning("⚠️ Capital INACTIVO — `CAPITAL_FECHA_DESDE` está en None. No se carga ninguna "
+                   "fila (protección anti doble-conteo). Fija la fecha de corte (YYYY-MM-DD).")
+
+    # 📌 REGLA OPERATIVA (cargue 1-a-1): igual que Amex/Rakuten/Robinhood — rango amplio SIEMPRE.
+    st.info("📌 Descarga SIEMPRE el rango COMPLETO disponible en Capital One, NUNCA solo 'el "
+            "último mes': hay compras que asientan tarde y solo salen en exports posteriores. "
+            "Cargar de más NO duplica (el Orden identifica cada transacción y el dedup la "
+            "reemplaza); cargar de menos SÍ pierde compras.")
+    st.caption("💵 **Debit** → Egreso (gasto) · **Credit `Merchandise`** → Ingreso (devolución, "
+               "con la TRM de su compra original) · **`ELECTRONIC PAYMENT`** → se ignora (pago a "
+               "la tarjeta, ni suma ni resta).")
+
+    if capital_file:
+        # 🔒 BLOQUEO DURO: sin fecha de corte NO se procesa nada (se detiene ANTES de procesar).
+        if CAPITAL_FECHA_DESDE is None:
+            st.error("🔒 Cargue Capital BLOQUEADO: no hay fecha de corte definida "
+                     "(CAPITAL_FECHA_DESDE=None). Define la fecha de corte antes de cargar.")
+            st.stop()
+
+        # 🛡️ LISTA DE EXCLUSIÓN obligatoria (anti-doble-cobro), igual que las otras 3.
+        try:
+            tarjetas_cobradas_cp, tarjetas_pendientes_cp, tarjetas_cobradas_cp_df = cargar_tarjetas_cobradas()
+            st.caption(f"🛡️ Lista de exclusión cargada: {len(tarjetas_cobradas_cp)} Orden ya "
+                       f"cobrados + {len(tarjetas_pendientes_cp)} pendientes de rematch.")
+            _aviso_barrera_atributos(tarjetas_cobradas_cp_df)
+        except Exception as e:
+            st.error(f"🔒 Cargue Capital BLOQUEADO: no se pudo leer '{TARJETAS_COBRADAS_FILENAME}' "
+                     f"desde Dropbox ({e}). Sin la lista de exclusión se recobrarían "
+                     f"transacciones ya cobradas. NO se procesa nada.")
+            st.stop()
+
+        try:
+            df_capital = pd.read_csv(capital_file)
+        except Exception as e:
+            st.error(f"❌ No se pudo leer el CSV Capital One: {e}")
+            df_capital = None
+
+        if df_capital is not None:
+            try:
+                capital_may = procesar_capital(df_capital, fecha_desde=CAPITAL_FECHA_DESDE,
+                                               cobrados=tarjetas_cobradas_cp,
+                                               pendientes=tarjetas_pendientes_cp,
+                                               hist_tarjetas=_hist_tarjetas_para_trm(),
+                                               cobrados_df=tarjetas_cobradas_cp_df)
+            except ValueError as e:
+                st.error(f"⛔ {e}")
+                st.stop()  # DETENER: falta TRM, columnas o Category nueva (como las otras 3)
+            if not capital_may:
+                st.info("No hay compras Capital (Debit) desde la fecha de corte.")
+            else:
+                for key, dfr in capital_may.items():
+                    st.dataframe(dfr, use_container_width=True)
+    else:
+        st.info("📂 Aún no subes el CSV de Tarjeta Capital")
+
+
     # 3) Ingresos Nathalia Ospina (CA1633)
     st.header("4) Ingresos Nathalia Ospina (CA1633)")
     nat_files = st.file_uploader(
@@ -3651,9 +4085,12 @@ def main():
         # >>> NUEVO: TARJETA ROBINHOOD — módulo paralelo, SOLO 1444 (get devuelve None para el resto) <<<
         robinhood = robinhood_may.get(f"robinhood_{cas}") if 'robinhood_may' in locals() else None
 
+        # >>> NUEVO: TARJETA CAPITAL — módulo paralelo, SOLO 13608 (get devuelve None para el resto) <<<
+        capital = capital_may.get(f"capital_{cas}") if 'capital_may' in locals() else None
+
         # 3) Armar la lista de DataFrames válidos
         frames = []
-        for df in (inc, egr, ext, env, cons, amex, rakuten, robinhood):  # rakuten/robinhood solo 1444
+        for df in (inc, egr, ext, env, cons, amex, rakuten, robinhood, capital):  # rakuten/robinhood 1444, capital 13608
             if df is not None and not df.empty:
                 frames.append(df)
 
@@ -3824,7 +4261,7 @@ def main():
             _amex_stash_1444 = None
             if cas == "1444" and not AMEX_AFECTA_COMISION_1444:
                 _m_amex = combinado["Orden"].astype(str).str.match(
-                    r"^(?:gastoamex|reembolsoamex)_1444_|^(?:amex|rakuten|robinhood)_", na=False
+                    r"^(?:gastoamex|reembolsoamex)_1444_|^(?:amex|rakuten|robinhood|capital)_", na=False
                 )
                 if _m_amex.any():
                     _amex_stash_1444 = combinado[_m_amex].copy()
