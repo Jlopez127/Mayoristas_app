@@ -415,6 +415,18 @@ def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     # 🚩 AQUÍ el cambio: monto viene limpio → solo convertir a entero
     df2["Monto"] = pd.to_numeric(df2["Monto"], errors="coerce").astype(int)
 
+    # 📦 PESO EN LIBRAS (para TARIFA_ENVIO_1444). Sale de la columna PESO del export del portal,
+    # copiada a la hoja "Mayoristas" del archivo intermedio. Se aceptan los alias 'Peso_lb'/'Peso'
+    # y se normaliza al nombre canónico del histórico (COL_PESO_HIST). Si el archivo no trae peso,
+    # la columna queda vacía y la tarifa hace FAIL-SOFT (deja el Monto del portal intacto).
+    _col_peso = next(
+        (c for c in df2.columns if str(c).strip().casefold() in {"peso_lb", "peso"}),
+        None
+    )
+    df2[COL_PESO_HIST] = (
+        pd.to_numeric(df2[_col_peso], errors="coerce") if _col_peso else np.nan
+    )
+
     # Filtrar filas válidas y casilleros conocidos
     df2 = df2.dropna(subset=["Fecha", "Monto"])
     df2 = df2[df2["Casillero"].isin(casilleros_validos)].copy()
@@ -423,7 +435,8 @@ def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     df2 = df2[~_es_envio_bloqueado(df2["Orden"])].copy()
 
     # Orden de columnas
-    cols = ["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Motivo","Nombre del producto"]
+    cols = ["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Motivo","Nombre del producto",
+            COL_PESO_HIST]
     df2 = df2[cols]
 
     # Dict por casillero
@@ -2915,6 +2928,140 @@ TARIFA_MINIMA_ENVIO_USD = {"1633": 14.4}   # casillero -> USD mínimo por envío
 TARIFA_MINIMA_ENVIO_DESDE = "2026-08-04"   # fecha de envío desde la que aplica (>= estricto)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# TARIFA DE ENVÍO POR PESO — CA1444 (Maria Moises). Regla de negocio de ENVÍOS; NADA que ver
+# con tarjetas (las filas de tarjeta llevan Motivo "Tarjeta *" y prefijo en 'Orden', nunca
+# Motivo "Envio").
+#
+#     cobro_usd = max(peso_lb, min_libras) * usd_por_libra + fijo
+#     monto_cop = round(cobro_usd * _amex_trm_dia(fecha))   # _amex_trm_dia YA incluye el +125
+#
+# DIFERENCIA CLAVE CON LA TARIFA MÍNIMA DE 1633: aquella es un PISO (solo sube); esta REEMPLAZA
+# el valor que trae el portal, así que puede subir O BAJAR el Monto. Por eso el resumen de la UI
+# informa explícitamente cuántos envíos BAJARON.
+#
+#   - ALCANCE: TODOS los TIPO ENVIO (Encargomio, Estandar, cualquiera) y todos los perfiles de
+#     envío, incluidos los livianos-de-alto-valor. Sin excepciones (decisión de negocio).
+#   - Se aplica sobre 'combinado' (histórico + lo nuevo) en main(), ANTES del recálculo de totales
+#     y del bloque de comisión quincenal, para que la comisión vea el saldo ya recalculado.
+#     Por eso NO va dentro de procesar_envios_mayoristas, que solo ve el archivo nuevo.
+#   - EL PESO VIAJA Y SE GUARDA: procesar_envios_mayoristas trae el peso del archivo de envíos y
+#     la función lo persiste en la columna COL_PESO_HIST del histórico. Eso hace la regla
+#     IDEMPOTENTE (fijar el valor exacto es punto fijo) y AUDITABLE, sin depender de tener el
+#     export del portal a mano en cada corrida.
+#   - FAIL-SOFT SIN TRM (igual que 1633): si falta la TRM del día —pasa con envíos fechados
+#     hoy/mañana, cuando datos.gov.co aún no publica— se AVISA y la fila queda INTACTA. NO se
+#     aborta el cargue: se reevalúa en cada corrida y se auto-corrige cuando la TRM aparezca.
+#   - FAIL-SOFT SIN PESO (propio de esta regla): si el peso viene vacío / 0 / negativo / no
+#     numérico se AVISA y la fila queda INTACTA con el valor del portal. NO se aplica el mínimo
+#     de 1 libra por defecto: un peso ausente es un ERROR DE DATOS, y cobrar 11 USD por un envío
+#     grande sería un error caro y silencioso.
+#   - La TRM usada se escribe en la columna 'TRM' de las filas recalculadas como rastro de
+#     auditoría. VERIFICADO que es invisible en Dash.py: la hoja de 1444 SÍ conserva la columna
+#     TRM (load_data, línea ~75) pero solo la muestra en la tabla de INGRESOS (Tipo == 'Ingreso',
+#     líneas ~1068 y ~1106); la tabla de EGRESOS —donde viven los envíos— selecciona únicamente
+#     ['Fecha','Orden','Monto','Nombre del producto'] (línea ~1156).
+#
+# 1444: entra en vigor el 2026-08-14. ⚠️ NO mover la fecha hacia atrás: alcanzaría envíos de
+# quincenas YA COMISIONADAS y, como las quincenas con inicio >= CUTOFF_COMISION_NUEVA
+# (2026-05-16) se REESCRIBEN en cada corrida, la comisión de esos períodos se recalcularía en
+# silencio, sin ningún aviso.
+# ──────────────────────────────────────────────────────────────────────────────
+COL_PESO_HIST = "Peso_lb"   # nombre canónico del peso (LIBRAS) en el histórico y en el pipeline
+
+TARIFA_ENVIO_1444 = {"usd_por_libra": 6.0, "fijo": 5.0, "min_libras": 1.0}
+TARIFA_ENVIO_1444_DESDE = "2026-08-14"   # fecha de envío desde la que aplica (>= estricto)
+
+
+def aplicar_tarifa_envio_por_peso(combinado: pd.DataFrame, cas: str, conf: dict, desde: str):
+    """Recalcula por PESO el Monto de los envíos de 'cas' con Fecha >= 'desde'.
+
+    Devuelve (df, resumen). 'resumen' = {"recalculadas": n, "subieron": n, "bajaron": n,
+    "cop": delta_total, "sin_trm": [fechas], "sin_peso": [(fecha, orden)], "detalle": [...],
+    "evaluadas": n} para mostrarlo en la UI.
+
+    NO toca: filas que no sean envíos, envíos anteriores al corte, filas de otro casillero, ni
+    envíos sin peso o sin TRM del día. Ver el bloque de arriba para el porqué de cada decisión.
+    """
+    resumen = {"recalculadas": 0, "subieron": 0, "bajaron": 0, "cop": 0.0,
+               "sin_trm": [], "sin_peso": [], "detalle": [], "evaluadas": 0}
+    if combinado is None or combinado.empty:
+        return combinado, resumen
+
+    df = combinado.copy()
+    for c in ("Motivo", "Fecha", "Monto"):
+        if c not in df.columns:
+            return combinado, resumen
+    if "TRM" not in df.columns:
+        df["TRM"] = ""
+    if COL_PESO_HIST not in df.columns:
+        df[COL_PESO_HIST] = ""
+
+    _fecha = pd.to_datetime(df["Fecha"], errors="coerce")
+    _monto = pd.to_numeric(df["Monto"], errors="coerce")
+    _peso = pd.to_numeric(df[COL_PESO_HIST], errors="coerce")
+
+    # Casillero: el bucle de main() ya trabaja hoja por hoja, así que esto es una malla de
+    # seguridad. Un valor vacío se acepta (la hoja ya es la del casillero); uno que diga
+    # explícitamente OTRO casillero se descarta.
+    _cas = df["Casillero"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    _cas_ok = _cas.eq(str(cas)) | _cas.str.lower().isin({"", "nan", "none"})
+
+    # 🔒 Filtro ESTRICTO: solo envíos, solo de este casillero, solo con fecha >= corte.
+    _sel = (
+        df["Motivo"].astype(str).str.strip().str.casefold().eq("envio")
+        & _cas_ok
+        & _fecha.notna()
+        & (_fecha >= pd.Timestamp(desde))
+        & _monto.notna()
+    )
+    if not _sel.any():
+        return combinado, resumen
+    resumen["evaluadas"] = int(_sel.sum())
+
+    # FAIL-SOFT sin peso: fuera del recálculo, con aviso. Se deja el Monto del portal.
+    _sin_peso = _sel & (_peso.isna() | (_peso <= 0))
+    if _sin_peso.any():
+        resumen["sin_peso"] = [
+            (str(_fecha.loc[i].date()), str(df.at[i, "Orden"])) for i in df.index[_sin_peso]
+        ]
+        _sel = _sel & ~_sin_peso
+    if not _sel.any():
+        return df, resumen
+
+    usd_lb = float(conf["usd_por_libra"])
+    fijo = float(conf["fijo"])
+    min_lb = float(conf["min_libras"])
+
+    trm_cache: dict = {}
+    for f_iso in sorted(_fecha[_sel].dt.strftime("%Y-%m-%d").unique()):
+        trm = _amex_trm_dia(f_iso, trm_cache)   # ya incluye el spread de +125
+        if trm is None:
+            resumen["sin_trm"].append(f_iso)
+            continue                            # FAIL-SOFT: esas filas quedan intactas
+        _dia = _sel & _fecha.dt.strftime("%Y-%m-%d").eq(f_iso)
+        for i in df.index[_dia]:
+            peso = float(_peso.loc[i])
+            usd = max(peso, min_lb) * usd_lb + fijo
+            nuevo = round(usd * float(trm))
+            antes = float(_monto.loc[i])
+            df.at[i, "Monto"] = nuevo
+            df.at[i, "TRM"] = round(float(trm), 2)      # rastro de auditoría
+            df.at[i, COL_PESO_HIST] = peso              # peso usado -> idempotencia
+            if nuevo != antes:
+                resumen["recalculadas"] += 1
+                resumen["cop"] += nuevo - antes
+                if nuevo > antes:
+                    resumen["subieron"] += 1
+                else:
+                    resumen["bajaron"] += 1
+                resumen["detalle"].append(
+                    (f_iso, str(df.at[i, "Orden"]), peso, round(usd, 2), antes, nuevo)
+                )
+    return df, resumen
+
+
+
 def aplicar_tarifa_minima_envios(combinado: pd.DataFrame, cas: str, usd: float, desde: str):
     """Sube al mínimo del día los envíos de 'cas' con Fecha >= 'desde' que estén por debajo.
 
@@ -3058,7 +3205,12 @@ def asegurar_columnas_historico(df):
         "Casillero",
         "Estado de Orden",
         "Nombre del producto",
-        "Fecha de Carga"
+        "Fecha de Carga",
+        # 📦 Peso en LIBRAS del envío (TARIFA_ENVIO_1444). Solo lo llenan las filas de envío de
+        # los casilleros con tarifa por peso; en el resto queda vacío. Se declara aquí para que
+        # la columna PERSISTA en el histórico corrida tras corrida (es lo que hace la regla
+        # idempotente y auditable). Invisible para Dash.py, que selecciona columnas por nombre.
+        COL_PESO_HIST,
     ]
 
     for col in columnas_base:
@@ -4345,6 +4497,41 @@ def main():
                     st.warning(
                         f"⚠️ Tarifa mínima {cas}: sin TRM para {', '.join(_tm['sin_trm'])} — "
                         f"esos envíos quedaron SIN ajustar (se corrigen solos en la próxima "
+                        f"corrida, cuando datos.gov.co publique la TRM)."
+                    )
+            # -------------------------------------------------------------------------
+
+            # ---- Tarifa de envío POR PESO (CA1444) ----
+            # Mismo punto del pipeline que la tarifa mínima de 1633: sobre 'combinado'
+            # (histórico + lo nuevo) y ANTES del incentivo, del recálculo de totales y del
+            # bloque de comisión quincenal, para que la comisión vea el saldo ya recalculado.
+            # A diferencia de la tarifa mínima, esta REEMPLAZA el valor del portal: puede bajarlo.
+            # Ver el bloque de TARIFA_ENVIO_1444.
+            if cas == "1444":
+                combinado, _tp = aplicar_tarifa_envio_por_peso(
+                    combinado, cas,
+                    conf=TARIFA_ENVIO_1444,
+                    desde=TARIFA_ENVIO_1444_DESDE,
+                )
+                if _tp["recalculadas"]:
+                    st.info(
+                        f"📦 Tarifa por peso {cas}: {_tp['recalculadas']} envío(s) recalculados a "
+                        f"(max(lb, {TARIFA_ENVIO_1444['min_libras']:g}) × USD "
+                        f"{TARIFA_ENVIO_1444['usd_por_libra']:g} + USD {TARIFA_ENVIO_1444['fijo']:g}) "
+                        f"desde {TARIFA_ENVIO_1444_DESDE} — {_tp['subieron']} subieron, "
+                        f"{_tp['bajaron']} BAJARON · neto COP {_tp['cop']:+,.0f}."
+                    )
+                if _tp["sin_peso"]:
+                    st.warning(
+                        f"⚠️ Tarifa por peso {cas}: {len(_tp['sin_peso'])} envío(s) SIN PESO "
+                        f"({', '.join(o for _f, o in _tp['sin_peso'][:10])}"
+                        f"{' …' if len(_tp['sin_peso']) > 10 else ''}) — quedaron con el valor del "
+                        f"portal SIN recalcular. Revisa la columna de peso del archivo de envíos."
+                    )
+                if _tp["sin_trm"]:
+                    st.warning(
+                        f"⚠️ Tarifa por peso {cas}: sin TRM para {', '.join(_tp['sin_trm'])} — "
+                        f"esos envíos quedaron SIN recalcular (se corrigen solos en la próxima "
                         f"corrida, cuando datos.gov.co publique la TRM)."
                     )
             # -------------------------------------------------------------------------
