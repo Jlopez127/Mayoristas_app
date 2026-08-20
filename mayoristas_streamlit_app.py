@@ -427,6 +427,17 @@ def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         pd.to_numeric(df2[_col_peso], errors="coerce") if _col_peso else np.nan
     )
 
+    # 💱 TRM del envío: la que usó el portal para convertir el VALOR en USD a COP. Se guarda
+    # como rastro de auditoría (poder reconstruir los USD de cualquier envío desde el histórico,
+    # igual que ya se hace con las filas de tarjeta). Si el archivo no la trae, queda vacía.
+    # ⚠️ Para los envíos de 1444 que pasan por aplicar_tarifa_envio_por_peso, esta TRM se
+    # SOBRESCRIBE después con la TRM oficial de _amex_trm_dia, que es la que de verdad se cobró.
+    # NINGÚN consumidor de la columna TRM se ve afectado: _indice_trm_historico filtra por
+    # Orden.startswith('amex_'/'rakuten_'/...), agregar_incentivo_amex filtra por Motivo de
+    # tarjeta, y el GMF toma la TRM de los INGRESOS. Los envíos no entran en ninguno.
+    _col_trm = next((c for c in df2.columns if str(c).strip().casefold() == "trm"), None)
+    df2["TRM"] = pd.to_numeric(df2[_col_trm], errors="coerce") if _col_trm else np.nan
+
     # Filtrar filas válidas y casilleros conocidos
     df2 = df2.dropna(subset=["Fecha", "Monto"])
     df2 = df2[df2["Casillero"].isin(casilleros_validos)].copy()
@@ -436,7 +447,7 @@ def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
     # Orden de columnas
     cols = ["Fecha","Tipo","Monto","Orden","Usuario","Casillero","Motivo","Nombre del producto",
-            COL_PESO_HIST]
+            COL_PESO_HIST, "TRM"]
     df2 = df2[cols]
 
     # Dict por casillero
@@ -3206,8 +3217,9 @@ def asegurar_columnas_historico(df):
         "Estado de Orden",
         "Nombre del producto",
         "Fecha de Carga",
-        # 📦 Peso en LIBRAS del envío (TARIFA_ENVIO_1444). Solo lo llenan las filas de envío de
-        # los casilleros con tarifa por peso; en el resto queda vacío. Se declara aquí para que
+        # 📦 Peso en LIBRAS del envío (TARIFA_ENVIO_1444). Lo llenan TODAS las filas de envío
+        # cuyo archivo de origen traiga la columna PESO, sin importar el casillero (en 1444 es
+        # además la entrada de la tarifa por peso). Se declara aquí para que
         # la columna PERSISTA en el histórico corrida tras corrida (es lo que hace la regla
         # idempotente y auditable). Invisible para Dash.py, que selecciona columnas por nombre.
         COL_PESO_HIST,
