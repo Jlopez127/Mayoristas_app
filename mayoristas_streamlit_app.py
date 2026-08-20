@@ -2945,7 +2945,19 @@ TARIFA_MINIMA_ENVIO_DESDE = "2026-08-04"   # fecha de envío desde la que aplica
 # Motivo "Envio").
 #
 #     cobro_usd = max(peso_lb, min_libras) * usd_por_libra + fijo
-#     monto_cop = round(cobro_usd * _amex_trm_dia(fecha))   # _amex_trm_dia YA incluye el +125
+#     monto_cop = round(cobro_usd * TRM_de_la_fila)         # la TRM del archivo de envíos
+#
+# 💱 LA TRM ES LA DEL ARCHIVO DE ENVÍOS, NO la de datos.gov.co (decisión de negocio,
+# 2026-08-20). Antes esta regla consultaba _amex_trm_dia (oficial + 125); ahora usa la TRM
+# que el portal trae en cada fila, que es la MISMA con la que se cobra a todos los demás
+# casilleros (el generador del archivo hace Valor_cop = TRM_portal × VALOR). Así 1444 queda
+# consistente con el resto y el cobro coincide con lo que cotizó el portal.
+#   · CONSECUENCIA CONOCIDA Y ACEPTADA: el portal puede traer VARIAS TRM el mismo día (la del
+#     momento de cada cotización: hasta 3 el 19-ago-2026), así que dos envíos idénticos del
+#     mismo día pueden costar distinto. Medido sobre 553 envíos desde jul-2026, la TRM del
+#     portal coincide con oficial+125 en el 49% de los casos y se desvía entre -109 y +86 COP.
+#   · SIGUE SIENDO IDEMPOTENTE: la TRM viaja en la fila y se persiste en la columna TRM, así
+#     que recalcular sobre el resultado da exactamente lo mismo (punto fijo).
 #
 # DIFERENCIA CLAVE CON LA TARIFA MÍNIMA DE 1633: aquella es un PISO (solo sube); esta REEMPLAZA
 # el valor que trae el portal, así que puede subir O BAJAR el Monto. Por eso el resumen de la UI
@@ -2960,18 +2972,17 @@ TARIFA_MINIMA_ENVIO_DESDE = "2026-08-04"   # fecha de envío desde la que aplica
 #     la función lo persiste en la columna COL_PESO_HIST del histórico. Eso hace la regla
 #     IDEMPOTENTE (fijar el valor exacto es punto fijo) y AUDITABLE, sin depender de tener el
 #     export del portal a mano en cada corrida.
-#   - FAIL-SOFT SIN TRM (igual que 1633): si falta la TRM del día —pasa con envíos fechados
-#     hoy/mañana, cuando datos.gov.co aún no publica— se AVISA y la fila queda INTACTA. NO se
-#     aborta el cargue: se reevalúa en cada corrida y se auto-corrige cuando la TRM aparezca.
+#   - FAIL-SOFT SIN TRM: si la fila no trae TRM (vacía / 0 / negativa / no numérica) se AVISA y
+#     la fila queda INTACTA con el valor del portal. NO se aborta el cargue: se reevalúa en cada
+#     corrida y se auto-corrige en cuanto el archivo de envíos traiga la TRM.
 #   - FAIL-SOFT SIN PESO (propio de esta regla): si el peso viene vacío / 0 / negativo / no
 #     numérico se AVISA y la fila queda INTACTA con el valor del portal. NO se aplica el mínimo
 #     de 1 libra por defecto: un peso ausente es un ERROR DE DATOS, y cobrar 11 USD por un envío
 #     grande sería un error caro y silencioso.
-#   - La TRM usada se escribe en la columna 'TRM' de las filas recalculadas como rastro de
-#     auditoría. VERIFICADO que es invisible en Dash.py: la hoja de 1444 SÍ conserva la columna
-#     TRM (load_data, línea ~75) pero solo la muestra en la tabla de INGRESOS (Tipo == 'Ingreso',
-#     líneas ~1068 y ~1106); la tabla de EGRESOS —donde viven los envíos— selecciona únicamente
-#     ['Fecha','Orden','Monto','Nombre del producto'] (línea ~1156).
+#   - La TRM usada se escribe en la columna 'TRM' de las filas recalculadas, y es lo que hace la
+#     regla idempotente además de auditable. Dash.py la MUESTRA en la tabla de egresos como
+#     columna "TRM" (leída de 'TRM_envio', el valor crudo capturado en load_data antes del +100
+#     que se le suma a la TRM de 1444 para convertir sus ingresos en USD).
 #
 # 1444: entra en vigor el 2026-08-14. ⚠️ NO mover la fecha hacia atrás: alcanzaría envíos de
 # quincenas YA COMISIONADAS y, como las quincenas con inicio >= CUTOFF_COMISION_NUEVA
@@ -3044,31 +3055,39 @@ def aplicar_tarifa_envio_por_peso(combinado: pd.DataFrame, cas: str, conf: dict,
     fijo = float(conf["fijo"])
     min_lb = float(conf["min_libras"])
 
-    trm_cache: dict = {}
-    for f_iso in sorted(_fecha[_sel].dt.strftime("%Y-%m-%d").unique()):
-        trm = _amex_trm_dia(f_iso, trm_cache)   # ya incluye el spread de +125
-        if trm is None:
-            resumen["sin_trm"].append(f_iso)
-            continue                            # FAIL-SOFT: esas filas quedan intactas
-        _dia = _sel & _fecha.dt.strftime("%Y-%m-%d").eq(f_iso)
-        for i in df.index[_dia]:
-            peso = float(_peso.loc[i])
-            usd = max(peso, min_lb) * usd_lb + fijo
-            nuevo = round(usd * float(trm))
-            antes = float(_monto.loc[i])
-            df.at[i, "Monto"] = nuevo
-            df.at[i, "TRM"] = round(float(trm), 2)      # rastro de auditoría
-            df.at[i, COL_PESO_HIST] = peso              # peso usado -> idempotencia
-            if nuevo != antes:
-                resumen["recalculadas"] += 1
-                resumen["cop"] += nuevo - antes
-                if nuevo > antes:
-                    resumen["subieron"] += 1
-                else:
-                    resumen["bajaron"] += 1
-                resumen["detalle"].append(
-                    (f_iso, str(df.at[i, "Orden"]), peso, round(usd, 2), antes, nuevo)
-                )
+    # 💱 La TRM sale de la PROPIA FILA (la que trae el archivo de envíos), no de datos.gov.co.
+    # Las filas que ya están en el histórico conservan la TRM con la que se cobraron, así que
+    # recalcular sobre ellas reproduce el mismo Monto: la regla es punto fijo.
+    _trm_fila = pd.to_numeric(df["TRM"], errors="coerce")
+
+    # FAIL-SOFT sin TRM: fuera del recálculo, con aviso. Se deja el Monto del portal.
+    _sin_trm = _sel & (_trm_fila.isna() | (_trm_fila <= 0))
+    if _sin_trm.any():
+        resumen["sin_trm"] = [str(df.at[i, "Orden"]) for i in df.index[_sin_trm]]
+        _sel = _sel & ~_sin_trm
+    if not _sel.any():
+        return df, resumen
+
+    for i in df.index[_sel]:
+        trm = float(_trm_fila.loc[i])
+        peso = float(_peso.loc[i])
+        usd = max(peso, min_lb) * usd_lb + fijo
+        nuevo = round(usd * trm)
+        antes = float(_monto.loc[i])
+        df.at[i, "Monto"] = nuevo
+        df.at[i, "TRM"] = round(trm, 2)             # la TRM cobrada -> idempotencia + auditoría
+        df.at[i, COL_PESO_HIST] = peso              # peso usado -> idempotencia
+        if nuevo != antes:
+            resumen["recalculadas"] += 1
+            resumen["cop"] += nuevo - antes
+            if nuevo > antes:
+                resumen["subieron"] += 1
+            else:
+                resumen["bajaron"] += 1
+            resumen["detalle"].append(
+                (str(_fecha.loc[i].date()), str(df.at[i, "Orden"]), peso, round(usd, 2),
+                 antes, nuevo)
+            )
     return df, resumen
 
 
@@ -4542,9 +4561,10 @@ def main():
                     )
                 if _tp["sin_trm"]:
                     st.warning(
-                        f"⚠️ Tarifa por peso {cas}: sin TRM para {', '.join(_tp['sin_trm'])} — "
-                        f"esos envíos quedaron SIN recalcular (se corrigen solos en la próxima "
-                        f"corrida, cuando datos.gov.co publique la TRM)."
+                        f"⚠️ Tarifa por peso {cas}: {len(_tp['sin_trm'])} envío(s) SIN TRM "
+                        f"({', '.join(_tp['sin_trm'][:10])}"
+                        f"{' …' if len(_tp['sin_trm']) > 10 else ''}) — quedaron con el valor del "
+                        f"portal SIN recalcular. Revisa la columna TRM del archivo de envíos."
                     )
             # -------------------------------------------------------------------------
 
