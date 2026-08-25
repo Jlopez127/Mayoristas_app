@@ -83,7 +83,7 @@ def upload_to_dropbox(data: bytes):
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
 # Prefijos de 'Orden' que identifican filas escritas por los módulos de tarjeta.
-TARJETA_ORDEN_RE = r"^(?:amex_|rakuten_|robinhood_|capital_|gastoamex|reembolsoamex)"
+TARJETA_ORDEN_RE = r"^(?:amex_|rakuten_|robinhood_|capital_|usbank_|gastoamex|reembolsoamex)"
 
 
 def _es_not_found(e: Exception) -> bool:
@@ -698,7 +698,7 @@ def cargar_hist_tarjetas():
         if "Orden" not in _dfh.columns:
             continue
         _o = _dfh["Orden"].astype(str).str.strip()
-        _sel = _dfh[_o.str.startswith(("amex_", "rakuten_", "robinhood_", "capital_"))]
+        _sel = _dfh[_o.str.startswith(("amex_", "rakuten_", "robinhood_", "capital_", "usbank_"))]
         if len(_sel):
             partes.append(_sel)
     return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
@@ -2235,6 +2235,392 @@ def procesar_capital(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendient
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Cargue "Tarjeta US Bank" (US Bank 0613, 5ª tarjeta; módulo PARALELO, NO reusa procesar_*).
+# Es la PRIMERA tarjeta MULTI-CASILLERO: una sola cuenta con varias sub-tarjetas, cada una de
+# un mayorista distinto. Fuente: CSV US Bank (Date, Transaction, Name, Memo, Amount).
+#
+#   - 🔑 SEGMENTACIÓN POR SUB-TARJETA, NO POR NOMBRE. El campo 'Memo' trae 6 subcampos
+#     separados por ';':
+#         <referencia>; <mcc>; <cod><cod><APELLIDO,NOMBRE>; ; ; <cod>0
+#              [0]        [1]              [2]              [3][4]   [5]
+#     El código de sub-tarjeta son los 4 primeros dígitos de [2] y es la LLAVE. El nombre que
+#     sigue es solo control cruzado: si no coincide con el código se AVISA y manda el código.
+#     Se hace así a propósito — en Amex hubo que mantener dos grafías de la misma persona
+#     ('K LOPEZ VELANDIA' / 'KELLY P LOPEZVELANDIA') porque el emisor cambia la escritura.
+#     El código no cambia nunca.
+#
+#   - 💵 CLASIFICACIÓN — las reglas se evalúan EN ESTE ORDEN, la primera que aplica decide:
+#       1. titular vacío            -> IGNORAR
+#       2. MCC 00300                -> IGNORAR (pago a la tarjeta)
+#       3. MCC 00761                -> IGNORAR (cuota de manejo)
+#       4. código 0534 (Santiago)   -> IGNORAR (no es mayorista)
+#       5. beneficio Amazon         -> IGNORAR (ver abajo)
+#       6. DEBIT                    -> Egreso  (compra)
+#       7. CREDIT                   -> Ingreso (devolución)
+#
+#     ⚠️ LA REGLA 1 VA PRIMERA Y NO ES NEGOCIABLE. En el extracto de agosto hay un par
+#     'PYMT REVERSAL' (DEBIT -6.022,36) / 'PYMT THANK YOU' (CREDIT +6.022,36) del 19-ago con
+#     MCC 05999, NO 00300: un pago a la tarjeta que rebotó y se reversó. Filtrando solo por MCC
+#     entrarían 6.022 USD como gasto real de alguien. Lo ÚNICO que los distingue es el titular
+#     vacío.
+#
+#     ⚠️ EL MCC NO IDENTIFICA DEVOLUCIONES. De los 57 CREDIT con titular, 56 llevan MCC 05999
+#     pero uno lleva 05311 (conservó el MCC del comercio). La regla correcta es
+#     'CREDIT + titular + no es pago', NUNCA 'MCC == 05999'.
+#
+#   - 🔴 BENEFICIO AMAZON (USBANK_EXCLUIR_BENEFICIO_AMAZON): las filas CREDIT rotuladas
+#     'AMAZON PAY YOUR CHARGES' NO son devoluciones del mayorista: son el abono del acuerdo
+#     comercial de Amazon a la cuenta (Amazon lo tenía con Amex y lo trasladó a US Bank). El
+#     beneficio lo consiguió Encargomio, no el mayorista. En el extracto de agosto son 31 filas
+#     por 7.216,61 USD (~23,3 M COP), todas del 19-ago y todas en la sub-tarjeta madre 2529;
+#     pasárselas a Maria como devolución sería regalarle ese margen. Tres evidencias:
+#       · es la única etiqueta que existe SOLO del lado del crédito — toda devolución real llega
+#         con el nombre del comercio, idéntico al de su compra (Amazon devuelve como
+#         'AMAZON MARKETPLACE NA PA', eBay como 'PAYPAL *EBAY 800-456-3229');
+#       · se pega en la sub-tarjeta madre de la cuenta, donde también caen los pagos;
+#       · las devoluciones reales siguen al comprador: Santiago devolvió 280,97 USD en eBay y el
+#         crédito quedó en SU sub-tarjeta 0534. Ninguna de las 31 llegó a Santiago, Julian ni
+#         Paula, pese a que los tres compraron en Amazon.
+#     Es una PERILLA a propósito: si el PDF del extracto demostrara que son returns, se pone en
+#     False y se recarga (el cargue es idempotente).
+#
+#   - 1-a-1: Orden HÍBRIDO, porque no todas las filas traen referencia.
+#       · con referencia -> "usbank_<referencia>"  (referencia numérica de 18 o 23 dígitos;
+#         VERIFICADO: 0 duplicadas entre las filas cargables)
+#       · sin referencia -> "usbank_<sha1-12 de 'Date|Amount|Name_norm|seq'>"
+#     EL 'seq' NO ES OPCIONAL: entre las filas sin referencia hay 3 colisiones exactas de
+#     (Date, Amount, Name) que afectan 6 filas (688,16 · 673,44 · 629,28, todas de Kelly). Sin
+#     seq se colapsarían de a pares y se perderían ~1.991 USD. El seq se asigna sobre ORDEN
+#     CANÓNICO (Date, Amount, Name) y NO sobre el orden de lectura, para que dos descargas den
+#     el mismo seq a la misma transacción (misma razón que Robinhood y Capital). El hash NO usa
+#     hora: el archivo no la trae.
+#
+#   - USD -> COP con la MISMA TRM que Amex (_amex_trm_dia: datos.gov.co, +125), por el día de
+#     'Date'. *** SIN TRM de respaldo: si falta la de un día con movimiento, ValueError. ***
+#   - Motivo = "Tarjeta US Bank" (tag EXACTO que capta agregar_incentivo_amex).
+#   - REEMBOLSOS: cada Ingreso se convierte con la TRM DE SU COMPRA ORIGINAL (las 3 pasadas de
+#     _resolver_trm_reembolsos). ⚠️ El 'Name' de US Bank es GENÉRICO ('PAYPAL *EBAY 800-456-3229'
+#     se repite en cientos de compras), así que el emparejamiento por merchant es mucho menos
+#     preciso que en Capital (que trae el order-id de eBay). Se ESPERA que varias devoluciones
+#     caigan en el fallback de "TRM de su propio día" con warning; es aceptable porque compras y
+#     devoluciones son del mismo día y la TRM coincide. NO forzar el emparejamiento.
+#   - COMISIÓN: 1444 SÍ tiene comisión quincenal y USBANK_AFECTA_COMISION_1444=True, así que
+#     estas filas ENTRAN en la base de la comisión (igual que Amex/Rakuten/Robinhood).
+# ──────────────────────────────────────────────────────────────────────────────
+USBANK_CARD_NO = "0613"
+USBANK_COLS = ["Date", "Transaction", "Name", "Memo", "Amount"]
+USBANK_MCC_PAGO = "00300"        # pago a la tarjeta: se ignora SIEMPRE
+USBANK_MCC_FEE = "00761"         # cuota de manejo: se ignora SIEMPRE
+USBANK_MAP_SUBTARJETA = {"2529": "1444", "0598": "11591", "0609": "13608"}
+USBANK_SUBTARJETAS_IGNORAR = {"0534"}      # Santiago Largo: no es mayorista
+USBANK_NOMBRE_ESPERADO = {                 # solo control cruzado (el código manda)
+    "2529": "LOPEZ VELANDIA,KELLY P",
+    "0598": "HERRERA,PAULA",
+    "0609": "SANCHEZ,JULIAN",
+    "0534": "LARGO,SANTIAGO",
+}
+USBANK_USUARIOS = {"1444": "Maria Moises", "11591": "Paula Herrera", "13608": "Julian Sanchez"}
+USBANK_MOTIVO = "Tarjeta US Bank"
+# 🚦 True (decisión vigente) -> las filas de US Bank ENTRAN en la base de la comisión de 1444.
+USBANK_AFECTA_COMISION_1444 = True
+# 🚦 True (decisión vigente) -> el abono 'AMAZON PAY YOUR CHARGES' NO se le pasa al mayorista.
+USBANK_EXCLUIR_BENEFICIO_AMAZON = True
+USBANK_ETIQUETA_BENEFICIO = "AMAZON PAY YOUR CHARGES"
+
+# 🚦 FECHA DE CORTE — MISMAS 3 reglas que las otras 4 tarjetas. Es LÍMITE DE SANIDAD, no un
+# corte real: la historia completa de la tarjeta arranca el 2026-08-17, así que no deja nada
+# afuera. ⚠️ NO MOVERLA HACIA ATRÁS NUNCA: alcanzaría quincenas ya comisionadas de 1444 y, como
+# las de inicio >= CUTOFF_COMISION_NUEVA se reescriben en cada corrida, la comisión se
+# recalcularía EN SILENCIO.  None -> INACTIVO (kill switch).
+USBANK_FECHA_DESDE = "2026-08-17"
+
+
+def _usbank_partes(df: pd.DataFrame) -> pd.DataFrame:
+    """Parte el 'Memo' en sus subcampos y devuelve las columnas auxiliares (_ref/_mcc/_cod)."""
+    p = df["Memo"].astype(str).str.split(";")
+    out = pd.DataFrame(index=df.index)
+    out["_ref"] = p.str[0].str.strip()
+    out["_mcc"] = p.str[1].str.strip()
+    out["_tit"] = p.str[2].str.strip()
+    out["_cod"] = out["_tit"].str[:4]
+    # El código va REPETIDO antes del nombre ("25292529LOPEZ VELANDIA,KELLY P"), así que el
+    # nombre empieza en la posición 8, no en la 4.
+    out["_nom"] = out["_tit"].str[8:].str.strip()
+    return out
+
+
+def _usbank_es_beneficio(df: pd.DataFrame) -> pd.Series:
+    """Filas del abono comercial de Amazon (no son devolución del mayorista)."""
+    return (df["Transaction"].astype(str).str.strip().str.upper().eq("CREDIT")
+            & df["Name"].astype(str).str.upper().str.contains(
+                USBANK_ETIQUETA_BENEFICIO, regex=False, na=False))
+
+
+def _usbank_clave_y_seq(df: pd.DataFrame):
+    """Clave e índice de repetición para las filas SIN referencia.
+
+    Clave = Date | Amount | Name normalizado (valores CRUDOS del CSV). El 'seq' se asigna sobre
+    ORDEN CANÓNICO (clave) y NO sobre el orden de lectura, para que dos descargas den el mismo
+    seq a la misma transacción. Dos filas con la misma clave son idénticas en todo lo que se
+    hashea, así que da igual cuál recibe 0 o 1.
+    """
+    clave = (df["Date"].astype(str).str.strip() + "|"
+             + df["Amount"].astype(str).str.strip() + "|"
+             + df["Name"].map(_norm_merchant))
+    canon = pd.DataFrame({"_k": clave}).sort_values("_k", kind="mergesort")
+    seq = canon.groupby("_k").cumcount().reindex(df.index).astype(str)
+    return clave, seq
+
+
+def _usbank_orden(ref: pd.Series, clave: pd.Series, seq: pd.Series) -> pd.Series:
+    """Orden híbrido: la referencia cuando existe; si no, sha1-12 de 'clave|seq'."""
+    hashed = (clave + "|" + seq).map(
+        lambda s: "usbank_" + hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
+    )
+    return np.where(ref.ne(""), "usbank_" + ref, hashed)
+
+
+def procesar_usbank(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None,
+                    hist_tarjetas=None, cobrados_df=None) -> dict[str, pd.DataFrame]:
+    """Transforma el CSV de US Bank en {usbank_<casillero>: DF} con UNA fila COP por movimiento.
+
+    Es MULTI-CASILLERO: devuelve una entrada por cada casillero con movimientos. Levanta
+    ValueError si faltan columnas o si falta la TRM de cualquier día con movimiento.
+    'cobrados' (OBLIGATORIO) = set de Orden ya cobrados. 'pendientes' se acepta por simetría de
+    firma pero NO se usa: US Bank no tiene auth pendientes de rematch.
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    faltan = [c for c in USBANK_COLS if c not in df.columns]
+    if faltan:
+        raise ValueError(f"El CSV de US Bank no tiene las columnas esperadas: {', '.join(faltan)}.")
+
+    if fecha_desde is None:
+        return {}
+
+    if cobrados is None:
+        raise ValueError(
+            "Falta la lista de exclusión 'tarjetas cobradas' (cobrados=None). "
+            "No se procesa nada: sin la lista se recobrarían transacciones ya cobradas."
+        )
+
+    aux = _usbank_partes(df)
+    df = pd.concat([df, aux], axis=1)
+
+    df["_fecha"] = pd.to_datetime(df["Date"], errors="coerce")
+    if df["_fecha"].isna().any():
+        raise ValueError(
+            f"US Bank: {int(df['_fecha'].isna().sum())} fila(s) con 'Date' ilegible. "
+            f"No se genera ningún movimiento."
+        )
+    df["_amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+    if df["_amount"].isna().any():
+        raise ValueError(
+            f"US Bank: {int(df['_amount'].isna().sum())} fila(s) con 'Amount' ilegible. "
+            f"No se genera ningún movimiento."
+        )
+    _tx = df["Transaction"].astype(str).str.strip().str.upper()
+    _tx_raras = sorted(set(_tx.unique()) - {"DEBIT", "CREDIT"})
+    if _tx_raras:
+        raise ValueError(
+            f"US Bank: 'Transaction' NO reconocido: {', '.join(_tx_raras)}. "
+            f"Esperados: DEBIT / CREDIT. No se genera ningún movimiento."
+        )
+
+    # Rango del extracto (sobre TODAS las filas) para la 2ª barrera.
+    _rango_extracto = (df["_fecha"].min(), df["_fecha"].max()) if len(df) else None
+
+    # ── DESCARTES, en el orden de las reglas ─────────────────────────────────
+    _sin_tit = df["_tit"].eq("")
+    _pago = ~_sin_tit & df["_mcc"].eq(USBANK_MCC_PAGO)
+    _fee = ~_sin_tit & ~_pago & df["_mcc"].eq(USBANK_MCC_FEE)
+    _ignorar_cod = ~_sin_tit & ~_pago & ~_fee & df["_cod"].isin(USBANK_SUBTARJETAS_IGNORAR)
+    _benef = pd.Series(False, index=df.index)
+    if USBANK_EXCLUIR_BENEFICIO_AMAZON:
+        _benef = ~_sin_tit & ~_pago & ~_fee & ~_ignorar_cod & _usbank_es_beneficio(df)
+
+    # Avisos (por NATURALEZA del movimiento, que es como se audita el extracto)
+    _n_pago_tot = int(df["_mcc"].eq(USBANK_MCC_PAGO).sum())
+    if _n_pago_tot:
+        _cobradas_info(
+            f"ℹ️ US Bank: {_n_pago_tot} pago(s) a la tarjeta ignorados "
+            f"(USD {float(df.loc[df['_mcc'].eq(USBANK_MCC_PAGO), '_amount'].sum()):,.2f}) "
+            f"— no son devolución."
+        )
+    if int(_sin_tit.sum()):
+        _cobradas_info(
+            f"ℹ️ US Bank: {int(_sin_tit.sum())} fila(s) SIN TITULAR ignoradas "
+            f"(reversos de pago y cuotas de la cuenta, no son de ningún mayorista)."
+        )
+    if int(_ignorar_cod.sum()):
+        _cobradas_info(
+            f"ℹ️ US Bank: {int(_ignorar_cod.sum())} fila(s) de sub-tarjetas excluidas "
+            f"({', '.join(sorted(USBANK_SUBTARJETAS_IGNORAR))}) — no son mayoristas."
+        )
+    if int(_benef.sum()):
+        _cobradas_info(
+            f"🎁 US Bank: {int(_benef.sum())} fila(s) de «{USBANK_ETIQUETA_BENEFICIO}» "
+            f"(USD {float(df.loc[_benef, '_amount'].sum()):,.2f}) NO se abonan al mayorista: "
+            f"son el beneficio comercial de Amazon a la cuenta, no una devolución."
+        )
+
+    df = df[~(_sin_tit | _pago | _fee | _ignorar_cod | _benef)].copy()
+    if df.empty:
+        return {}
+
+    # Sub-tarjeta desconocida -> FAIL-LOUD (no adivinar a quién cobrarle).
+    _desconocidas = sorted(set(df["_cod"].unique()) - set(USBANK_MAP_SUBTARJETA))
+    if _desconocidas:
+        raise ValueError(
+            f"US Bank: sub-tarjeta(s) NO mapeada(s): {', '.join(_desconocidas)}. "
+            f"Añádelas a USBANK_MAP_SUBTARJETA o a USBANK_SUBTARJETAS_IGNORAR. "
+            f"No se genera ningún movimiento."
+        )
+
+    # Control cruzado nombre vs código: el CÓDIGO manda, el nombre solo avisa.
+    _esp = df["_cod"].map(USBANK_NOMBRE_ESPERADO)
+    _mismatch = _esp.notna() & df["_nom"].str.upper().ne(_esp.str.upper())
+    if _mismatch.any():
+        _ej = df.loc[_mismatch, ["_cod", "_nom"]].drop_duplicates().head(5)
+        _cobradas_warn(
+            f"⚠️ US Bank: {int(_mismatch.sum())} fila(s) con el nombre distinto al esperado para "
+            f"su código — se respeta el CÓDIGO: "
+            + "; ".join(f"{r['_cod']} trae '{r['_nom']}' (esperado "
+                        f"'{USBANK_NOMBRE_ESPERADO[r['_cod']]}')" for _, r in _ej.iterrows())
+        )
+
+    df["_cas"] = df["_cod"].map(USBANK_MAP_SUBTARJETA)
+    df["_tipo"] = np.where(
+        df["Transaction"].astype(str).str.strip().str.upper().eq("DEBIT"), "Egreso", "Ingreso")
+    df["_usd"] = df["_amount"].abs()
+    df["_merch_attr"] = df["Name"].map(_norm_merchant)
+
+    # Orden híbrido. Se calcula sobre ESTE universo (antes del corte y de la lista) para que el
+    # 'seq' no dependa de qué filas se filtren después.
+    _clave, _seq = _usbank_clave_y_seq(df)
+    df["_orden"] = _usbank_orden(df["_ref"], _clave, _seq)
+    if df["_orden"].duplicated().any():
+        _dups = df.loc[df["_orden"].duplicated(keep=False), "_orden"].unique()[:5]
+        raise ValueError(
+            f"US Bank: colisión de Orden ({len(_dups)}+ casos, p.ej. {', '.join(_dups)}). "
+            f"Dos movimientos distintos generarían el mismo ID. No se genera ningún movimiento."
+        )
+    _ordenes_universo = set(df["_orden"])
+
+    # 🔁 UNIVERSO DE COMPRAS para emparejar devoluciones: ANTES del corte y de la lista.
+    _compras_universo = [
+        {
+            "id": r["_orden"],
+            "fecha": r["_fecha"],
+            "merch": r["_merch_attr"],
+            "usd": round(float(r["_usd"]), 2),
+            "cm": USBANK_USUARIOS.get(r["_cas"], r["_cas"]),
+            "cas": r["_cas"],
+            "trm_fecha": r["_fecha"].strftime("%Y-%m-%d"),
+        }
+        for _, r in df[df["_tipo"] == "Egreso"].iterrows()
+    ]
+
+    df = df[df["_fecha"] >= pd.Timestamp(fecha_desde)].copy()
+    if df.empty:
+        return {}
+    df["_fecha_iso"] = df["_fecha"].dt.strftime("%Y-%m-%d")
+
+    # 🛡️ Barrera 1 — lista de exclusión por Orden.
+    _ya = df["_orden"].isin(cobrados)
+    if _ya.any():
+        _neg = df[_ya & (df["_tipo"] == "Egreso")]
+        _pos = df[_ya & (df["_tipo"] == "Ingreso")]
+        _cobradas_info(
+            f"🛡️ US Bank: {int(_ya.sum())} movimiento(s) ya liquidados (lista de exclusión) — "
+            f"excluidos: {len(_neg)} compra(s) USD {float(_neg['_usd'].sum()):,.2f} "
+            f"+ {len(_pos)} devolución(es) USD {float(_pos['_usd'].sum()):,.2f}."
+        )
+        df = df[~_ya].copy()
+    if df.empty:
+        return {}
+
+    # 🛡️ Barrera 2 — por atributos (independiente del hash), con SIGNO.
+    df["_tipo_attr"] = df["_tipo"]
+    _drop_attr = _excluir_por_atributos(df, cobrados_df, "usbank", _ordenes_universo,
+                                        _rango_extracto, "US Bank")
+    if _drop_attr:
+        df = df.drop(index=_drop_attr)
+    if df.empty:
+        return {}
+
+    # 🔁 Devolución -> TRM de su compra original.
+    _reembolsos = [
+        {"id": r["_orden"], "fecha": r["_fecha"], "merch": r["_merch_attr"],
+         "usd": round(float(r["_usd"]), 2),
+         "cm": USBANK_USUARIOS.get(r["_cas"], r["_cas"]), "cas": r["_cas"]}
+        for _, r in df[df["_tipo"] == "Ingreso"].iterrows()
+    ]
+    _trm_ok, _trm_sin_match, _trm_ambiguos = _resolver_trm_reembolsos(
+        _reembolsos, _compras_universo,
+        _indice_compras_historico(hist_tarjetas, "usbank_", USBANK_MOTIVO),
+    )
+    if _trm_sin_match:
+        _cobradas_warn(
+            "⚠️ US Bank: {} devolución(es) sin compra original identificable — se usa la TRM de "
+            "su propio día. Es lo ESPERADO en esta tarjeta (el 'Name' es genérico y no distingue "
+            "la compra); el costo en COP es ~0 cuando compra y devolución son del mismo día. "
+            "Revisar solo si alguna es de un día distinto al de su compra: {}"
+            .format(len(_trm_sin_match),
+                    "; ".join(f"{x['fecha']:%Y-%m-%d} USD {x['usd']:.2f} {x['merch'][:32]} "
+                              f"[{x['motivo']}]" for x in _trm_sin_match[:10]))
+        )
+    if _trm_ambiguos:
+        _cobradas_info(
+            f"ℹ️ US Bank: {len(_trm_ambiguos)} devolución(es) tenían varias compras candidatas "
+            f"con TRM distintas; se tomó la compra MÁS RECIENTE anterior a la devolución."
+        )
+
+    # TRM por día (+125), incluidos los días de las compras originales casadas.
+    trm_cache: dict = {}
+    _dias = set(df["_fecha_iso"].unique()) | {
+        f for f, origen, _t, _p in _trm_ok.values() if origen == "extracto"
+    }
+    faltantes = {f for f in sorted(_dias) if _amex_trm_dia(f, trm_cache) is None}
+    if faltantes:
+        raise ValueError(
+            f"Sin TRM (datos.gov.co) para los días con movimiento US Bank: "
+            f"{', '.join(sorted(faltantes))}. No se genera ningún movimiento "
+            f"(no hay TRM de respaldo)."
+        )
+
+    filas = []
+    for _, r in df.iterrows():
+        tipo, f_iso, cas = r["_tipo"], r["_fecha_iso"], r["_cas"]
+        trm = trm_cache[f_iso]
+        etq = "gasto" if tipo == "Egreso" else "devolucion"
+        _m = _trm_ok.get(r["_orden"]) if tipo == "Ingreso" else None
+        if _m:
+            _f_compra, _origen, _trm_hist, _parcial = _m
+            trm = _trm_hist if _origen == "historico" else trm_cache[_f_compra]
+            etq = f"devolucion{' parcial' if _parcial else ''} (TRM compra {_f_compra})"
+        desc = " ".join(str(r["Name"]).split())
+        filas.append({
+            "Fecha": f_iso,
+            "Tipo": tipo,
+            "Monto": round(float(r["_usd"]) * trm),   # COP, POSITIVO (el signo lo lleva 'Tipo')
+            "Orden": r["_orden"],
+            "Motivo": USBANK_MOTIVO,
+            "TRM": round(trm, 2),
+            "Usuario": USBANK_USUARIOS.get(cas, cas),
+            "Casillero": cas,
+            "Estado de Orden": "",
+            "Nombre del producto": f"{USBANK_MOTIVO} - {etq} - {desc}",
+        })
+
+    out = pd.DataFrame(filas)
+    if out.empty:
+        return {}
+    return {f"usbank_{cas}": g.reset_index(drop=True)
+            for cas, g in out.groupby("Casillero")}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # INCENTIVO AMEX MENSUAL (cashback). Por cada mes CERRADO, agrega un Ingreso al casillero
 # = INCENTIVO_COP_POR_USD * USD_neto, donde USD_neto = Σ(USD egresos Amex) − Σ(USD ingresos Amex)
 # y USD_fila = Monto_COP / TRM_fila (la TRM del histórico YA incluye el spread +125, así que
@@ -2299,7 +2685,7 @@ def agregar_incentivo_amex(combinado, cas, usuario, fecha_carga):
     # "Rakuten X"/"Amex Y"). Nota: las filas backoffice legacy "Compra Amex" (Motivo vacío) NO
     # entran — son pre-INCENTIVO_MES_INICIO, fuera de la ventana del incentivo.
     es_tarjeta = motivo_s.str.strip().isin(["Tarjeta Amex", "Tarjeta Rakuten", "Tarjeta Robinhood",
-                                            "Tarjeta Capital"])
+                                            "Tarjeta Capital", "Tarjeta US Bank"])
     es_incentivo = orden_s.str.startswith("incentivoamex_") | motivo_s.str.strip().eq("Incentivo Amex")
     tarjeta_mask = es_tarjeta & ~es_incentivo & tipo_u.isin(["EGRESO", "INGRESO"])
 
@@ -3878,6 +4264,78 @@ def main():
         st.info("📂 Aún no subes el CSV de Tarjeta Capital")
 
 
+    st.markdown("---")
+    st.header("3.6) Tarjeta US Bank")
+
+    usbank_file = st.file_uploader(
+        "Sube el CSV de US Bank (columnas: Date, Transaction, Name, Memo, Amount)",
+        type=["csv"],
+        key="usbank_uploader"
+    )
+
+    usbank_may = {}  # dict global para usar después en conciliaciones (MULTI-casillero)
+
+    if USBANK_FECHA_DESDE:
+        st.success(f"✅ Corte US Bank ACTIVO: solo transacciones con fecha ≥ {USBANK_FECHA_DESDE}")
+    else:
+        st.warning("⚠️ US Bank INACTIVO — `USBANK_FECHA_DESDE` está en None. No se carga ninguna "
+                   "fila (protección anti doble-conteo). Fija la fecha de corte (YYYY-MM-DD).")
+
+    st.info("📌 Descarga SIEMPRE el rango COMPLETO disponible en US Bank, NUNCA solo 'el último "
+            "mes': hay compras que asientan tarde y solo salen en exports posteriores. Cargar de "
+            "más NO duplica (el Orden identifica cada transacción y el dedup la reemplaza); "
+            "cargar de menos SÍ pierde compras.")
+    st.caption("💳 Es la única tarjeta MULTI-CASILLERO: se reparte por **sub-tarjeta** "
+               "(2529 → 1444 · 0598 → 11591 · 0609 → 13608 · 0534 se ignora). "
+               "**DEBIT** → Egreso · **CREDIT** → Ingreso (devolución) · pagos a la tarjeta, "
+               "cuota de manejo y filas sin titular se ignoran.")
+    if USBANK_EXCLUIR_BENEFICIO_AMAZON:
+        st.caption(f"🎁 «{USBANK_ETIQUETA_BENEFICIO}» se DESCARTA: es el beneficio comercial de "
+                   f"Amazon a la cuenta, no una devolución del mayorista.")
+
+    if usbank_file:
+        if USBANK_FECHA_DESDE is None:
+            st.error("🔒 Cargue US Bank BLOQUEADO: no hay fecha de corte definida "
+                     "(USBANK_FECHA_DESDE=None). Define la fecha de corte antes de cargar.")
+            st.stop()
+
+        try:
+            tarjetas_cobradas_ub, tarjetas_pendientes_ub, tarjetas_cobradas_ub_df = cargar_tarjetas_cobradas()
+            st.caption(f"🛡️ Lista de exclusión cargada: {len(tarjetas_cobradas_ub)} Orden ya "
+                       f"cobrados + {len(tarjetas_pendientes_ub)} pendientes de rematch.")
+            _aviso_barrera_atributos(tarjetas_cobradas_ub_df)
+        except Exception as e:
+            st.error(f"🔒 Cargue US Bank BLOQUEADO: no se pudo leer '{TARJETAS_COBRADAS_FILENAME}' "
+                     f"desde Dropbox ({e}). Sin la lista de exclusión se recobrarían "
+                     f"transacciones ya cobradas. NO se procesa nada.")
+            st.stop()
+
+        try:
+            df_usbank = pd.read_csv(usbank_file)
+        except Exception as e:
+            st.error(f"❌ No se pudo leer el CSV de US Bank: {e}")
+            df_usbank = None
+
+        if df_usbank is not None:
+            try:
+                usbank_may = procesar_usbank(df_usbank, fecha_desde=USBANK_FECHA_DESDE,
+                                             cobrados=tarjetas_cobradas_ub,
+                                             pendientes=tarjetas_pendientes_ub,
+                                             hist_tarjetas=_hist_tarjetas_para_trm(),
+                                             cobrados_df=tarjetas_cobradas_ub_df)
+            except ValueError as e:
+                st.error(f"⛔ {e}")
+                st.stop()  # DETENER: falta TRM, columnas o sub-tarjeta nueva (como las otras 4)
+            if not usbank_may:
+                st.info("No hay movimientos US Bank cargables desde la fecha de corte.")
+            else:
+                for key, dfr in usbank_may.items():
+                    st.markdown(f"**{key}** — {len(dfr)} movimiento(s)")
+                    st.dataframe(dfr, use_container_width=True)
+    else:
+        st.info("📂 Aún no subes el CSV de Tarjeta US Bank")
+
+
     # 3) Ingresos Nathalia Ospina (CA1633)
     st.header("4) Ingresos Nathalia Ospina (CA1633)")
     nat_files = st.file_uploader(
@@ -4350,9 +4808,13 @@ def main():
         # >>> NUEVO: TARJETA CAPITAL — módulo paralelo, SOLO 13608 (get devuelve None para el resto) <<<
         capital = capital_may.get(f"capital_{cas}") if 'capital_may' in locals() else None
 
+        # >>> NUEVO: TARJETA US BANK — MULTI-casillero (1444 / 11591 / 13608); el get devuelve
+        # None para los casilleros sin movimientos en el extracto. <<<
+        usbank = usbank_may.get(f"usbank_{cas}") if 'usbank_may' in locals() else None
+
         # 3) Armar la lista de DataFrames válidos
         frames = []
-        for df in (inc, egr, ext, env, cons, amex, rakuten, robinhood, capital):  # rakuten/robinhood 1444, capital 13608
+        for df in (inc, egr, ext, env, cons, amex, rakuten, robinhood, capital, usbank):  # rakuten/robinhood 1444, capital 13608, usbank 1444/11591/13608
             if df is not None and not df.empty:
                 frames.append(df)
 
