@@ -2311,8 +2311,15 @@ USBANK_CARD_NO = "0613"
 USBANK_COLS = ["Date", "Transaction", "Name", "Memo", "Amount"]
 USBANK_MCC_PAGO = "00300"        # pago a la tarjeta: se ignora SIEMPRE
 USBANK_MCC_FEE = "00761"         # cuota de manejo: se ignora SIEMPRE
-USBANK_MAP_SUBTARJETA = {"2529": "1444", "0598": "11591", "0609": "13608"}
-USBANK_SUBTARJETAS_IGNORAR = {"0534"}      # Santiago Largo: no es mayorista
+USBANK_MAP_SUBTARJETA = {"0598": "11591", "0609": "13608"}
+# 🔴 2529 (Kelly Lopez Velandia) SE IGNORA desde el 2026-08-25. En el primer cargue se mapeó a
+# 1444 por analogía con Amex (donde Kelly SÍ compra para Maria Moises), y fue un ERROR: sus
+# 1.063 movimientos se cobraron a Maria y hubo que revertirlos. Es además la tarjeta MADRE de la
+# cuenta, donde se pegan los pagos y el beneficio de Amazon, así que un mapeo equivocado ahí es
+# el más caro de todos (fueron 1.372 millones de COP).
+# ⚠️ NO reasignarla a un casillero sin confirmación explícita del usuario: que Kelly compre para
+# Maria en Amex NO implica que lo haga en US Bank.
+USBANK_SUBTARJETAS_IGNORAR = {"0534", "2529"}   # 0534 Santiago Largo · 2529 Kelly (sin asignar)
 USBANK_NOMBRE_ESPERADO = {                 # solo control cruzado (el código manda)
     "2529": "LOPEZ VELANDIA,KELLY P",
     "0598": "HERRERA,PAULA",
@@ -4286,7 +4293,7 @@ def main():
             "más NO duplica (el Orden identifica cada transacción y el dedup la reemplaza); "
             "cargar de menos SÍ pierde compras.")
     st.caption("💳 Es la única tarjeta MULTI-CASILLERO: se reparte por **sub-tarjeta** "
-               "(2529 → 1444 · 0598 → 11591 · 0609 → 13608 · 0534 se ignora). "
+               "(0598 → 11591 · 0609 → 13608 · **2529 Kelly y 0534 Santiago se IGNORAN**). "
                "**DEBIT** → Egreso · **CREDIT** → Ingreso (devolución) · pagos a la tarjeta, "
                "cuota de manejo y filas sin titular se ignoran.")
     if USBANK_EXCLUIR_BENEFICIO_AMAZON:
