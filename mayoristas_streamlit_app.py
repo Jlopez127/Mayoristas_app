@@ -3295,6 +3295,28 @@ def procesar_ingresos_clientes_csv(files: list, usuario: str, casillero: str) ->
 
 
 # === Config de cobros mensuales por casillero (fácil de cambiar) ===
+# ──────────────────────────────────────────────────────────────────────────────
+# COMISIÓN QUINCENAL — QUÉ CASILLEROS LA LLEVAN.
+# Regla: 1,5% × |Total diario más negativo de la quincena|, es decir sobre el día en que el
+# mayorista MÁS debe. El "Total" es el saldo ACUMULADO, no el neto del día: un saldo negativo
+# no se reinicia con la quincena, arrastra, y cada quincena vuelve a cobrar sobre él hasta que
+# se amortice.
+#   · 'usuario' — el que va en la fila de comisión (debe coincidir con el de la hoja).
+#   · 'desde'   — fecha de INICIO de la primera quincena que aplica (YYYY-MM-DD), o None para
+#                 "sin restricción" (comportamiento histórico de 1444). Las quincenas que
+#                 empiecen ANTES de esa fecha NO se cobran ni se crean.
+#
+# ⚠️ 9444 se añadió el 2026-08-26 con 'desde' = 2026-08-16: la primera comisión es la de la
+# quincena 16-31 agosto, que se cobra en el primer cargue del 1 al 15 de septiembre. El
+# 'desde' NO es decorativo: sin él, un cargue de hoy (día ≥ 16) calcularía "1-15 agosto" y le
+# cobraría 2.426.065 COP de una quincena que el usuario dejó explícitamente fuera.
+# ⚠️ NO mover un 'desde' hacia atrás: alcanzaría quincenas que nunca se cobraron y las cobraría
+# de golpe.
+COMISION_QUINCENAL_CONF = {
+    "1444": {"usuario": "Maria Moises",        "desde": None},
+    "9444": {"usuario": "Maira Alejandra Paez", "desde": "2026-08-16"},
+}
+
 COBROS_MENSUALES_CONF = {
     # casillero : {"inicio": "YYYY-MM-01", "monto": int}
     "1633": {"inicio": "2024-02-01", "monto": 879_000},
@@ -5072,9 +5094,14 @@ def main():
             # subidos en esta misma corrida). Para períodos con inicio >= 2026-04-01, si la fila
             # ya existe se reescribe el Monto con el valor recalculado; para períodos anteriores
             # se mantiene el comportamiento viejo (skip si existe).
-            if cas == "1444":
+            if cas in COMISION_QUINCENAL_CONF:
                 import calendar
                 from datetime import date as _date
+
+                _com_conf = COMISION_QUINCENAL_CONF[cas]
+                _com_usuario = _com_conf["usuario"]
+                _com_desde = (_date.fromisoformat(_com_conf["desde"])
+                              if _com_conf.get("desde") else None)
 
                 dfh = combinado.copy()
                 dfh["Fecha_dt"] = pd.to_datetime(dfh["Fecha"], errors="coerce").dt.date
@@ -5096,6 +5123,12 @@ def main():
 
                 def agregar_comision_rango(dfh_local, ini_date, fin_date, etiqueta):
                     orden_nombre = f"Comision de ({etiqueta})"
+
+                    # 🚦 Quincenas anteriores al 'desde' del casillero: NO se cobran ni se crean.
+                    # Se sale ANTES de mirar nada, para no tocar una fila preexistente por error.
+                    if _com_desde is not None and ini_date < _com_desde:
+                        return dfh_local
+
                     es_nueva_logica = ini_date >= CUTOFF_COMISION_NUEVA
 
                     mask_existente = pd.Series(False, index=dfh_local.index)
@@ -5137,8 +5170,8 @@ def main():
                         "Monto": comision,
                         "Motivo": "comision",
                         "TRM": "",
-                        "Usuario": "Maria Moises",
-                        "Casillero": "1444",
+                        "Usuario": _com_usuario,
+                        "Casillero": cas,
                         "Estado de Orden": "",
                         "Nombre del producto": orden_nombre,
                         "Fecha de Carga": fecha_carga
