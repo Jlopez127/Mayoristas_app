@@ -381,6 +381,57 @@ def _es_envio_bloqueado(orden_series: pd.Series) -> pd.Series:
     return norm.isin(ENVIOS_BLOQUEADOS)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Compras que el cliente pagó con su PROPIA tarjeta (no se le cobran).
+# El portal las asienta como Egreso normal porque la orden existe, pero el
+# mayorista ya la pagó con su propio medio de pago: cobrarla sería cobrarla dos
+# veces. NO se borran — se NEUTRALIZAN: la fila queda con Monto = 0 y el Motivo
+# dice por qué, y así se ve DESPUÉS DE CADA ACTUALIZACIÓN.
+#
+# Por qué neutralizar y no purgar (a diferencia de ENVIOS_BLOQUEADOS):
+#   · el 'Orden' sigue existiendo en la salida, así que guard_frescura_historico
+#     (capa A) no lo ve como una pérdida y NO hay que tocar _orden_removible
+#     (ampliarlo debilitaría el guard para siempre).
+#   · queda la huella auditable de la compra y del motivo por el que no se cobró.
+#
+# Idempotente: se re-aplica en cada corrida sobre el histórico Y sobre lo que
+# traiga el archivo de compras, así que el cargo no puede volver a aparecer.
+# Gateado por casillero: una Orden solo se neutraliza en SU hoja.
+# ──────────────────────────────────────────────────────────────────────────────
+COMPRAS_TC_PROPIA = {
+    # "Orden": ("casillero", "Motivo que queda escrito en la fila")
+    "163730": ("11591", "Compra con TC propia"),
+}
+
+
+def _neutralizar_compras_tc_propia(df: pd.DataFrame, cas: str) -> pd.DataFrame:
+    """Pone en Monto = 0 y escribe el Motivo de las compras pagadas con la tarjeta
+    del propio cliente (COMPRAS_TC_PROPIA) que aparezcan en la hoja de `cas`.
+    No borra filas. Si no hay nada que neutralizar devuelve el DF sin tocar."""
+    if df is None or df.empty or "Orden" not in df.columns:
+        return df
+
+    objetivo = {
+        str(orden).strip(): motivo
+        for orden, (casillero, motivo) in COMPRAS_TC_PROPIA.items()
+        if str(casillero).strip() == str(cas).strip()
+    }
+    if not objetivo:
+        return df
+
+    norm = df["Orden"].astype(str).str.strip().str.replace(".0", "", regex=False)
+    mask = norm.isin(objetivo)
+    if not mask.any():
+        return df
+
+    df = df.copy()
+    if "Motivo" not in df.columns:
+        df["Motivo"] = ""
+    df.loc[mask, "Monto"] = 0
+    df.loc[mask, "Motivo"] = norm[mask].map(objetivo)
+    return df
+
+
 @st.cache_data
 def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """
@@ -4932,6 +4983,13 @@ def main():
             _mask_bloq = _es_envio_bloqueado(combinado["Orden"])
             if _mask_bloq.any():
                 combinado = combinado[~_mask_bloq].reset_index(drop=True)
+
+            # 💳 Compras pagadas con la TC del propio cliente: se neutralizan
+            # (Monto = 0 + Motivo) en CADA corrida, tanto la fila que ya está en el
+            # histórico como la que vuelva a traer el archivo de compras. Va antes
+            # del dedup (que conserva keep="last") y del recálculo de totales, para
+            # que el saldo se recompute sin ese cargo.
+            combinado = _neutralizar_compras_tc_propia(combinado, cas)
 
             combinado["Tipo"] = combinado["Tipo"].astype(str).str.strip()
             
