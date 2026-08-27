@@ -28,6 +28,12 @@ por casillero. Es **dinero real de clientes**. Credenciales en `.streamlit/secre
 blocklist `ENVIOS_BLOQUEADOS` · el bloque de comisión quincenal · flujo de secrets/Dropbox/Siigo ·
 los cuatro `procesar_*` de tarjetas existentes.
 
+> **Retirar un cargo sin borrarlo.** Si hay que dejar de cobrar una orden que el portal sigue
+> asentando, **neutralizarla, no purgarla**: `Monto = 0` + `Motivo` explicando por qué
+> (`COMPRAS_TC_PROPIA`, aplicada en el paso 6 antes del dedup). Así el `Orden` sigue existiendo
+> en la salida, la **capa A no la ve como pérdida** y no hay que tocar `_orden_removible`.
+> Purgar (estilo `ENVIOS_BLOQUEADOS`) obliga a saltarse el guard y deja de ser auditable.
+
 **Verificar por AST** que esas funciones quedan idénticas tras cualquier cambio.
 
 ---
@@ -165,6 +171,8 @@ Las líneas se mueven; buscar por nombre:
 
 - **Constantes/perillas**: `AMEX_*`, `RAKUTEN_*`, `ROBINHOOD_*`, `CAPITAL_*`, `USBANK_*`,
   `TARIFA_*`, `COMISION_QUINCENAL_CONF`, `COBROS_MENSUALES_CONF`, `INCENTIVO_*`
+- **Listas de excepción**: `ENVIOS_BLOQUEADOS` (se PURGAN) · `COMPRAS_TC_PROPIA` (se
+  NEUTRALIZAN: `Monto = 0` + `Motivo`, la fila se queda)
 - **Blindaje**: `TARJETA_ORDEN_RE`, `preservar_filas_tarjeta`, `guard_frescura_historico`,
   `upload_to_dropbox`
 - **Tarjetas**: `procesar_amex` · `procesar_rakuten` · `procesar_robinhood` · `procesar_capital`
