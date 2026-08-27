@@ -400,7 +400,7 @@ def _es_envio_bloqueado(orden_series: pd.Series) -> pd.Series:
 # ──────────────────────────────────────────────────────────────────────────────
 COMPRAS_TC_PROPIA = {
     # "Orden": ("casillero", "Motivo que queda escrito en la fila")
-    "163730": ("11591", "Compra con TC propia"),
+    "163730": ("11591", "Compra con su propia TC"),
 }
 
 
