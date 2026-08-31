@@ -83,7 +83,12 @@ def upload_to_dropbox(data: bytes):
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
 # Prefijos de 'Orden' que identifican filas escritas por los módulos de tarjeta.
-TARJETA_ORDEN_RE = r"^(?:amex_|rakuten_|robinhood_|capital_|usbank_|gastoamex|reembolsoamex)"
+# 'applepay_' NO tiene módulo: son las 4 compras del 25-ago-2026 que se le cargaron A MANO a
+# 1444 por la tarjeta Apple Card que se le prestó temporalmente (esa tarjeta la usan también
+# Santiago y Kelly para gasto que no es de 1444, por eso no se procesa su extracto). Va aquí
+# para que la capa B las reponga si alguien sube un histórico rezagado — es exactamente el
+# olvido de prefijo que costó las 128 filas de Robinhood el 24-jul-2026.
+TARJETA_ORDEN_RE = r"^(?:amex_|rakuten_|robinhood_|capital_|usbank_|applepay_|gastoamex|reembolsoamex)"
 
 
 def _es_not_found(e: Exception) -> bool:
