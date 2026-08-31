@@ -88,7 +88,7 @@ def upload_to_dropbox(data: bytes):
 # Santiago y Kelly para gasto que no es de 1444, por eso no se procesa su extracto). Va aquí
 # para que la capa B las reponga si alguien sube un histórico rezagado — es exactamente el
 # olvido de prefijo que costó las 128 filas de Robinhood el 24-jul-2026.
-TARJETA_ORDEN_RE = r"^(?:amex_|rakuten_|robinhood_|capital_|usbank_|applepay_|gastoamex|reembolsoamex)"
+TARJETA_ORDEN_RE = r"^(?:amex_|rakuten_|robinhood_|capital_|usbank_|intuit_|applepay_|gastoamex|reembolsoamex)"
 
 
 def _es_not_found(e: Exception) -> bool:
@@ -754,7 +754,7 @@ def cargar_hist_tarjetas():
         if "Orden" not in _dfh.columns:
             continue
         _o = _dfh["Orden"].astype(str).str.strip()
-        _sel = _dfh[_o.str.startswith(("amex_", "rakuten_", "robinhood_", "capital_", "usbank_"))]
+        _sel = _dfh[_o.str.startswith(("amex_", "rakuten_", "robinhood_", "capital_", "usbank_", "intuit_"))]
         if len(_sel):
             partes.append(_sel)
     return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
@@ -2684,6 +2684,364 @@ def procesar_usbank(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendiente
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Cargue "Tarjeta Intuit" (6ª tarjeta; módulo PARALELO, NO reusa procesar_*).
+# Fuente: CSV de Intuit (Merchant, Amount, Rewards, Date, Status, Decline Reason, Address, User).
+# El archivo viene con BOM (utf-8-sig): leerlo con encoding="utf-8-sig".
+#
+#   - UN SOLO CASILLERO: 1444 (Maria Moises). Estructuralmente es como Rakuten/Robinhood.
+#     La llave es la columna 'User', comparada NORMALIZADA (minúsculas, espacios colapsados):
+#     el emisor no controla la capitalización ('Maria Moises' vs 'santiago largo' en el mismo
+#     archivo). 'santiago largo' se IGNORA (mismo criterio que el código 0534 en US Bank).
+#     Un 'User' desconocido se IGNORA con warning: no se adivina a quién cobrarle.
+#
+#   - REGLAS, EN ESTE ORDEN (la primera que aplica decide):
+#       1. 'User' no mapeado                -> ignorar
+#       2. Status != 'Settled'              -> ignorar (Pending / Declined)
+#       3. Amount POSITIVO                  -> Egreso
+#       4. cualquier otra cosa              -> EXCLUIR + warning con la fila cruda
+#     Hoy esta tarjeta solo trae compras y así se carga: SOLO COMPRAS. No se implementa una
+#     regla de devolución inventada — no hay ninguna en el archivo con que verificarla. Una
+#     fila que no sea una compra Settled de un usuario mapeado se excluye y se REPORTA, nunca
+#     se interpreta. El cargue NO se detiene por ella: las compras buenas entran igual.
+#
+#   - 🎁 La columna 'Rewards' ("2%   $0.51") NO SE LEE NUNCA. Es el cashback de la tarjeta:
+#     beneficio de la cuenta de Encargomío, no devolución del mayorista. Misma lógica que
+#     USBANK_EXCLUIR_BENEFICIO_AMAZON. No resta del neto ni genera fila.
+#
+#   - 🔴 RIESGO ESTRUCTURAL — Pending que liquida con OTRO monto. Es la tarjeta más frágil de
+#     las seis: no hay ID nativo ni hora, así que el Orden es hash puro de
+#     Date|Amount|Merchant|seq. Si una fila Pending liquidara por un monto distinto al
+#     retenido, el hash cambiaría por completo y entraría como transacción nueva; la barrera
+#     por atributos tampoco la atraparía, porque su llave incluye el monto. El riesgo es
+#     concreto: en el primer extracto hay dos filas de Wawa, que es gasolinera, y las
+#     preautorizaciones de combustible liquidan rutinariamente por otro monto.
+#     MITIGACIÓN: las filas Pending NUNCA se cargan (regla 2) — solo entra lo Settled, que ya
+#     es el monto final. Es lo mismo que se hizo con Robinhood (ROBINHOOD_STATUS_OK='Posted').
+#     Cada corrida REPORTA cuántas Pending se omitieron, para saber qué quedó esperando.
+#
+#   - Orden 1-a-1 = "intuit_<sha1-12 de 'Date|Amount|Merchant_normalizado|seq'>". El 'seq' NO
+#     es opcional aunque hoy no haya colisiones: en el primer extracto hay dos Wawa del mismo
+#     día que solo se salvan porque los montos difieren (4,82 y 38,05). Se asigna sobre ORDEN
+#     CANÓNICO (clave, cargable) con las CARGABLES primero — la lección de Robinhood: si una
+#     Pending se numerara antes que una Settled de la misma clave, al liquidar la Pending el
+#     seq de la Settled se correría y su Orden cambiaría -> re-cobro.
+#     ⚠️ El número del nombre del archivo (transactions_<n>.csv) NO se usa: no está verificado
+#     que sea estable entre descargas.
+#
+#   - USD -> COP con la MISMA TRM que las demás (_amex_trm_dia: datos.gov.co + 125). *** SIN
+#     TRM de respaldo: si falta un día con movimiento, LEVANTA ValueError. ***
+#
+#   - ⚠️ LO QUE ESTE EXTRACTO NO PERMITE DETERMINAR (abierto, no inventar la regla):
+#       a) cómo se ve una DEVOLUCIÓN (¿Amount negativo? ¿otro Status? ¿un Merchant de crédito?)
+#          — la regla 4 es una hipótesis razonable y está SIN VERIFICAR;
+#       b) cómo se ve un DECLINED (la columna 'Decline Reason' existe pero viene vacía);
+#       c) si el número del nombre del archivo es estable entre descargas.
+# ──────────────────────────────────────────────────────────────────────────────
+INTUIT_CASILLERO = "1444"
+INTUIT_USUARIO = "Maria Moises"
+INTUIT_MOTIVO = "Tarjeta Intuit"
+INTUIT_COLS = ["Merchant", "Amount", "Rewards", "Date", "Status", "Decline Reason",
+               "Address", "User"]
+INTUIT_FECHA_FORMATO = "%b %d, %Y"          # "Aug 30, 2026"
+INTUIT_MAP_USUARIO = {"maria moises": "1444"}
+INTUIT_USUARIOS_IGNORAR = {"santiago largo"}
+INTUIT_STATUS_VALIDOS = {"Settled"}
+INTUIT_USUARIOS = {"1444": "Maria Moises"}
+
+# ⚠️ CA1444 / COMISIÓN QUINCENAL — True: el gasto Intuit SÍ cuenta en la base de la comisión
+# quincenal de 1444 (igual que Amex/Rakuten/Robinhood, que también alimentan ese casillero).
+INTUIT_AFECTA_COMISION_1444 = True
+
+# 🚦 FECHA DE CORTE. El extracto trae la HISTORIA COMPLETA desde el primer día (confirmado con
+# el usuario: no hay extracto anterior), que arranca el 2026-08-29 — así que el corte es solo un
+# límite de sanidad: LA LISTA DE EXCLUSIÓN ES LA QUE MANDA.
+#   - None -> INACTIVO (kill switch de emergencia: no se procesa nada).
+# ⚠️ NUNCA mover esta fecha HACIA ATRÁS: alcanzaría quincenas de 1444 ya comisionadas y las
+# recalcularía en silencio.
+INTUIT_FECHA_DESDE = "2026-08-29"
+
+
+def _intuit_monto(s: pd.Series) -> pd.Series:
+    """'$25.66' / '$1,234.56' -> float. Quita el símbolo y los separadores de miles."""
+    return pd.to_numeric(
+        s.astype(str).str.strip()
+         .str.replace("$", "", regex=False)
+         .str.replace(",", "", regex=False),
+        errors="coerce",
+    )
+
+
+def _intuit_user_norm(s: pd.Series) -> pd.Series:
+    """'  Maria   Moises ' -> 'maria moises'. El emisor no controla la capitalización."""
+    return s.astype(str).str.split().str.join(" ").str.lower()
+
+
+def _intuit_clave_y_seq(df: pd.DataFrame):
+    """Clave e índice de repetición del Orden Intuit. No hay ID nativo NI hora.
+
+    Clave = Date | Amount | Merchant normalizado, con los valores CRUDOS del CSV.
+    El 'seq' se asigna sobre ORDEN CANÓNICO (clave, cargable) y NO sobre el orden de lectura,
+    para que dos descargas den el mismo seq a la misma transacción.
+
+    ⚠️ Las CARGABLES van primero (es la lección que costó dinero en Robinhood): solo las filas
+    Settled de un usuario mapeado pueden llegar al histórico, así que son las únicas cuyo Orden
+    importa. Si una Pending se numerara antes que una Settled de la misma clave, el día que esa
+    Pending liquidara el seq de la Settled se correría, su Orden cambiaría y la entrada de la
+    lista de exclusión quedaría huérfana -> RE-COBRO de algo ya cobrado.
+    """
+    clave = (df["Date"].astype(str).str.strip() + "|"
+             + df["Amount"].astype(str).str.strip() + "|"
+             + df["Merchant"].map(_norm_merchant))
+    cargable = (
+        df["Status"].astype(str).str.strip().isin(INTUIT_STATUS_VALIDOS)
+        & _intuit_user_norm(df["User"]).isin(INTUIT_MAP_USUARIO)
+    )
+    canon = pd.DataFrame({"_k": clave, "_c": (~cargable).astype(int)}).sort_values(
+        ["_k", "_c"], kind="mergesort")
+    seq = canon.groupby("_k").cumcount().reindex(df.index).astype(str)
+    return clave, seq
+
+
+def procesar_intuit(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None,
+                    hist_tarjetas=None, cobrados_df=None) -> dict[str, pd.DataFrame]:
+    """Transforma el CSV de Intuit en {intuit_1444: DF} con UNA fila COP por movimiento.
+
+    Un solo casillero (1444). Levanta ValueError si faltan columnas, si 'Date'/'Amount' son
+    ilegibles, si hay colisión de Orden o si falta la TRM de cualquier día con movimiento.
+    'cobrados' (OBLIGATORIO) = set de Orden ya cobrados. 'pendientes' se acepta por simetría de
+    firma pero NO se usa: Intuit no tiene auth pendientes de rematch (las Pending se descartan).
+    """
+    df = df.copy()
+    df.columns = [str(c).strip().lstrip("﻿") for c in df.columns]
+    faltan = [c for c in INTUIT_COLS if c not in df.columns]
+    if faltan:
+        raise ValueError(f"El CSV de Intuit no tiene las columnas esperadas: {', '.join(faltan)}.")
+
+    if fecha_desde is None:
+        return {}
+
+    if cobrados is None:
+        raise ValueError(
+            "Falta la lista de exclusión 'tarjetas cobradas' (cobrados=None). "
+            "No se procesa nada: sin la lista se recobrarían transacciones ya cobradas."
+        )
+
+    df["_fecha"] = pd.to_datetime(df["Date"].astype(str).str.strip(),
+                                  format=INTUIT_FECHA_FORMATO, errors="coerce")
+    if df["_fecha"].isna().any():
+        _ej = df.loc[df["_fecha"].isna(), "Date"].astype(str).unique()[:5]
+        raise ValueError(
+            f"Intuit: {int(df['_fecha'].isna().sum())} fila(s) con 'Date' ilegible "
+            f"(esperado '{INTUIT_FECHA_FORMATO}', p.ej. {', '.join(_ej)}). "
+            f"No se genera ningún movimiento."
+        )
+    df["_amount"] = _intuit_monto(df["Amount"])
+    if df["_amount"].isna().any():
+        _ej = df.loc[df["_amount"].isna(), "Amount"].astype(str).unique()[:5]
+        raise ValueError(
+            f"Intuit: {int(df['_amount'].isna().sum())} fila(s) con 'Amount' ilegible "
+            f"(p.ej. {', '.join(_ej)}). No se genera ningún movimiento."
+        )
+    df["_user"] = _intuit_user_norm(df["User"])
+    df["_status"] = df["Status"].astype(str).str.strip()
+
+    # Rango del extracto (sobre TODAS las filas) para la 2ª barrera.
+    _rango_extracto = (df["_fecha"].min(), df["_fecha"].max()) if len(df) else None
+
+    # ── DESCARTES, en el orden de las reglas ─────────────────────────────────
+    # Regla 1 — 'User' no mapeado (incluye 'santiago largo').
+    _ign_user = ~df["_user"].isin(INTUIT_MAP_USUARIO)
+    _desconocidos = sorted(set(df.loc[_ign_user, "_user"]) - INTUIT_USUARIOS_IGNORAR)
+    if int(_ign_user.sum()):
+        _cobradas_info(
+            f"ℹ️ Intuit: {int(_ign_user.sum())} fila(s) de usuarios no mapeados ignoradas "
+            f"({', '.join(sorted(set(df.loc[_ign_user, 'User'].astype(str))))})."
+        )
+    if _desconocidos:
+        _cobradas_warn(
+            f"⚠️ Intuit: usuario(s) DESCONOCIDO(S) en el extracto: {', '.join(_desconocidos)}. "
+            f"Se IGNORAN (no se adivina a quién cobrarle). Si alguno es de un mayorista, "
+            f"añádelo a INTUIT_MAP_USUARIO; si no, a INTUIT_USUARIOS_IGNORAR."
+        )
+
+    # Regla 2 — Status distinto de 'Settled'. Las Pending se reportan aparte: son las que van
+    # a mutar, y hay que saber qué quedó afuera esperando liquidación.
+    # ⚠️ El conteo de Pending se hace sobre TODO el archivo, no solo sobre lo que sobrevive a la
+    # regla 1: una Pending de un usuario no mapeado ya quedó fuera por 'User', pero el §4 pide
+    # saber cuántas quedaron esperando liquidación, y esconderla tras el aviso de usuario haría
+    # que el reporte dijera "0 Pending" con una Pending en el archivo.
+    _no_settled = ~_ign_user & ~df["_status"].isin(INTUIT_STATUS_VALIDOS)
+    _pend_todas = df["_status"].str.lower().eq("pending")
+    _pend = _no_settled & _pend_todas
+    if int(_pend_todas.sum()):
+        _cobradas_info(
+            f"⏳ Intuit: {int(_pend_todas.sum())} fila(s) PENDING en el extracto "
+            f"({int(_pend.sum())} de usuario mapeado, "
+            f"USD {float(df.loc[_pend, '_amount'].abs().sum()):,.2f}) — NO se cargan: se "
+            f"cargarán cuando liquiden, con su monto FINAL. En Pending el monto puede cambiar "
+            f"al liquidar (típico en gasolineras) y el Orden es un hash del monto."
+        )
+    _otros_estados = _no_settled & ~_pend
+    if int(_otros_estados.sum()):
+        _cobradas_warn(
+            f"⚠️ Intuit: {int(_otros_estados.sum())} fila(s) con Status NO reconocido "
+            f"({', '.join(sorted(set(df.loc[_otros_estados, '_status'])))}) — EXCLUIDAS y sin "
+            f"interpretar. Revisar a mano: puede ser el primer 'Declined' del que no se sabe "
+            f"cómo se ve."
+        )
+
+    df = df[~(_ign_user | _no_settled)].copy()
+    if df.empty:
+        return {}
+
+    # Regla 3 / 4 — el signo. Hoy esta tarjeta solo trae compras (Amount positivo) y así se
+    # carga. Una fila con Amount <= 0 NO se interpreta: se EXCLUYE y se reporta CRUDA, porque
+    # no hay ninguna devolución en el extracto con que verificar cómo se ve. El cargue sigue.
+    _no_compra = ~(df["_amount"] > 0)
+    if _no_compra.any():
+        _crudas = df.loc[_no_compra, INTUIT_COLS].astype(str)
+        _cobradas_warn(
+            f"🚨 Intuit: {int(_no_compra.sum())} fila(s) que NO son una compra "
+            f"(Amount ≤ 0) — EXCLUIDAS y sin interpretar, el resto del cargue sigue normal. "
+            f"Puede ser la primera DEVOLUCIÓN: hay que DEFINIR la regla antes de cargarlas, "
+            f"no adivinarla. Filas crudas: "
+            + " || ".join("; ".join(f"{c}={r[c]}" for c in INTUIT_COLS)
+                          for _, r in _crudas.head(10).iterrows())
+        )
+        df = df[~_no_compra].copy()
+    if df.empty:
+        return {}
+
+    df["_cas"] = df["_user"].map(INTUIT_MAP_USUARIO)
+    df["_tipo"] = "Egreso"
+    df["_usd"] = df["_amount"].abs()
+    df["_merch_attr"] = df["Merchant"].map(_norm_merchant)
+
+    # Orden = hash puro. Se calcula sobre el universo COMPLETO (antes del corte y de la lista)
+    # para que el 'seq' no dependa de qué filas se filtren después.
+    _clave, _seq = _intuit_clave_y_seq(df)
+    df["_orden"] = "intuit_" + (_clave + "|" + _seq).map(
+        lambda s: hashlib.sha1(s.encode("utf-8")).hexdigest()[:12])
+    if df["_orden"].duplicated().any():
+        _dups = df.loc[df["_orden"].duplicated(keep=False), "_orden"].unique()[:5]
+        raise ValueError(
+            f"Intuit: colisión de Orden ({len(_dups)}+ casos, p.ej. {', '.join(_dups)}). "
+            f"Dos movimientos distintos generarían el mismo ID. No se genera ningún movimiento."
+        )
+    _ordenes_universo = set(df["_orden"])
+
+    # 🔁 UNIVERSO DE COMPRAS para emparejar devoluciones: ANTES del corte y de la lista.
+    _compras_universo = [
+        {
+            "id": r["_orden"],
+            "fecha": r["_fecha"],
+            "merch": r["_merch_attr"],
+            "usd": round(float(r["_usd"]), 2),
+            "cm": INTUIT_USUARIOS.get(r["_cas"], r["_cas"]),
+            "cas": r["_cas"],
+            "trm_fecha": r["_fecha"].strftime("%Y-%m-%d"),
+        }
+        for _, r in df[df["_tipo"] == "Egreso"].iterrows()
+    ]
+
+    df = df[df["_fecha"] >= pd.Timestamp(fecha_desde)].copy()
+    if df.empty:
+        return {}
+    df["_fecha_iso"] = df["_fecha"].dt.strftime("%Y-%m-%d")
+
+    # 🛡️ Barrera 1 — lista de exclusión por Orden.
+    _ya = df["_orden"].isin(cobrados)
+    if _ya.any():
+        _cobradas_info(
+            f"🛡️ Intuit: {int(_ya.sum())} movimiento(s) ya liquidados (lista de exclusión) — "
+            f"excluidos: USD {float(df.loc[_ya, '_usd'].sum()):,.2f}."
+        )
+        df = df[~_ya].copy()
+    if df.empty:
+        return {}
+
+    # 🛡️ Barrera 2 — por atributos (independiente del hash), con SIGNO.
+    df["_tipo_attr"] = df["_tipo"]
+    _drop_attr = _excluir_por_atributos(df, cobrados_df, "intuit", _ordenes_universo,
+                                        _rango_extracto, "Intuit")
+    if _drop_attr:
+        df = df.drop(index=_drop_attr)
+    if df.empty:
+        return {}
+
+    # 🔁 Devolución -> TRM de su compra original. HOY SIEMPRE VACÍO: la regla 4 excluye las
+    # filas que no son compra, así que no hay Ingreso. El cableado queda puesto (y con
+    # 'intuit_' en el índice del histórico) para el día en que se VERIFIQUE cómo se ve una
+    # devolución; sin él, un reembolso futuro no encontraría la TRM de su compra y dejaría
+    # residuo cambiario a cargo del mayorista.
+    _reembolsos = [
+        {"id": r["_orden"], "fecha": r["_fecha"], "merch": r["_merch_attr"],
+         "usd": round(float(r["_usd"]), 2),
+         "cm": INTUIT_USUARIOS.get(r["_cas"], r["_cas"]), "cas": r["_cas"]}
+        for _, r in df[df["_tipo"] == "Ingreso"].iterrows()
+    ]
+    _trm_ok, _trm_sin_match, _trm_ambiguos = _resolver_trm_reembolsos(
+        _reembolsos, _compras_universo,
+        _indice_compras_historico(hist_tarjetas, "intuit_", INTUIT_MOTIVO),
+    )
+    if _trm_sin_match:
+        _cobradas_warn(
+            "⚠️ Intuit: {} devolución(es) sin compra original identificable (ni total ni "
+            "parcial) — se usa la TRM de su propio día. REVISAR a mano: {}"
+            .format(len(_trm_sin_match),
+                    "; ".join(f"{x['fecha']:%Y-%m-%d} USD {x['usd']:.2f} {x['merch'][:36]} "
+                              f"[{x['motivo']}]" for x in _trm_sin_match[:10]))
+        )
+    if _trm_ambiguos:
+        _cobradas_info(
+            f"ℹ️ Intuit: {len(_trm_ambiguos)} devolución(es) tenían varias compras candidatas "
+            f"con TRM distintas; se tomó la compra MÁS RECIENTE anterior al reembolso."
+        )
+
+    # TRM por día (+125), incluidos los días de las compras originales casadas.
+    trm_cache: dict = {}
+    _dias = set(df["_fecha_iso"].unique()) | {
+        f for f, origen, _t, _p in _trm_ok.values() if origen == "extracto"
+    }
+    faltantes = {f for f in sorted(_dias) if _amex_trm_dia(f, trm_cache) is None}
+    if faltantes:
+        raise ValueError(
+            f"Sin TRM (datos.gov.co) para los días con movimiento Intuit: "
+            f"{', '.join(sorted(faltantes))}. No se genera ningún movimiento "
+            f"(no hay TRM de respaldo)."
+        )
+
+    filas = []
+    for _, r in df.iterrows():
+        tipo, f_iso, cas = r["_tipo"], r["_fecha_iso"], r["_cas"]
+        trm = trm_cache[f_iso]
+        etq = "gasto" if tipo == "Egreso" else "devolucion"
+        _m = _trm_ok.get(r["_orden"]) if tipo == "Ingreso" else None
+        if _m:
+            _f_compra, _origen, _trm_hist, _parcial = _m
+            trm = _trm_hist if _origen == "historico" else trm_cache[_f_compra]
+            etq = f"devolucion{' parcial' if _parcial else ''} (TRM compra {_f_compra})"
+        desc = " ".join(str(r["Merchant"]).split())
+        filas.append({
+            "Fecha": f_iso,
+            "Tipo": tipo,
+            "Monto": round(float(r["_usd"]) * trm),   # COP, POSITIVO (el signo lo lleva 'Tipo')
+            "Orden": r["_orden"],
+            "Motivo": INTUIT_MOTIVO,
+            "TRM": round(trm, 2),
+            "Usuario": INTUIT_USUARIOS.get(cas, cas),
+            "Casillero": cas,
+            "Estado de Orden": "",
+            "Nombre del producto": f"{INTUIT_MOTIVO} - {etq} - {desc}",
+        })
+
+    out = pd.DataFrame(filas)
+    if out.empty:
+        return {}
+    return {f"intuit_{INTUIT_CASILLERO}": out.reset_index(drop=True)}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # INCENTIVO AMEX MENSUAL (cashback). Por cada mes CERRADO, agrega un Ingreso al casillero
 # = INCENTIVO_COP_POR_USD * USD_neto, donde USD_neto = Σ(USD egresos Amex) − Σ(USD ingresos Amex)
 # y USD_fila = Monto_COP / TRM_fila (la TRM del histórico YA incluye el spread +125, así que
@@ -2748,7 +3106,7 @@ def agregar_incentivo_amex(combinado, cas, usuario, fecha_carga):
     # "Rakuten X"/"Amex Y"). Nota: las filas backoffice legacy "Compra Amex" (Motivo vacío) NO
     # entran — son pre-INCENTIVO_MES_INICIO, fuera de la ventana del incentivo.
     es_tarjeta = motivo_s.str.strip().isin(["Tarjeta Amex", "Tarjeta Rakuten", "Tarjeta Robinhood",
-                                            "Tarjeta Capital", "Tarjeta US Bank"])
+                                            "Tarjeta Capital", "Tarjeta US Bank", "Tarjeta Intuit"])
     es_incentivo = orden_s.str.startswith("incentivoamex_") | motivo_s.str.strip().eq("Incentivo Amex")
     tarjeta_mask = es_tarjeta & ~es_incentivo & tipo_u.isin(["EGRESO", "INGRESO"])
 
@@ -4421,6 +4779,111 @@ def main():
         st.info("📂 Aún no subes el CSV de Tarjeta US Bank")
 
 
+    st.markdown("---")
+    st.header("3.7) Tarjeta Intuit")
+
+    intuit_file = st.file_uploader(
+        "Sube el CSV de Intuit (columnas: Merchant, Amount, Rewards, Date, Status, "
+        "Decline Reason, Address, User)",
+        type=["csv"],
+        key="intuit_uploader"
+    )
+
+    intuit_may = {}  # dict global para usar después en conciliaciones (solo 1444)
+
+    if INTUIT_FECHA_DESDE:
+        st.success(f"✅ Corte Intuit ACTIVO: solo transacciones con fecha ≥ {INTUIT_FECHA_DESDE}")
+    else:
+        st.warning("⚠️ Intuit INACTIVO — `INTUIT_FECHA_DESDE` está en None. No se carga ninguna "
+                   "fila (protección anti doble-conteo). Fija la fecha de corte (YYYY-MM-DD).")
+
+    st.info("📌 Descarga SIEMPRE el rango COMPLETO disponible en Intuit, NUNCA solo 'el último "
+            "mes'. Cargar de más NO duplica (el Orden identifica cada transacción y el dedup la "
+            "reemplaza); cargar de menos SÍ pierde compras.")
+    st.caption("💳 Alimenta un solo casillero: **1444 (Maria Moises)**. La llave es la columna "
+               "**User** (normalizada): `Maria Moises` → 1444 · **`santiago largo` se IGNORA** · "
+               "un usuario desconocido se ignora con aviso. Solo entran las **compras Settled**.")
+    st.caption("⏳ Las filas **Pending NO se cargan**: su monto puede cambiar al liquidar (típico "
+               "en gasolineras — en el extracto hay dos Wawa) y el Orden es un hash del monto, "
+               "así que una Pending cargada se re-cobraría al liquidar con otro valor. Entran "
+               "solas en la siguiente corrida, ya con el monto final.")
+    st.caption("🎁 La columna **Rewards** (cashback 2%) NO se lee: es beneficio de la cuenta de "
+               "Encargomío, no una devolución del mayorista.")
+    st.caption("⚠️ Esta tarjeta **aún no ha mostrado una devolución ni un Declined**, así que esas "
+               "reglas están SIN VERIFICAR: una fila que no sea una compra Settled se EXCLUYE y "
+               "se reporta cruda — nunca se interpreta —, y el resto del cargue sigue normal.")
+
+    if intuit_file:
+        if INTUIT_FECHA_DESDE is None:
+            st.error("🔒 Cargue Intuit BLOQUEADO: no hay fecha de corte definida "
+                     "(INTUIT_FECHA_DESDE=None). Define la fecha de corte antes de cargar.")
+            st.stop()
+
+        try:
+            tarjetas_cobradas_in, tarjetas_pendientes_in, tarjetas_cobradas_in_df = cargar_tarjetas_cobradas()
+            st.caption(f"🛡️ Lista de exclusión cargada: {len(tarjetas_cobradas_in)} Orden ya "
+                       f"cobrados + {len(tarjetas_pendientes_in)} pendientes de rematch.")
+            _aviso_barrera_atributos(tarjetas_cobradas_in_df)
+        except Exception as e:
+            st.error(f"🔒 Cargue Intuit BLOQUEADO: no se pudo leer '{TARJETAS_COBRADAS_FILENAME}' "
+                     f"desde Dropbox ({e}). Sin la lista de exclusión se recobrarían "
+                     f"transacciones ya cobradas. NO se procesa nada.")
+            st.stop()
+
+        try:
+            # El CSV de Intuit viene con BOM -> utf-8-sig, si no la 1ª columna llega como '﻿Merchant'.
+            df_intuit = pd.read_csv(intuit_file, encoding="utf-8-sig")
+        except Exception as e:
+            st.error(f"❌ No se pudo leer el CSV de Intuit: {e}")
+            df_intuit = None
+
+        if df_intuit is not None:
+            # Resumen del extracto ANTES de procesar, para ver qué queda afuera y por qué.
+            try:
+                _r = df_intuit.copy()
+                _r.columns = [str(c).strip().lstrip("﻿") for c in _r.columns]
+                _ru = _intuit_user_norm(_r["User"])
+                _rs = _r["Status"].astype(str).str.strip()
+                _n_tot = len(_r)
+                _n_user = int((~_ru.isin(INTUIT_MAP_USUARIO)).sum())
+                _n_pend = int(_rs.str.lower().eq("pending").sum())   # TODO el archivo (ver §4)
+                _n_otro = int((_ru.isin(INTUIT_MAP_USUARIO) & ~_rs.isin(INTUIT_STATUS_VALIDOS)
+                               & ~_rs.str.lower().eq("pending")).sum())
+                st.caption(f"📄 Extracto: **{_n_tot}** fila(s) · descartadas por usuario no "
+                           f"mapeado: **{_n_user}** · **Pending omitidas: {_n_pend}** · otros "
+                           f"estados: **{_n_otro}**")
+            except Exception:
+                pass
+
+            try:
+                intuit_may = procesar_intuit(df_intuit, fecha_desde=INTUIT_FECHA_DESDE,
+                                             cobrados=tarjetas_cobradas_in,
+                                             pendientes=tarjetas_pendientes_in,
+                                             hist_tarjetas=_hist_tarjetas_para_trm(),
+                                             cobrados_df=tarjetas_cobradas_in_df)
+            except ValueError as e:
+                st.error(f"⛔ {e}")
+                st.stop()  # DETENER: falta TRM, columnas, fecha/monto ilegible o colisión de Orden
+            if not intuit_may:
+                st.info("No hay movimientos Intuit cargables desde la fecha de corte.")
+            else:
+                for key, dfr in intuit_may.items():
+                    _eg = dfr[dfr["Tipo"] == "Egreso"]
+                    _in = dfr[dfr["Tipo"] == "Ingreso"]
+                    _usd_eg = float((pd.to_numeric(_eg["Monto"]) / pd.to_numeric(_eg["TRM"])).sum())
+                    _usd_in = float((pd.to_numeric(_in["Monto"]) / pd.to_numeric(_in["TRM"])).sum())
+                    st.markdown(
+                        f"**{key}** — {len(dfr)} movimiento(s): {len(_eg)} Egreso "
+                        f"(USD {_usd_eg:,.2f} · COP {pd.to_numeric(_eg['Monto']).sum():,.0f})"
+                        + (f" · {len(_in)} Ingreso (USD {_usd_in:,.2f} · "
+                           f"COP {pd.to_numeric(_in['Monto']).sum():,.0f})" if len(_in) else "")
+                        + f" · **neto USD {_usd_eg - _usd_in:,.2f}**"
+                    )
+                    st.dataframe(dfr, use_container_width=True)
+    else:
+        st.info("📂 Aún no subes el CSV de Tarjeta Intuit")
+
+
     # 3) Ingresos Nathalia Ospina (CA1633)
     st.header("4) Ingresos Nathalia Ospina (CA1633)")
     nat_files = st.file_uploader(
@@ -4897,9 +5360,12 @@ def main():
         # None para los casilleros sin movimientos en el extracto. <<<
         usbank = usbank_may.get(f"usbank_{cas}") if 'usbank_may' in locals() else None
 
+        # >>> NUEVO: TARJETA INTUIT — módulo paralelo, SOLO 1444 (get devuelve None para el resto) <<<
+        intuit = intuit_may.get(f"intuit_{cas}") if 'intuit_may' in locals() else None
+
         # 3) Armar la lista de DataFrames válidos
         frames = []
-        for df in (inc, egr, ext, env, cons, amex, rakuten, robinhood, capital, usbank):  # rakuten/robinhood 1444, capital 13608, usbank 1444/11591/13608
+        for df in (inc, egr, ext, env, cons, amex, rakuten, robinhood, capital, usbank, intuit):  # rakuten/robinhood/intuit 1444, capital 13608, usbank 11591/13608
             if df is not None and not df.empty:
                 frames.append(df)
 
