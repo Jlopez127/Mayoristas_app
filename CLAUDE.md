@@ -186,6 +186,20 @@ recalcularía la comisión **en silencio**.
    a mano.
 4. El archivo intermedio de envíos debe traer la columna **`PESO`**; sin ella la tarifa de 1444
    cae en fail-soft y no cobra.
+5. **Todo cargue termina en DOS escrituras: histórico Y lista.** Si solo se hizo la primera, el
+   cargue está a medias. Descubierto el 31-ago-2026: las 249 filas `robinhood_`, 73 `rakuten_` y
+   115 `capital_` que el módulo había cargado **no tenían ni una entrada** en
+   `tarjetas_cobradas.xlsx` — los cobros que sí estaban venían del Excel del backoffice. Sin
+   entrada, si el emisor re-fecha un movimiento su hash cambia y **no lo ve ninguna de las dos
+   barreras**: se re-cobra. Es el caso que costó COP 4.799.142.
+   - Registrar de más **no puede dejar de cobrar nada**: mientras el extracto siga generando ese
+     `Orden`, la barrera 1 lo consume y nunca llega a ser huérfano (`_cobros_huerfanos_attr`).
+   - Los atributos se **capturan envolviendo `_excluir_por_atributos`**, no se reconstruyen del
+     histórico: así usan la misma normalización que la barrera (importa en los reembolsos, cuyo
+     `Nombre del producto` no lleva el merchant crudo).
+   - Prioridad por tipo de `Orden`: **hash = frágil** (Rakuten, Robinhood, Capital, Intuit) vs.
+     **ID nativo = estable** (Amex, US Bank, Apple Pay). Al 31-ago-2026 no queda ningún hash sin
+     cubrir; Amex (245), US Bank (22) y Apple Pay (4) siguen fuera a propósito.
 
 ---
 
