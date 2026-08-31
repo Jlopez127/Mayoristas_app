@@ -45,8 +45,8 @@ ESP_NO_RECONOCIDAS = 0
 ESP_NETO_USD = 818.41
 
 # Barandas de frescura (se exigen en --escribir).
-REV_ESPERADA = None          # se fija tras el dry-run
-SALDO_ESPERADO = None
+REV_ESPERADA = "0165a58637daa4000000002f34b3f21"
+SALDO_ESPERADO = 59009031.21390714
 
 
 def saldo(d):

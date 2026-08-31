@@ -3105,8 +3105,12 @@ def agregar_incentivo_amex(combinado, cas, usuario, fecha_carga):
     # Más robusto que el texto "amex" suelto (evita falsos positivos si un merchant se llamara
     # "Rakuten X"/"Amex Y"). Nota: las filas backoffice legacy "Compra Amex" (Motivo vacío) NO
     # entran — son pre-INCENTIVO_MES_INICIO, fuera de la ventana del incentivo.
+    # "Tarjeta Apple Pay" son las 4 compras del 25-ago-2026 cargadas A MANO a 1444 (la Apple Card
+    # que se le prestó temporalmente). NO tienen módulo, pero el mayorista gastó ese USD con una
+    # tarjeta de Encargomío igual que con las otras seis, así que cuentan para el incentivo.
     es_tarjeta = motivo_s.str.strip().isin(["Tarjeta Amex", "Tarjeta Rakuten", "Tarjeta Robinhood",
-                                            "Tarjeta Capital", "Tarjeta US Bank", "Tarjeta Intuit"])
+                                            "Tarjeta Capital", "Tarjeta US Bank", "Tarjeta Intuit",
+                                            "Tarjeta Apple Pay"])
     es_incentivo = orden_s.str.startswith("incentivoamex_") | motivo_s.str.strip().eq("Incentivo Amex")
     tarjeta_mask = es_tarjeta & ~es_incentivo & tipo_u.isin(["EGRESO", "INGRESO"])
 
