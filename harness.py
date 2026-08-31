@@ -47,6 +47,15 @@ def _mk_st():
     st.cache_data = cache_data
     st.cache_resource = cache_data
 
+    class _Ctx:
+        """Context manager de verdad: los dunder se buscan en el TIPO, no en la instancia,
+        así que un SimpleNamespace con __enter__ NO sirve para `with`. Sin esto, cualquier
+        bloque `with st.expander(...)` revienta con AttributeError — pasa, por ejemplo, al
+        ejecutar guard_frescura_historico cuando SÍ hay pérdidas que reportar."""
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def __getattr__(self, n): return _cap("ctx")
+
     st.session_state = {}
     st.file_uploader = lambda *a, **k: None
     st.radio = lambda *a, **k: None
@@ -54,11 +63,10 @@ def _mk_st():
     st.button = lambda *a, **k: False
     st.checkbox = lambda *a, **k: False
     st.text_input = lambda *a, **k: ""
-    st.columns = lambda n, *a, **k: [types.SimpleNamespace() for _ in range(n if isinstance(n, int) else len(n))]
-    st.tabs = lambda names: [types.SimpleNamespace(__enter__=lambda s: s, __exit__=lambda *x: None)
-                             for _ in names]
-    st.expander = lambda *a, **k: types.SimpleNamespace(__enter__=lambda: None, __exit__=lambda *x: None)
-    st.spinner = lambda *a, **k: types.SimpleNamespace(__enter__=lambda: None, __exit__=lambda *x: None)
+    st.columns = lambda n, *a, **k: [_Ctx() for _ in range(n if isinstance(n, int) else len(n))]
+    st.tabs = lambda names: [_Ctx() for _ in names]
+    st.expander = lambda *a, **k: _Ctx()
+    st.spinner = lambda *a, **k: _Ctx()
     st.form = st.expander
     st.sidebar = types.SimpleNamespace(**{n: _cap(n) for n in ("info", "warning", "write")})
     st.rerun = lambda *a, **k: None
