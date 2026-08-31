@@ -3056,7 +3056,7 @@ def procesar_intuit(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendiente
 #   - Mes cerrado = mes ANTERIOR a fecha_carga; se crean todos los meses cerrados desde
 #     INCENTIVO_MES_INICIO que aún no tengan incentivo (robusto a corridas perdidas).
 # ──────────────────────────────────────────────────────────────────────────────
-INCENTIVO_AMEX_ACTIVO = False        # 🚦 activar (True) para que se generen los incentivos
+INCENTIVO_AMEX_ACTIVO = True         # 🚦 ENCENDIDO 31-ago-2026: el 1er incentivo generado sera el de AGOSTO
 INCENTIVO_COP_POR_USD = 25           # tarifa: COP de cashback por USD neto gastado en Amex
 # Arranca en AGOSTO (no julio): julio 2026 es 100% legacy backoffice ("Compra Amex", Motivo
 # vacío) y con la captura por Motivo EXACTO {"Tarjeta Amex","Tarjeta Rakuten"} no se calcularía
