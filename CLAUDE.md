@@ -40,7 +40,7 @@ los cuatro `procesar_*` de tarjetas existentes.
 
 ## Arquitectura en 30 segundos
 
-**Cinco tarjetas**, cada una con su módulo paralelo (no reusan código entre sí):
+**Seis tarjetas**, cada una con su módulo paralelo (no reusan código entre sí):
 
 | Módulo | Casillero | Orden (ID de cada movimiento) |
 |---|---|---|
@@ -49,6 +49,22 @@ los cuatro `procesar_*` de tarjetas existentes.
 | `procesar_robinhood` | 1444 | `robinhood_<sha1-12>` **sin hora** |
 | `procesar_capital` | 13608 | `capital_<sha1-12>` |
 | `procesar_usbank` | 11591 · 13608 | `usbank_<ref>` o `usbank_<sha1-12>` (híbrido) |
+| `procesar_intuit` | 1444 | `intuit_<sha1-12>` **sin ID nativo ni hora** |
+
+Y una **séptima sin módulo**: `applepay_` — 4 compras del 25-ago-2026 cargadas A MANO a 1444
+(Apple Card prestada temporalmente; esa tarjeta la usan también Santiago y Kelly para gasto que
+no es de 1444, por eso **no se procesa su extracto**). Tiene prefijo en `TARJETA_ORDEN_RE` y
+cuenta para el incentivo, pero no hay uploader ni `procesar_*`.
+
+⚠️ **Intuit es la más frágil**: sin ID nativo ni hora, el Orden es un hash del **monto**. Una
+fila `Pending` que liquidara por otro valor entraría como transacción nueva, y la barrera por
+atributos tampoco la vería (su llave incluye el monto). Por eso **las `Pending` nunca se
+cargan** — solo entra lo `Settled`, que ya es el monto final — y cada corrida reporta cuántas
+quedaron esperando. Su `seq` numera **las cargables primero**, para que al liquidar una
+`Pending` no se corra el `seq` de una `Settled` de la misma clave.
+Abierto y **sin verificar**: cómo se ve una devolución y cómo se ve un `Declined` en Intuit.
+Una fila que no sea compra `Settled` se **excluye y se reporta cruda**, nunca se interpreta, y
+el cargue sigue con las demás.
 
 **USD → COP** con `_amex_trm_dia()`: TRM oficial de datos.gov.co **+ 125**, consulta por rango de
 vigencia (cubre fines de semana). **Sin TRM de respaldo: si falta un día con movimiento, el
@@ -104,6 +120,20 @@ en `main()`.
 
 ---
 
+## Incentivo mensual (25 COP por USD)
+
+`INCENTIVO_COP_POR_USD = 25` sobre el **USD neto** (egresos − devoluciones) del mes cerrado,
+solo para los casilleros de `AMEX_USUARIOS` (11591 · 13608 · 1444). Cuentan **las seis tarjetas
+más Apple Pay**, capturadas por `Motivo` EXACTO en la lista blanca de `es_tarjeta` — una tarjeta
+nueva que no se añada ahí **no genera incentivo y nadie se entera**.
+
+No puede pagarse dos veces: el Orden `incentivoamex_<cas>_<YYYY-MM>` se crea una sola vez y
+**queda congelado** (no se recalcula aunque lleguen movimientos tarde), y las propias filas de
+incentivo se excluyen de su base.
+
+🚦 **Hoy está APAGADO** (`INCENTIVO_AMEX_ACTIVO = False`): no se genera solo. El de julio-2026 se
+cargó a mano. `INCENTIVO_MES_INICIO = "2026-08"`.
+
 ## Comisión quincenal
 
 `1,5% × |Total diario más negativo de la quincena|` — el día en que el mayorista **más debe**.
@@ -134,6 +164,7 @@ recalcularía la comisión **en silencio**.
 | Cifra fijada a mano | Un incentivo inventado se detectó antes de escribir. **Todo número se deriva de los datos** |
 | Criterio de aceptación en COP | Casi detiene un cargue correcto. Los criterios van **en USD** |
 | `if dfn.empty: continue` | Una hoja solo entra al pipeline si la corrida produce ≥1 fila para ella. De ahí venía el "duplicado que a veces colapsaba y a veces no" |
+| Extracto corto de Capital | Las devoluciones pierden su compra original y **pisan filas ya correctas** con una TRM peor. Pasó dos veces (25-ago y 31-ago-2026): −75.990 COP la segunda. Se detecta exigiendo **0 diferencias en Monto y TRM** al reprocesar las filas ya cargadas |
 
 ---
 
@@ -141,6 +172,8 @@ recalcularía la comisión **en silencio**.
 
 1. **🛑 No cobrar tarjetas a mano** para fechas ≥ el corte de cada tarjeta. El sistema las cobra;
    un cobro manual las duplica y **el dedup no puede verlo** (Orden numérico vs. con prefijo).
+   Cortes vigentes: Amex/Rakuten 16-jun · Robinhood 14-abr · Capital 1-jul · US Bank 17-ago ·
+   **Intuit 29-ago-2026**.
 2. **Cargar siempre rango amplio** de extractos: recargar no duplica, cargar de menos deja
    movimientos tardíos por fuera.
 3. La copia Dropbox → OneDrive (`Historico Carga/Conciliacion/Mayoristas/`) la hace el usuario
@@ -176,7 +209,7 @@ Las líneas se mueven; buscar por nombre:
 - **Blindaje**: `TARJETA_ORDEN_RE`, `preservar_filas_tarjeta`, `guard_frescura_historico`,
   `upload_to_dropbox`
 - **Tarjetas**: `procesar_amex` · `procesar_rakuten` · `procesar_robinhood` · `procesar_capital`
-  · `procesar_usbank`
+  · `procesar_usbank` · `procesar_intuit`
 - **Envíos**: `procesar_envios_mayoristas`, `aplicar_tarifa_minima_envios`,
   `aplicar_tarifa_envio_por_peso`
 - **Saldos**: `recalcular_totales_diarios`, `asegurar_columnas_historico`
