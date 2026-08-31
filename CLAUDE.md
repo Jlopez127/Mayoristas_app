@@ -131,8 +131,14 @@ No puede pagarse dos veces: el Orden `incentivoamex_<cas>_<YYYY-MM>` se crea una
 **queda congelado** (no se recalcula aunque lleguen movimientos tarde), y las propias filas de
 incentivo se excluyen de su base.
 
-🚦 **Hoy está APAGADO** (`INCENTIVO_AMEX_ACTIVO = False`): no se genera solo. El de julio-2026 se
-cargó a mano. `INCENTIVO_MES_INICIO = "2026-08"`.
+🚦 **ENCENDIDO desde el 31-ago-2026** (`INCENTIVO_AMEX_ACTIVO = True`). Con
+`INCENTIVO_MES_INICIO = "2026-08"`, el primer incentivo que se genera solo es el de **agosto**,
+en la primera corrida de septiembre (~2,34 M COP repartidos entre 11591, 13608 y 1444). El de
+julio-2026 se cargó a mano y queda fuera de la ventana.
+
+⚠️ Los scripts de cargue puntuales (`cargar_tc_*.py`, `cargar_intuit_*.py`, …) traen
+`assert INCENTIVO_AMEX_ACTIVO is False` y **abortan** ahora. Es a propósito: eran de un mundo
+donde el incentivo no se generaba solo; si hay que reusar uno, revisar el assert a conciencia.
 
 ## Comisión quincenal
 
