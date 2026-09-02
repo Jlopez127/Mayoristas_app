@@ -2743,22 +2743,29 @@ INTUIT_MOTIVO = "Tarjeta Intuit"
 INTUIT_COLS = ["Merchant", "Amount", "Rewards", "Date", "Status", "Decline Reason",
                "Address", "User"]
 INTUIT_FECHA_FORMATO = "%b %d, %Y"          # "Aug 30, 2026"
-INTUIT_MAP_USUARIO = {"maria moises": "1444"}
+# 'User' del extracto (en minúsculas) -> casillero. Confirmado con el usuario el 2026-09-02:
+# "Elvis Martinez" es la tarjeta de Paula Herrera (11591). 'santiago largo' SIGUE IGNORADO: su
+# gasto NO es de 1444 (mismo criterio que en Robinhood).
+INTUIT_MAP_USUARIO = {"maria moises": "1444", "elvis martinez": "11591"}
 INTUIT_USUARIOS_IGNORAR = {"santiago largo"}
 INTUIT_STATUS_VALIDOS = {"Settled"}
-INTUIT_USUARIOS = {"1444": "Maria Moises"}
+INTUIT_USUARIOS = {"1444": "Maria Moises", "11591": "Paula Herrera"}
 
 # ⚠️ CA1444 / COMISIÓN QUINCENAL — True: el gasto Intuit SÍ cuenta en la base de la comisión
 # quincenal de 1444 (igual que Amex/Rakuten/Robinhood, que también alimentan ese casillero).
 INTUIT_AFECTA_COMISION_1444 = True
 
-# 🚦 FECHA DE CORTE. El extracto trae la HISTORIA COMPLETA desde el primer día (confirmado con
-# el usuario: no hay extracto anterior), que arranca el 2026-08-29 — así que el corte es solo un
-# límite de sanidad: LA LISTA DE EXCLUSIÓN ES LA QUE MANDA.
+# 🚦 FECHA DE CORTE. ⚠️ El 2026-09-02 se descubrió que el "2026-08-29" original era FALSO: la
+# tarjeta no empezaba ahí, es que **Intuit descarga de a 7 movimientos** y el primer extracto
+# venía truncado. Con 13 descargas acumuladas aparecieron 12 compras de Maria del 26 al 28-ago
+# (USD 8.058,52) que el corte estaba descartando en silencio. Se movió a 2026-08-26 CON OK del
+# usuario, tras verificar que no alcanza ninguna quincena ya comisionada: la de 1-15 ago está
+# escrita y fuera de la ventana, y la de 16-31 ago no existe (1444 no tuvo ningún día negativo).
+# El corte es solo un límite de sanidad: LA LISTA DE EXCLUSIÓN ES LA QUE MANDA.
 #   - None -> INACTIVO (kill switch de emergencia: no se procesa nada).
 # ⚠️ NUNCA mover esta fecha HACIA ATRÁS: alcanzaría quincenas de 1444 ya comisionadas y las
 # recalcularía en silencio.
-INTUIT_FECHA_DESDE = "2026-08-29"
+INTUIT_FECHA_DESDE = "2026-08-26"
 
 
 def _intuit_monto(s: pd.Series) -> pd.Series:
@@ -3038,7 +3045,13 @@ def procesar_intuit(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendiente
     out = pd.DataFrame(filas)
     if out.empty:
         return {}
-    return {f"intuit_{INTUIT_CASILLERO}": out.reset_index(drop=True)}
+    # 🔑 UNA CLAVE POR CASILLERO (igual que US Bank). Antes devolvía todo bajo
+    # `intuit_{INTUIT_CASILLERO}` fijo: con un solo casillero mapeado daba lo mismo, pero al
+    # mapear un segundo usuario (Elvis Martinez -> 11591) sus filas habrían caído en la hoja de
+    # 1444, porque main() lee `intuit_may.get(f"intuit_{cas}")`. Con un solo casillero mapeado
+    # el resultado es idéntico al anterior.
+    return {f"intuit_{c}": g.reset_index(drop=True)
+            for c, g in out.groupby(out["Casillero"].astype(str), sort=False)}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
