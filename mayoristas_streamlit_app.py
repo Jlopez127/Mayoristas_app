@@ -2375,12 +2375,16 @@ USBANK_MAP_SUBTARJETA = {"0598": "11591", "0609": "13608"}
 # el más caro de todos (fueron 1.372 millones de COP).
 # ⚠️ NO reasignarla a un casillero sin confirmación explícita del usuario: que Kelly compre para
 # Maria en Amex NO implica que lo haga en US Bank.
-USBANK_SUBTARJETAS_IGNORAR = {"0534", "2529"}   # 0534 Santiago Largo · 2529 Kelly (sin asignar)
+# 🔴 6554 (Jose Ignacio Saenz) SE IGNORA desde el 2026-09-07 (decisión del usuario): su único
+# movimiento es Amazon Web Services USD 2.249,74 del 2-sep, gasto de la empresa. No es
+# mayorista; si algún día lo fuera, mapearlo explícitamente, nunca por analogía.
+USBANK_SUBTARJETAS_IGNORAR = {"0534", "2529", "6554"}   # 0534 Santiago Largo · 2529 Kelly (sin asignar) · 6554 Jose I. Saenz (AWS, empresa)
 USBANK_NOMBRE_ESPERADO = {                 # solo control cruzado (el código manda)
     "2529": "LOPEZ VELANDIA,KELLY P",
     "0598": "HERRERA,PAULA",
     "0609": "SANCHEZ,JULIAN",
     "0534": "LARGO,SANTIAGO",
+    "6554": "SAENZ,JOSE IGNACIO",
 }
 USBANK_USUARIOS = {"1444": "Maria Moises", "11591": "Paula Herrera", "13608": "Julian Sanchez"}
 USBANK_MOTIVO = "Tarjeta US Bank"
