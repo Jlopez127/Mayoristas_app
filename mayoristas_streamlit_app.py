@@ -437,6 +437,111 @@ def _neutralizar_compras_tc_propia(df: pd.DataFrame, cas: str) -> pd.DataFrame:
     return df
 
 
+# ── 🐛 SUBCOBRO POR ERROR DE CANTIDAD (pago anticipado, portal 3.0) ───────────────────
+# El flujo de PAGO ANTICIPADO POR TRANSFERENCIA cobró 1 unidad en vez de la cantidad real en
+# órdenes con más de un producto (cotizaciones creadas desde el backoffice). `Valor de compra
+# COP` del Reporte_compras —de donde procesar_egresos saca el Monto— trae el valor de UNA
+# unidad, así que el mayorista quedó subcobrado. Detectado por Pablo Agudelo el 2026-09-08 y
+# escalado a S&G. Los demás métodos de pago (PSE, Stripe, Wompi, Bancolombia, Sistecredito,
+# Addi) NO están afectados.
+#
+# ⚠️ POR QUÉ SE APLICA EN CADA CORRIDA Y NO UNA SOLA VEZ SOBRE EL HISTÓRICO:
+#   mientras S&G no corrija el bug, el reporte SIGUE trayendo el valor malo, y el dedup por
+#   Orden (keep="last", con el archivo concatenado DESPUÉS del histórico) reescribiría la
+#   corrección en la siguiente corrida. Mismo motivo y mismo patrón que COMPRAS_TC_PROPIA.
+#
+# ⚠️ NO se puede derivar el valor correcto con una fórmula: en 4 de las 12 órdenes el debido
+#   NO es "cobrado x unidades" (166049, 167672, 168362, 168380 traen costos que no se
+#   multiplican). Por eso el USD debido se fija A MANO, con los valores del correo.
+#
+# Orden -> (casillero, USD debido). El COP se calcula con la TRM de la propia fila, que es
+# como se valora todo lo demás en el histórico.
+SUBCOBRO_CANTIDAD_30 = {
+    # 9444 · Maira Alejandra Paez — 5 órdenes, USD 4.899,35 de diferencia
+    "166049": ("9444",  1775.98),
+    "167672": ("9444",  1079.97),
+    "168362": ("9444",  2568.02),
+    "168378": ("9444",  1709.90),
+    "168380": ("9444",   854.95),
+    # 9680 · Juan Felipe Laverde — 5 órdenes, USD 4.387,43
+    "165950": ("9680",   489.04),
+    "165951": ("9680",   769.94),
+    "167079": ("9680",  1139.97),
+    "167341": ("9680",  1077.00),
+    "168066": ("9680",  2849.95),
+    # 14825 · Cristian Javier Castro — 2 órdenes, USD 1.015,68
+    "163366": ("14825",  629.28),
+    "166951": ("14825", 1051.56),
+    # ⏸️ 168510 (9680, USD 2.279,96): la transferencia estaba PENDIENTE y Pablo pidió NO
+    #    aprobarla tal como estaba. Se deja registrada para que, si igual se aprueba, entre
+    #    con el valor correcto en vez del subcobrado. Si se rechaza, nunca aparece y esta
+    #    entrada no hace nada.
+    "168510": ("9680",  2279.96),
+}
+
+
+def _corregir_subcobro_cantidad(df: pd.DataFrame, cas: str) -> pd.DataFrame:
+    """Reescribe el Monto de las órdenes subcobradas por el bug de cantidad del portal 3.0
+    al valor correcto (USD debido x TRM de la fila) en la hoja de `cas`.
+
+    Se aplica en CADA corrida —igual que _neutralizar_compras_tc_propia— tanto a la fila que
+    ya está en el histórico como a la que vuelva a traer el Reporte_compras, y ANTES del dedup
+    por Orden. No borra ni agrega filas: solo cambia el Monto, así que el Orden sigue existiendo
+    y la capa A no lo ve como pérdida.
+
+    Si una fila ya trae el valor correcto, avisa: es la señal de que S&G corrigió el bug y esa
+    entrada se puede retirar del diccionario. Si le falta la TRM, avisa y la deja intacta (no
+    se inventa un valor)."""
+    if df is None or df.empty or "Orden" not in df.columns:
+        return df
+
+    objetivo = {
+        str(orden).strip(): usd
+        for orden, (casillero, usd) in SUBCOBRO_CANTIDAD_30.items()
+        if str(casillero).strip() == str(cas).strip()
+    }
+    if not objetivo:
+        return df
+
+    norm = df["Orden"].astype(str).str.strip().str.replace(".0", "", regex=False)
+    es_egreso = df["Tipo"].astype(str).str.strip().str.upper() == "EGRESO"
+    mask = norm.isin(objetivo) & es_egreso
+    if not mask.any():
+        return df
+
+    df = df.copy()
+    trm = pd.to_numeric(df.loc[mask, "TRM"], errors="coerce")
+    usd = norm[mask].map(objetivo).astype(float)
+    correcto = (usd * trm).round(2)
+    actual = pd.to_numeric(df.loc[mask, "Monto"], errors="coerce")
+
+    sin_trm = trm.isna()
+    if sin_trm.any():
+        st.warning(
+            f"⚠️ Subcobro 3.0 ({cas}): {int(sin_trm.sum())} fila(s) sin TRM legible "
+            f"({', '.join(sorted(norm[mask][sin_trm].unique()))}) — NO se corrigen, se dejan "
+            f"como están. Revisar a mano."
+        )
+    ya_ok = (~sin_trm) & ((actual - correcto).abs() <= 1)
+    if ya_ok.any():
+        st.info(
+            f"✅ Subcobro 3.0 ({cas}): {int(ya_ok.sum())} orden(es) ya llegan con el valor "
+            f"correcto ({', '.join(sorted(norm[mask][ya_ok].unique()))}) — el bug del portal "
+            f"parece corregido; se pueden retirar de SUBCOBRO_CANTIDAD_30."
+        )
+    aplicar = (~sin_trm) & (~ya_ok)
+    if aplicar.any():
+        idx = correcto[aplicar].index
+        delta = float((correcto[aplicar] - actual[aplicar]).sum())
+        st.warning(
+            f"🐛 Subcobro 3.0 ({cas}): {int(aplicar.sum())} orden(es) corregidas por el error "
+            f"de cantidad del portal — COP {delta:+,.0f} "
+            f"({', '.join(sorted(norm[mask][aplicar].unique()))})."
+        )
+        df.loc[idx, "Monto"] = correcto[aplicar]
+    return df
+
+
 @st.cache_data
 def procesar_envios_mayoristas(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """
@@ -5482,6 +5587,11 @@ def main():
             # del dedup (que conserva keep="last") y del recálculo de totales, para
             # que el saldo se recompute sin ese cargo.
             combinado = _neutralizar_compras_tc_propia(combinado, cas)
+
+            # 🐛 Subcobro por error de cantidad del portal 3.0: se reescribe el Monto al valor
+            # correcto en CADA corrida (el reporte sigue trayendo el valor malo hasta que S&G
+            # corrija el bug). Va antes del dedup, que conserva keep="last".
+            combinado = _corregir_subcobro_cantidad(combinado, cas)
 
             combinado["Tipo"] = combinado["Tipo"].astype(str).str.strip()
             
