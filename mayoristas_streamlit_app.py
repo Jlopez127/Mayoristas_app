@@ -88,7 +88,10 @@ def upload_to_dropbox(data: bytes):
 # Santiago y Kelly para gasto que no es de 1444, por eso no se procesa su extracto). Va aquí
 # para que la capa B las reponga si alguien sube un histórico rezagado — es exactamente el
 # olvido de prefijo que costó las 128 filas de Robinhood el 24-jul-2026.
-TARJETA_ORDEN_RE = r"^(?:amex_|rakuten_|robinhood_|capital_|usbank_|intuit_|applepay_|gastoamex|reembolsoamex)"
+# `migracionamex_` son los cargos del lote de migración Amex→US Bank del 19-ago-2026 que el
+# banco cobró sin respaldo, cargados A MANO al 15-ago (como applepay_: ningún módulo los
+# regenera, así que la capa B tiene que saber reinyectarlos).
+TARJETA_ORDEN_RE = r"^(?:amex_|rakuten_|robinhood_|capital_|usbank_|intuit_|applepay_|migracionamex_|gastoamex|reembolsoamex)"
 
 
 def _es_not_found(e: Exception) -> bool:
