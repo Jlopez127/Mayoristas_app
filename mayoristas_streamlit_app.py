@@ -91,7 +91,7 @@ def upload_to_dropbox(data: bytes):
 # `migracionamex_` son los cargos del lote de migración Amex→US Bank del 19-ago-2026 que el
 # banco cobró sin respaldo, cargados A MANO al 15-ago (como applepay_: ningún módulo los
 # regenera, así que la capa B tiene que saber reinyectarlos).
-TARJETA_ORDEN_RE = r"^(?:amex_|rakuten_|robinhood_|capital_|usbank_|intuit_|applepay_|migracionamex_|gastoamex|reembolsoamex)"
+TARJETA_ORDEN_RE = r"^(?:amex_|rakuten_|robinhood_|capital_|usbank_|intuit_|discover_|applepay_|migracionamex_|gastoamex|reembolsoamex)"
 
 
 def _es_not_found(e: Exception) -> bool:
@@ -3235,7 +3235,7 @@ def agregar_incentivo_amex(combinado, cas, usuario, fecha_carga):
     # tarjeta de Encargomío igual que con las otras seis, así que cuentan para el incentivo.
     es_tarjeta = motivo_s.str.strip().isin(["Tarjeta Amex", "Tarjeta Rakuten", "Tarjeta Robinhood",
                                             "Tarjeta Capital", "Tarjeta US Bank", "Tarjeta Intuit",
-                                            "Tarjeta Apple Pay"])
+                                            "Tarjeta Apple Pay", "Tarjeta Discover"])
     es_incentivo = orden_s.str.startswith("incentivoamex_") | motivo_s.str.strip().eq("Incentivo Amex")
     tarjeta_mask = es_tarjeta & ~es_incentivo & tipo_u.isin(["EGRESO", "INGRESO"])
 
@@ -3284,6 +3284,358 @@ CONS_NOMBRES = {
     "9680": "Juan Felipe Laverde", "14825": "Cristian Javier Castro",
     "13297": "Christian Trujillo",
 }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cargue "Tarjeta Discover" (7ª tarjeta con módulo; PARALELO, NO reusa procesar_*).
+# SOLO Julian Sanchez -> casillero 13608.
+#
+#   - 👤 EL TITULAR ES SANTIAGO LARGO ("Acct Ending 4244"), NO Julian. Decisión EXPLÍCITA del
+#     usuario (2026-09-14): *todas* las compras de esta tarjeta desde el 9-sep-2026 inclusive
+#     son de Julian. Es lo contrario de lo que vale en las otras tarjetas, donde el gasto de
+#     Santiago se IGNORA (Robinhood, Intuit, US Bank 0534) — por eso queda escrito aquí.
+#     ⚠️ NO extender este criterio a otra tarjeta de Santiago sin confirmación explícita: el
+#     mapeo por analogía ya costó revertir 1.063 movimientos en US Bank.
+#
+#   - 📄 FUENTE: el "xls" que baja Discover es HTML disfrazado (una <table> por documento), no
+#     un Excel. Se parsea con `html.parser` de la stdlib — sin lxml/bs4, que NO están en
+#     requirements.txt y no hay por qué añadir una dependencia para esto.
+#     Columnas: Trans. date | Post date | Description | Amount | Category.
+#
+#   - 💶 EL MONTO VIENE EN FORMATO EUROPEO: "1.054,32" son mil cincuenta y cuatro con 32, y
+#     "-10.000" son menos diez mil. Punto = miles, coma = decimales. Leerlo como US daría
+#     1,05 y -10,0 — dos órdenes de magnitud de error. Ver _discover_monto.
+#
+#   - 💵 CLASIFICACIÓN por Category:
+#       'Payments and Credits' -> IGNORAR SIEMPRE (pagos a la tarjeta: "PAYMENT - THANK YOU").
+#       cualquier otra (Merchandise, Department Stores, ...) con Amount > 0 -> Egreso (gasto).
+#       cualquier otra con Amount < 0 -> Ingreso (devolución del comercio).
+#     Una Category nueva NO hace fail-loud (Discover las inventa por comercio: 'Department
+#     Stores', 'Merchandise', 'Services'...); lo que manda es el signo. Los pagos se detectan
+#     por Category exacta, y como red de seguridad también por la descripción 'PAYMENT'.
+#
+#   - USD -> COP con _amex_trm_dia (datos.gov.co, +125) por Trans. date. SIN TRM de respaldo.
+#
+#   - 1-a-1: Discover NO trae ID nativo -> Orden determinista por transacción:
+#       clave = "<Trans. date>|<Amount crudo>|<Description>|<seq>"
+#       Orden = "discover_" + sha1(clave, utf-8)[:12]
+#     El seq va sobre un ORDEN CANÓNICO (clave, Post date) y no sobre el de lectura, para que
+#     dos descargas den el mismo seq a la misma transacción (igual que Robinhood y Capital).
+#     ⚠️ El hash incluye el monto: si Discover re-expidiera un movimiento con otro importe
+#     entraría como nuevo. Esa es justo la grieta que tapa la 2ª barrera por atributos.
+#
+#   - Motivo = "Tarjeta Discover" (tag EXACTO que captura el incentivo de 25 COP/USD; hay que
+#     mantenerlo en la lista blanca de agregar_incentivo_amex y en _MOTIVOS_TC de Dash.py).
+#   - REEMBOLSOS: cada Ingreso se convierte con la TRM DE SU COMPRA ORIGINAL (las mismas 3
+#     pasadas de _resolver_trm_reembolsos que usan las demás), para netear sin residuo.
+#   - COMISIÓN: 13608 no tiene comisión quincenal. Estas filas mueven su saldo y nada más.
+# ──────────────────────────────────────────────────────────────────────────────
+DISCOVER_CASILLERO = "13608"
+DISCOVER_USUARIO = "Julian Sanchez"
+DISCOVER_CUENTA = "4244"              # titular Santiago Largo; compra para Julian (ver arriba)
+DISCOVER_COLS = ["Trans. date", "Post date", "Description", "Amount", "Category"]
+DISCOVER_CAT_PAGO = "Payments and Credits"
+DISCOVER_MOTIVO = "Tarjeta Discover"
+
+# 🚦 FECHA DE CORTE — MISMAS 3 reglas que las otras tarjetas:
+#   1. el histórico de cobrados MANDA (la LISTA decide, no el corte);
+#   2. el corte es límite de sanidad para no procesar historia que no es de Julian;
+#   3. todo lo nuevo fuera de lista se toma.
+#   ⚠️ AQUÍ EL CORTE SÍ ES UNA REGLA DE NEGOCIO, no solo sanidad: antes del 9-sep-2026 la
+#   tarjeta era gasto de Santiago y NO se le cobra a Julian. Mover esta fecha hacia atrás le
+#   cargaría a Julian compras que no son suyas.
+#   - None -> INACTIVO (kill switch de emergencia).
+DISCOVER_FECHA_DESDE = "2026-09-09"
+
+
+def _discover_monto(s) -> float:
+    """Monto de Discover a float. El extracto usa formato EUROPEO: '1.054,32' -> 1054.32 y
+    '-10.000' -> -10000.0. Se quitan los puntos (miles) y la coma pasa a punto decimal."""
+    t = str(s).strip().replace("$", "").replace("\xa0", "").replace(" ", "")
+    if not t or t.lower() in {"nan", "none"}:
+        return float("nan")
+    neg = t.startswith("-")
+    t = t.lstrip("+-").replace(".", "").replace(",", ".")
+    try:
+        v = float(t)
+    except ValueError:
+        return float("nan")
+    return -v if neg else v
+
+
+def leer_discover(contenido) -> pd.DataFrame:
+    """Lee el 'xls' de Discover (HTML disfrazado) y devuelve un DF con DISCOVER_COLS.
+
+    Acepta bytes, un file-like (el uploader de Streamlit) o una ruta. Usa html.parser de la
+    stdlib: no hace falta lxml ni bs4. Levanta ValueError si no encuentra la tabla, para no
+    devolver un DF vacío en silencio y que parezca "no hay movimientos"."""
+    from html.parser import HTMLParser
+
+    if hasattr(contenido, "read"):
+        contenido = contenido.read()
+    if isinstance(contenido, bytes):
+        texto = contenido.decode("utf-8", errors="replace")
+    elif isinstance(contenido, str) and "<" not in contenido[:200]:
+        with open(contenido, encoding="utf-8", errors="replace") as fh:
+            texto = fh.read()
+    else:
+        texto = str(contenido)
+
+    class _T(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.filas, self._fila, self._celda, self._en = [], None, None, False
+        def handle_starttag(self, tag, attrs):
+            if tag == "tr":
+                self._fila = []
+            elif tag in ("td", "th"):
+                self._celda, self._en = [], True
+        def handle_endtag(self, tag):
+            if tag in ("td", "th") and self._en:
+                if self._fila is not None:
+                    self._fila.append(" ".join("".join(self._celda).split()))
+                self._celda, self._en = None, False
+            elif tag == "tr" and self._fila is not None:
+                self.filas.append(self._fila)
+                self._fila = None
+        def handle_data(self, d):
+            if self._en and self._celda is not None:
+                self._celda.append(d)
+
+    p = _T()
+    p.feed(texto)
+    # la fila de cabecera es la que trae 'Trans. date'
+    hdr_i = next((i for i, f in enumerate(p.filas)
+                  if f and str(f[0]).strip().lower().startswith("trans")), None)
+    if hdr_i is None:
+        raise ValueError(
+            "El archivo de Discover no tiene la tabla esperada (no se encontró la fila de "
+            "cabecera 'Trans. date'). ¿Es el 'xls' que descarga Discover?"
+        )
+    hdr = [c.strip() for c in p.filas[hdr_i]]
+    datos = [f for f in p.filas[hdr_i + 1:] if len(f) == len(hdr) and any(c for c in f)]
+    df = pd.DataFrame(datos, columns=hdr)
+    faltan = [c for c in DISCOVER_COLS if c not in df.columns]
+    if faltan:
+        raise ValueError(
+            f"El archivo de Discover no trae las columnas esperadas: {', '.join(faltan)}. "
+            f"Encontradas: {', '.join(map(str, df.columns))}."
+        )
+    return df
+
+
+def _discover_clave_y_seq(df: pd.DataFrame):
+    """Clave e índice de repetición del Orden Discover (1-a-1).
+
+    Clave = Trans. date | Amount CRUDO | Description. Se usa el Amount tal como viene en el
+    archivo (texto), no el float: así el hash no depende de cómo se formatee al parsear.
+    El 'seq' se asigna sobre un ORDEN CANÓNICO (clave, Post date) y NO sobre el de lectura,
+    para que dos descargas den el mismo seq a la misma transacción."""
+    clave = (df["Trans. date"].astype(str).str.strip() + "|"
+             + df["Amount"].astype(str).str.strip() + "|"
+             + df["Description"].astype(str).str.strip())
+    canon = pd.DataFrame(
+        {"_k": clave, "_p": df["Post date"].astype(str).str.strip()}
+    ).sort_values(["_k", "_p"], kind="mergesort")
+    seq = canon.groupby("_k").cumcount().reindex(df.index).astype(str)
+    return clave, seq
+
+
+def _discover_orden(clave: pd.Series, seq: pd.Series) -> pd.Series:
+    """Orden 1-a-1 de Discover: discover_<sha1-12 de 'clave|seq'>."""
+    return "discover_" + (clave + "|" + seq).map(
+        lambda s: hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
+    )
+
+
+def procesar_discover(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendientes=None,
+                      hist_tarjetas=None, cobrados_df=None) -> dict[str, pd.DataFrame]:
+    """Transforma el extracto de Discover en {discover_13608: DF} con UNA fila COP por
+    movimiento cargable (1-a-1, Orden = discover_<sha1-12>; ver bloque de arriba).
+
+    Levanta ValueError si faltan columnas o si falta la TRM de cualquier día con movimiento.
+    'fecha_desde' descarta transacciones anteriores (None -> no procesa nada). 'cobrados'
+    (OBLIGATORIO) = set de Orden ya cobrados: esas transacciones se EXCLUYEN. 'cobrados_df' =
+    la lista con atributos, para la segunda barrera anti-recobro. 'hist_tarjetas' = filas de
+    tarjeta del histórico, para darle a una devolución la TRM de su compra original.
+    'pendientes' se acepta por simetría de firma pero NO se usa: Discover no tiene auth
+    pendientes de rematch."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    faltan = [c for c in DISCOVER_COLS if c not in df.columns]
+    if faltan:
+        raise ValueError(
+            f"El extracto de Discover no tiene las columnas esperadas: {', '.join(faltan)}.")
+
+    # INACTIVO sin fecha de corte: no se procesa nada (se validan columnas ANTES).
+    if fecha_desde is None:
+        return {}
+
+    # 🛡️ LISTA DE EXCLUSIÓN obligatoria: procesar sin lista recobraría lo ya cobrado.
+    if cobrados is None:
+        raise ValueError(
+            "Falta la lista de exclusión 'tarjetas cobradas' (cobrados=None). "
+            "No se procesa nada: sin la lista se recobrarían transacciones ya cobradas."
+        )
+
+    df["_fecha"] = pd.to_datetime(df["Trans. date"], format="%m/%d/%Y", errors="coerce")
+    if df["_fecha"].isna().any():
+        raise ValueError(
+            f"Discover: {int(df['_fecha'].isna().sum())} fila(s) con 'Trans. date' ilegible "
+            f"(se espera MM/DD/YYYY). No se genera ningún movimiento."
+        )
+    df["_monto"] = df["Amount"].map(_discover_monto)
+    if df["_monto"].isna().any():
+        raise ValueError(
+            f"Discover: {int(df['_monto'].isna().sum())} fila(s) con 'Amount' ilegible. "
+            f"No se genera ningún movimiento."
+        )
+
+    # Rango del extracto (sobre TODAS las filas, incluidas las ignoradas) para la 2ª barrera.
+    _rango_extracto = (df["_fecha"].min(), df["_fecha"].max()) if len(df) else None
+
+    # 💵 PAGOS A LA TARJETA: se ignoran siempre. Por Category exacta y, como red de seguridad,
+    # por la descripción (Discover los escribe "PAYMENT - THANK YOU").
+    _cat = df["Category"].astype(str).str.strip()
+    _desc = df["Description"].astype(str).str.strip()
+    _m_pago = _cat.eq(DISCOVER_CAT_PAGO) | _desc.str.upper().str.startswith("PAYMENT")
+    if _m_pago.any():
+        _cobradas_info(
+            f"ℹ️ Discover: {int(_m_pago.sum())} pago(s) a la tarjeta ignorados "
+            f"(USD {float(df.loc[_m_pago, '_monto'].abs().sum()):,.2f}) — no son compras."
+        )
+    df = df[~_m_pago].copy()
+    if df.empty:
+        return {}
+
+    # Amount == 0 no es un movimiento real.
+    df = df[df["_monto"] != 0].copy()
+    if df.empty:
+        return {}
+
+    # Signo -> tipo. Positivo = gasto; negativo = devolución del comercio.
+    df["_tipo"] = df["_monto"].map(lambda v: "Egreso" if v > 0 else "Ingreso")
+    df["_usd"] = df["_monto"].abs()
+
+    # 🚦 CORTE: aquí es REGLA DE NEGOCIO (antes del corte la tarjeta no es de Julian).
+    _antes = df["_fecha"] < pd.Timestamp(fecha_desde)
+    if _antes.any():
+        _cobradas_info(
+            f"ℹ️ Discover: {int(_antes.sum())} movimiento(s) anteriores a {fecha_desde} "
+            f"(USD {float(df.loc[_antes, '_usd'].sum()):,.2f}) — NO son de "
+            f"{DISCOVER_USUARIO}, se ignoran."
+        )
+    df = df[~_antes].copy()
+    if df.empty:
+        return {}
+
+    _clave, _seq = _discover_clave_y_seq(df)
+    df["_orden"] = _discover_orden(_clave, _seq)
+    # FAIL-LOUD: una colisión de hash colapsaría dos movimientos en uno.
+    if df["_orden"].duplicated().any():
+        raise ValueError(
+            "Colisión de hash en el Orden Discover (dos transacciones distintas generaron el "
+            "mismo Orden). No se genera ningún movimiento."
+        )
+    df["_fecha_iso"] = df["_fecha"].dt.strftime("%Y-%m-%d")
+    df["_merch_attr"] = _desc.reindex(df.index)
+
+    # 🛡️ BARRERA 1 (principal): excluir lo que ya está en la lista, por Orden. Va ANTES de la TRM.
+    _ordenes_universo = set(df["_orden"])
+    _compras_universo = [
+        {"id": r["_orden"], "fecha": r["_fecha"], "merch": r["_merch_attr"],
+         "usd": round(float(r["_usd"]), 2), "cm": DISCOVER_USUARIO, "cas": DISCOVER_CASILLERO,
+         "trm_fecha": r["_fecha"].strftime("%Y-%m-%d")}
+        for _, r in df[df["_tipo"] == "Egreso"].iterrows()
+    ]
+    _ya = df["_orden"].isin(cobrados)
+    if _ya.any():
+        _cobradas_info(
+            f"🛡️ Discover: {int(_ya.sum())} movimiento(s) ya liquidados (lista de exclusión) — "
+            f"excluidos: USD {float(df.loc[_ya, '_usd'].sum()):,.2f}."
+        )
+    df = df[~_ya].copy()
+    if df.empty:
+        return {}
+
+    # 🛡️ BARRERA 2 (por atributos, independiente del hash): tapa el caso en que Discover
+    # re-expidiera un movimiento ya liquidado con la fecha o el importe corridos. La llave
+    # incluye el SIGNO, para que un cobro-compra huérfano no tape al reembolso de esa compra.
+    _drop_attr = _excluir_por_atributos(df, cobrados_df, "discover", _ordenes_universo,
+                                        _rango_extracto, "Discover")
+    if _drop_attr:
+        df = df.drop(index=_drop_attr)
+    if df.empty:
+        return {}
+
+    # 🔁 Reembolso -> TRM DE SU COMPRA ORIGINAL (neteo exacto). Solo toca los Ingreso.
+    _reembolsos = [
+        {"id": r["_orden"], "fecha": r["_fecha"], "merch": r["_merch_attr"],
+         "usd": round(float(r["_usd"]), 2), "cm": DISCOVER_USUARIO, "cas": DISCOVER_CASILLERO}
+        for _, r in df[df["_tipo"] == "Ingreso"].iterrows()
+    ]
+    _trm_ok, _trm_sin_match, _trm_ambiguos = _resolver_trm_reembolsos(
+        _reembolsos, _compras_universo,
+        _indice_compras_historico(hist_tarjetas, "discover_", DISCOVER_MOTIVO),
+    )
+    if _trm_sin_match:
+        _cobradas_warn(
+            f"⚠️ Discover: {len(_trm_sin_match)} devolución(es) sin compra original "
+            f"identificable — se usa la TRM de su propio día. REVISAR a mano: "
+            + "; ".join(_trm_sin_match[:6])
+        )
+    if _trm_ambiguos:
+        _cobradas_warn(
+            f"⚠️ Discover: {len(_trm_ambiguos)} devolución(es) con varias compras candidatas; "
+            f"se tomó la compra MÁS RECIENTE anterior al reembolso."
+        )
+
+    # TRM por día (+125). Incluye los días de las COMPRAS ORIGINALES de los reembolsos.
+    trm_cache: dict = {}
+    faltantes = set()
+    _dias = set(df["_fecha_iso"].unique()) | {
+        f for f, origen, _, _p in _trm_ok.values() if origen == "extracto"
+    }
+    for f_iso in sorted(_dias):
+        if _amex_trm_dia(f_iso, trm_cache) is None:
+            faltantes.add(f_iso)
+    if faltantes:
+        raise ValueError(
+            f"Sin TRM (datos.gov.co) para los días con movimiento Discover: "
+            f"{', '.join(sorted(faltantes))}. No se genera ningún movimiento "
+            f"(no hay TRM de respaldo)."
+        )
+
+    cas = DISCOVER_CASILLERO
+    filas = []
+    for _, r in df.iterrows():
+        tipo, f_iso = r["_tipo"], r["_fecha_iso"]
+        trm = trm_cache[f_iso]
+        etq = "gasto" if tipo == "Egreso" else "reembolso"
+        _m = _trm_ok.get(r["_orden"]) if tipo == "Ingreso" else None
+        if _m:
+            _f_compra, _origen, _trm_hist, _parcial = _m
+            trm = _trm_hist if _origen == "historico" else trm_cache[_f_compra]
+            etq = f"reembolso{' parcial' if _parcial else ''} (TRM compra {_f_compra})"
+        filas.append({
+            "Fecha": f_iso,
+            "Tipo": tipo,
+            "Monto": round(float(r["_usd"]) * trm),   # COP, POSITIVO
+            "Orden": r["_orden"],
+            "Motivo": DISCOVER_MOTIVO,
+            "TRM": round(trm, 2),
+            "Usuario": DISCOVER_USUARIO,
+            "Casillero": cas,
+            "Estado de Orden": "",
+            "Nombre del producto": f"Tarjeta Discover - {etq} - "
+                                   f"{' '.join(str(r['Description']).split())}",
+        })
+
+    out = pd.DataFrame(filas)
+    if out.empty:
+        return {}
+    return {f"discover_{cas}": out.reset_index(drop=True)}
+
 
 
 @st.cache_data(ttl=120)
@@ -5013,6 +5365,94 @@ def main():
         st.info("📂 Aún no subes el CSV de Tarjeta Intuit")
 
 
+    st.markdown("---")
+    st.header("3.8) Tarjeta Discover")
+
+    discover_file = st.file_uploader(
+        "Sube el archivo de Discover (el .xls que descarga el portal: Statement o Recent "
+        "Activity). Columnas: Trans. date, Post date, Description, Amount, Category",
+        type=["xls", "xlsx", "csv", "html", "htm"],
+        accept_multiple_files=True,
+        key="discover_uploader"
+    )
+    discover_may = {}  # dict global para usar después en conciliaciones (solo 13608)
+
+    if DISCOVER_FECHA_DESDE:
+        st.success(f"✅ Corte Discover ACTIVO: solo transacciones con fecha ≥ {DISCOVER_FECHA_DESDE}")
+    else:
+        st.warning("⚠️ Discover INACTIVO — `DISCOVER_FECHA_DESDE` está en None. No se carga "
+                   "ninguna fila (protección anti doble-conteo).")
+
+    st.caption(f"💳 Alimenta un solo casillero: **{DISCOVER_CASILLERO} "
+               f"({DISCOVER_USUARIO})**. ⚠️ La cuenta está a nombre de **Santiago Largo** "
+               f"(termina en {DISCOVER_CUENTA}), pero por decisión del 2026-09-14 **todas** sus "
+               f"compras desde el {DISCOVER_FECHA_DESDE} son de {DISCOVER_USUARIO}. Lo anterior "
+               f"a esa fecha se ignora: era gasto de Santiago.")
+    st.caption("📄 El «.xls» de Discover es **HTML disfrazado**, no un Excel. Se parsea con la "
+               "stdlib, así que puedes subir el archivo tal como lo baja el portal. Puedes "
+               "subir VARIOS a la vez (Statement + Recent Activity): se unen y el dedup por "
+               "Orden evita duplicar el solape.")
+    st.caption("💶 Los montos vienen en formato **europeo** («1.054,32» son mil cincuenta y "
+               "cuatro): el módulo lo convierte. Los **pagos a la tarjeta** («PAYMENT - THANK "
+               "YOU», Category «Payments and Credits») se ignoran: no son compras.")
+
+    if discover_file:
+        if DISCOVER_FECHA_DESDE is None:
+            st.error("🔒 Cargue Discover BLOQUEADO: no hay fecha de corte definida "
+                     "(DISCOVER_FECHA_DESDE=None).")
+            st.stop()
+        try:
+            tarjetas_cobradas_dc, tarjetas_pendientes_dc, tarjetas_cobradas_dc_df = cargar_tarjetas_cobradas()
+            st.caption(f"🛡️ Lista de exclusión cargada: {len(tarjetas_cobradas_dc)} Orden ya "
+                       f"cobrados + {len(tarjetas_pendientes_dc)} pendientes de rematch.")
+            _aviso_barrera_atributos(tarjetas_cobradas_dc_df)
+        except Exception as e:
+            st.error(f"🔒 Cargue Discover BLOQUEADO: no se pudo leer "
+                     f"'{TARJETAS_COBRADAS_FILENAME}' desde Dropbox ({e}). Sin la lista de "
+                     f"exclusión se recobrarían transacciones ya cobradas. NO se procesa nada.")
+            st.stop()
+
+        df_discover = None
+        try:
+            _partes = [leer_discover(f) for f in discover_file]
+            df_discover = pd.concat(_partes, ignore_index=True)
+            st.caption(f"📄 {len(discover_file)} archivo(s) · **{len(df_discover)}** fila(s) "
+                       f"leídas en total.")
+        except ValueError as e:
+            st.error(f"❌ {e}")
+        except Exception as e:
+            st.error(f"❌ No se pudo leer el archivo de Discover: {e}")
+
+        if df_discover is not None:
+            try:
+                discover_may = procesar_discover(df_discover, fecha_desde=DISCOVER_FECHA_DESDE,
+                                                 cobrados=tarjetas_cobradas_dc,
+                                                 pendientes=tarjetas_pendientes_dc,
+                                                 hist_tarjetas=_hist_tarjetas_para_trm(),
+                                                 cobrados_df=tarjetas_cobradas_dc_df)
+            except ValueError as e:
+                st.error(f"⛔ {e}")
+                st.stop()  # DETENER: falta TRM, columnas, fecha/monto ilegible o colisión
+            if not discover_may:
+                st.info("No hay movimientos Discover cargables desde la fecha de corte.")
+            else:
+                for key, dfr in discover_may.items():
+                    _eg = dfr[dfr["Tipo"] == "Egreso"]
+                    _in = dfr[dfr["Tipo"] == "Ingreso"]
+                    _usd_eg = float((pd.to_numeric(_eg["Monto"]) / pd.to_numeric(_eg["TRM"])).sum())
+                    _usd_in = float((pd.to_numeric(_in["Monto"]) / pd.to_numeric(_in["TRM"])).sum()) if len(_in) else 0.0
+                    st.markdown(
+                        f"**{key}** — {len(dfr)} movimiento(s): {len(_eg)} Egreso "
+                        f"(USD {_usd_eg:,.2f} · COP {pd.to_numeric(_eg['Monto']).sum():,.0f})"
+                        + (f" · {len(_in)} Ingreso (USD {_usd_in:,.2f} · "
+                           f"COP {pd.to_numeric(_in['Monto']).sum():,.0f})" if len(_in) else "")
+                        + f" · **neto USD {_usd_eg - _usd_in:,.2f}**"
+                    )
+                    st.dataframe(dfr, use_container_width=True)
+    else:
+        st.info("📂 Aún no subes el archivo de Tarjeta Discover")
+
+
     # 3) Ingresos Nathalia Ospina (CA1633)
     st.header("4) Ingresos Nathalia Ospina (CA1633)")
     nat_files = st.file_uploader(
@@ -5492,9 +5932,13 @@ def main():
         # >>> NUEVO: TARJETA INTUIT — módulo paralelo, SOLO 1444 (get devuelve None para el resto) <<<
         intuit = intuit_may.get(f"intuit_{cas}") if 'intuit_may' in locals() else None
 
+        # >>> NUEVO: TARJETA DISCOVER — módulo paralelo, SOLO 13608 (None para el resto) <<<
+        discover = discover_may.get(f"discover_{cas}") if 'discover_may' in locals() else None
+
         # 3) Armar la lista de DataFrames válidos
         frames = []
-        for df in (inc, egr, ext, env, cons, amex, rakuten, robinhood, capital, usbank, intuit):  # rakuten/robinhood/intuit 1444, capital 13608, usbank 11591/13608
+        for df in (inc, egr, ext, env, cons, amex, rakuten, robinhood, capital, usbank, intuit,
+                   discover):  # rakuten/robinhood/intuit 1444, capital/discover 13608, usbank 11591/13608
             if df is not None and not df.empty:
                 frames.append(df)
 
