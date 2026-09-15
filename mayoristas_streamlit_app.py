@@ -5960,7 +5960,8 @@ def main():
         # >>> NUEVO: TARJETA ROBINHOOD — módulo paralelo, SOLO 1444 (get devuelve None para el resto) <<<
         robinhood = robinhood_may.get(f"robinhood_{cas}") if 'robinhood_may' in locals() else None
 
-        # >>> NUEVO: TARJETA CAPITAL — módulo paralelo, SOLO 13608 (get devuelve None para el resto) <<<
+        # >>> TARJETA CAPITAL — MULTI-casillero desde el traspaso del 9-sep-2026: 13608 lo anterior,
+        # 11591 las compras nuevas. El get devuelve None para los casilleros sin movimientos. <<<
         capital = capital_may.get(f"capital_{cas}") if 'capital_may' in locals() else None
 
         # >>> NUEVO: TARJETA US BANK — MULTI-casillero (1444 / 11591 / 13608); el get devuelve
