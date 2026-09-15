@@ -2109,6 +2109,27 @@ def procesar_robinhood(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendie
 # ──────────────────────────────────────────────────────────────────────────────
 CAPITAL_CASILLERO = "13608"
 CAPITAL_USUARIO = "Julian Sanchez"
+
+# 🔁 TRASPASO DE TITULAR (decisión del usuario 2026-09-15): la 1484 dejó de ser de Julian y
+# pasó a Paula el 2026-09-09. Desde esa fecha **toda COMPRA nueva es de Paula**.
+#   ⚠️ Los REEMBOLSOS no siguen la fecha del movimiento sino la de SU COMPRA ORIGINAL: una
+#   devolución que llega en septiembre de algo que Julian pagó en agosto es de JULIAN. Si fuera
+#   por fecha, Julian se quedaría con el cargo y Paula recibiría el abono de una compra que
+#   nunca pagó. `_resolver_trm_reembolsos` ya devuelve la fecha de la compra original (la usa
+#   para la TRM), así que se reaprovecha esa misma resolución — no hay que emparejar dos veces.
+#   Un reembolso sin compra identificable cae por su propia fecha y se avisa.
+#   - None -> sin traspaso (todo a CAPITAL_CASILLERO), que es como estaba antes.
+CAPITAL_FECHA_TRASPASO = "2026-09-09"
+CAPITAL_CASILLERO_DESDE = "11591"
+CAPITAL_USUARIO_DESDE = "Paula Herrera"
+
+
+def _capital_cas_por_fecha(f_iso: str):
+    """(casillero, usuario) de un movimiento de Capital según la fecha que le corresponde.
+    Antes del traspaso -> Julian; desde el traspaso -> Paula."""
+    if CAPITAL_FECHA_TRASPASO and str(f_iso) >= CAPITAL_FECHA_TRASPASO:
+        return CAPITAL_CASILLERO_DESDE, CAPITAL_USUARIO_DESDE
+    return CAPITAL_CASILLERO, CAPITAL_USUARIO
 CAPITAL_CARD_NO = "1484"
 CAPITAL_COLS = ["Transaction Date", "Posted Date", "Card No.", "Description", "Category",
                 "Debit", "Credit"]
@@ -2369,15 +2390,23 @@ def procesar_capital(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendient
         )
 
     filas = []
+    _reemb_sin_origen = []
     for _, r in df.iterrows():
         tipo, f_iso = r["_tipo"], r["_fecha_iso"]
         trm = trm_cache[f_iso]
         etq = "gasto" if tipo == "Egreso" else "reembolso"
+        # 🔁 El casillero sale de la fecha del movimiento... salvo en los reembolsos, que siguen
+        # a SU COMPRA ORIGINAL (ver CAPITAL_FECHA_TRASPASO).
+        f_cas = f_iso
         _m = _trm_ok.get(r["_orden"]) if tipo == "Ingreso" else None
         if _m:
             _f_compra, _origen, _trm_hist, _parcial = _m
             trm = _trm_hist if _origen == "historico" else trm_cache[_f_compra]
             etq = f"reembolso{' parcial' if _parcial else ''} (TRM compra {_f_compra})"
+            f_cas = _f_compra
+        elif tipo == "Ingreso" and CAPITAL_FECHA_TRASPASO:
+            _reemb_sin_origen.append(f"{f_iso} USD {float(r['_usd']):,.2f}")
+        cas_fila, usuario_fila = _capital_cas_por_fecha(f_cas)
         desc = " ".join(str(r["Description"]).split())
         filas.append({
             "Fecha": f_iso,
@@ -2386,16 +2415,25 @@ def procesar_capital(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendient
             "Orden": r["_orden"],
             "Motivo": "Tarjeta Capital",
             "TRM": round(trm, 2),
-            "Usuario": CAPITAL_USUARIO,
-            "Casillero": CAPITAL_CASILLERO,
+            "Usuario": usuario_fila,
+            "Casillero": cas_fila,
             "Estado de Orden": "",
             "Nombre del producto": f"Tarjeta Capital - {etq} - {desc}",
         })
+    if _reemb_sin_origen:
+        _cobradas_warn(
+            f"⚠️ Capital: {len(_reemb_sin_origen)} devolución(es) sin compra original "
+            f"identificable — se asignan por SU PROPIA fecha, no por la de la compra. "
+            f"REVISAR a quién corresponden: {'; '.join(_reemb_sin_origen[:6])}"
+        )
 
     out = pd.DataFrame(filas)
     if out.empty:
         return {}
-    return {f"capital_{CAPITAL_CASILLERO}": out.reset_index(drop=True)}
+    # MULTI-casillero desde el traspaso: una clave por casillero con movimientos, igual que
+    # US Bank e Intuit. main() lee capital_may.get(f"capital_{cas}") y recibe None donde no hay.
+    return {f"capital_{c}": g.reset_index(drop=True)
+            for c, g in out.groupby(out["Casillero"].astype(str), sort=False)}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
