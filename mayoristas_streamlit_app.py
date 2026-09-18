@@ -405,10 +405,17 @@ def _es_envio_bloqueado(orden_series: pd.Series) -> pd.Series:
 # Idempotente: se re-aplica en cada corrida sobre el histórico Y sobre lo que
 # traiga el archivo de compras, así que el cargo no puede volver a aparecer.
 # Gateado por casillero: una Orden solo se neutraliza en SU hoja.
+#
+# También se usa para cualquier otra orden que NO se debe cobrar aunque el portal la siga
+# trayendo (p. ej. una compra agotada que nunca se hizo): el mecanismo es el mismo.
 # ──────────────────────────────────────────────────────────────────────────────
 COMPRAS_TC_PROPIA = {
     # "Orden": ("casillero", "Motivo que queda escrito en la fila")
     "163730": ("11591", "Compra con su propia TC"),
+    # RTX 5070 del 14-sep-2026: 'Cancelada' + 'Agotado = Si', sin tienda, sin Nº de compra ni
+    # tarjeta -> nunca se compró. Se recompró al día siguiente como 170541 (eBay, USD 611,82),
+    # que SÍ se cobra. Cobrar las dos era cobrarle a Paula USD 866,84 de más.
+    "170314": ("11591", "Agotada, recomprada como 170541"),
 }
 
 
