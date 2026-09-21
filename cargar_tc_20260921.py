@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cargue de CUATRO tarjetas del 2026-09-21, en UNA sola escritura de histórico y UNA de lista.
+Cargue de CINCO tarjetas del 2026-09-21, en UNA sola escritura de histórico y UNA de lista.
 
     Capital   -> 11591 Paula           2026-09-21_transaction_download (2).csv   (card 1484)
     US Bank   -> 11591 Paula + 13608   Credit Card - 0613_08-21-2026_09-25-2026.csv
     Intuit    -> 1444 Maria + 11591    Compras TC/intuit_acumulado.csv (SOLO LECTURA: lo arma
                                        Compras TC/intuit_merge.py; 21-sep 10:27, 206 filas)
     Rakuten   -> 1444 Maria            Rakuten_Activity_All (7).csv (nov-2025 -> 20-sep, completo)
+    Discover  -> 13608 Julian          Discover-RecentActivity-20260921.xls (Santi, desde 9-sep)
+
+Discover: requiere el fix 2ff9534 (devoluciones del comercio en 'Payments and Credits' + las
+compras de Amazon retenidas + barrera 2 con casillero y signo). Las 3 de Amazon (USD 3.149,97)
+NO entran: 2 del 14-sep no aplican y la del 15-sep espera validación del usuario.
 
 Intuit: la frontera 16/17-sep del acumulado no está verificada con ninguna página del portal
 (aviso de la sesión de Compras TC). Si faltara algún cargo, entra en el próximo cargue; no hay
@@ -64,10 +69,11 @@ CSV_CAPITAL = f"{DL}/2026-09-21_transaction_download (2).csv"
 CSV_USBANK = f"{DL}/Credit Card - 0613_08-21-2026_09-25-2026.csv"
 CSV_INTUIT = "/Users/julianlopez/Library/CloudStorage/OneDrive-Personal/Encargomio/Compras TC/intuit_acumulado.csv"
 CSV_RAKUTEN = f"{DL}/Rakuten_Activity_All (7).csv"
+XLS_DISCOVER = f"{DL}/Discover-RecentActivity-20260921.xls"
 
 # tarjeta -> (nombre del módulo, constante de corte, prefijo, card_norm por casillero)
 CARD_NORM = {"13608": "JULIAN SANCHEZ", "11591": "PAULA HERRERA", "1444": "MARIA MOISES"}
-NOTA = "cargue TC 2026-09-21 (Capital 1484 -> Paula + US Bank + Intuit + Rakuten)"
+NOTA = "cargue TC 2026-09-21 (Capital 1484 -> Paula + US Bank + Intuit + Rakuten + Discover)"
 
 REV_ESPERADA = "0165bfd4332f37e00000002f34b3f21"
 # lo que debe entrar: (casillero, prefijo) -> (filas, USD neto)
@@ -78,6 +84,7 @@ ESPERADO = {
     ("1444",  "intuit_"):  (13,  9528.01),
     ("11591", "intuit_"):  (2,   1195.99),
     ("1444",  "rakuten_"): (12,  1749.32),
+    ("13608", "discover_"): (29, 23330.57),
 }
 # filas por prefijo que ya hay en el histórico, por casillero
 PREVIAS = {"13608": {"capital_": 122, "usbank_": 29, "discover_": 22, "amex_": 1, "migracionamex_": 3},
@@ -128,9 +135,8 @@ def main():
         return None
     mod._amex_trm_dia = _trm
 
-    # 🧯 tripwires: solo Capital, US Bank, Intuit y Rakuten, y nunca el incentivo
-    for fn in ("procesar_amex", "procesar_robinhood",
-               "procesar_discover", "procesar_egresos", "agregar_incentivo_amex"):
+    # 🧯 tripwires: solo Capital, US Bank, Intuit, Rakuten y Discover, y nunca el incentivo
+    for fn in ("procesar_amex", "procesar_robinhood", "procesar_egresos", "agregar_incentivo_amex"):
         def _boom(*a, _n=fn, **k):
             raise AssertionError(f"{_n} fue llamada — este script no carga esa tarjeta")
         setattr(mod, fn, _boom)
@@ -141,7 +147,9 @@ def main():
     for k in ("CAPITAL_FECHA_DESDE", "CAPITAL_FECHA_TRASPASO", "CAPITAL_CASILLERO",
               "CAPITAL_CASILLERO_DESDE", "CAPITAL_CARD_NO", "USBANK_FECHA_DESDE",
               "USBANK_MAP_SUBTARJETA", "USBANK_SUBTARJETAS_IGNORAR",
-              "INTUIT_FECHA_DESDE", "INTUIT_MAP_USUARIO", "RAKUTEN_FECHA_DESDE", "RAKUTEN_CASILLERO"):
+              "INTUIT_FECHA_DESDE", "INTUIT_MAP_USUARIO", "RAKUTEN_FECHA_DESDE", "RAKUTEN_CASILLERO",
+              "DISCOVER_FECHA_DESDE", "DISCOVER_CASILLERO", "DISCOVER_EXCLUIR_RANGOS",
+              "DISCOVER_RETENIDAS"):
         print(f"  {k:<26} = {getattr(mod, k)}")
     chk("Capital: traspaso a Paula el 2026-09-09",
         mod.CAPITAL_FECHA_TRASPASO == "2026-09-09" and mod.CAPITAL_CASILLERO_DESDE == "11591")
@@ -149,8 +157,12 @@ def main():
         mod.USBANK_MAP_SUBTARJETA == {"0598": "11591", "0609": "13608"})
     chk("Intuit: Maria -> 1444, Elvis -> 11591",
         mod.INTUIT_MAP_USUARIO == {"maria moises": "1444", "elvis martinez": "11591"})
-    chk("capital_, usbank_, intuit_ y rakuten_ protegidos por la capa B",
-        all(p in mod.TARJETA_ORDEN_RE for p in ("capital_", "usbank_", "intuit_", "rakuten_")))
+    chk("capital_, usbank_, intuit_, rakuten_ y discover_ protegidos por la capa B",
+        all(p in mod.TARJETA_ORDEN_RE for p in ("capital_", "usbank_", "intuit_", "rakuten_", "discover_")))
+    chk("Discover: a Julian desde el 9-sep, Amazon 9-14 excluida y la del 15-sep retenida",
+        mod.DISCOVER_FECHA_DESDE == "2026-09-09" and mod.DISCOVER_CASILLERO == "13608"
+        and ("AMAZON", "2026-09-09", "2026-09-14") in mod.DISCOVER_EXCLUIR_RANGOS
+        and "AMAZON.COM*5L3RC1722" in mod.DISCOVER_RETENIDAS)
 
     banner("1) HISTÓRICO VIVO FRESCO")
     cfg = mod.st.secrets["dropbox"]
@@ -193,6 +205,7 @@ def main():
         "usbank": pd.read_csv(CSV_USBANK),
         "intuit": pd.read_csv(CSV_INTUIT, encoding="utf-8-sig"),
         "rakuten": pd.read_csv(CSV_RAKUTEN),
+        "discover": mod.leer_discover(XLS_DISCOVER),
     }
     chk("el extracto de Capital es SOLO de la 1484",
         set(crudos["capital"]["Card No."].astype(str)) == {str(mod.CAPITAL_CARD_NO)},
@@ -201,7 +214,8 @@ def main():
     for nom, fn, corte in (("capital", mod.procesar_capital, mod.CAPITAL_FECHA_DESDE),
                            ("usbank", mod.procesar_usbank, mod.USBANK_FECHA_DESDE),
                            ("intuit", mod.procesar_intuit, mod.INTUIT_FECHA_DESDE),
-                           ("rakuten", mod.procesar_rakuten, mod.RAKUTEN_FECHA_DESDE)):
+                           ("rakuten", mod.procesar_rakuten, mod.RAKUTEN_FECHA_DESDE),
+                           ("discover", mod.procesar_discover, mod.DISCOVER_FECHA_DESDE)):
         out = fn(crudos[nom].copy(), fecha_desde=corte, cobrados=cobrados, pendientes=pendientes,
                  hist_tarjetas=hist_t, cobrados_df=cobrados_df)
         print(f"\n  ── {nom.upper()} · {len(crudos[nom])} filas crudas · corte {corte}")
@@ -224,7 +238,7 @@ def main():
         chk(f"{clave:<18} {n_esp} filas · USD neto {usd_esp:,.2f}",
             len(d) == n_esp and abs(neto - usd_esp) < 0.02, f"{len(d)} · USD {neto:,.2f}")
     todas = pd.concat([d for d in nuevas.values() if len(d)], ignore_index=True)
-    chk("0 Orden duplicados entre las cuatro tarjetas", not todas["Orden"].duplicated().any())
+    chk("0 Orden duplicados entre las cinco tarjetas", not todas["Orden"].duplicated().any())
     chk("ninguna está ya en la lista de exclusión",
         not (set(todas["Orden"].astype(str)) & set(cobrados)))
     ya = set().union(*[set(o0[c]) for c in o0])
@@ -257,7 +271,8 @@ def main():
     for nom, fn, corte in (("capital", mod.procesar_capital, mod.CAPITAL_FECHA_DESDE),
                            ("usbank", mod.procesar_usbank, mod.USBANK_FECHA_DESDE),
                            ("intuit", mod.procesar_intuit, mod.INTUIT_FECHA_DESDE),
-                           ("rakuten", mod.procesar_rakuten, mod.RAKUTEN_FECHA_DESDE)):
+                           ("rakuten", mod.procesar_rakuten, mod.RAKUTEN_FECHA_DESDE),
+                           ("discover", mod.procesar_discover, mod.DISCOVER_FECHA_DESDE)):
         todo = fn(crudos[nom].copy(), fecha_desde=corte, cobrados=set(), pendientes=None,
                   hist_tarjetas=hist_t, cobrados_df=None)
         harness.clear_msgs()
@@ -522,14 +537,15 @@ def main():
     chk2("0 Orden duplicados", not c2["Orden"].astype(str).str.strip().duplicated().any())
     print(f"  rev lista NUEVA = {md_l2.rev}")
 
-    banner("12) 🔥 PRUEBA DE FUEGO: recargar los cuatro extractos ya no cobra nada")
+    banner("12) 🔥 PRUEBA DE FUEGO: recargar los cinco extractos ya no cobra nada")
     cob2, pen2, cdf2 = mod.cargar_tarjetas_cobradas(); harness.clear_msgs()
     ht2 = mod.cargar_hist_tarjetas(); harness.clear_msgs()
     tot = 0
     for nom, fn, corte in (("capital", mod.procesar_capital, mod.CAPITAL_FECHA_DESDE),
                            ("usbank", mod.procesar_usbank, mod.USBANK_FECHA_DESDE),
                            ("intuit", mod.procesar_intuit, mod.INTUIT_FECHA_DESDE),
-                           ("rakuten", mod.procesar_rakuten, mod.RAKUTEN_FECHA_DESDE)):
+                           ("rakuten", mod.procesar_rakuten, mod.RAKUTEN_FECHA_DESDE),
+                           ("discover", mod.procesar_discover, mod.DISCOVER_FECHA_DESDE)):
         o3 = fn(crudos[nom].copy(), fecha_desde=corte, cobrados=cob2, pendientes=pen2,
                 hist_tarjetas=ht2, cobrados_df=cdf2)
         harness.clear_msgs()
