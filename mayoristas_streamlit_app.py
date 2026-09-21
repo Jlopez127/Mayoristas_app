@@ -869,7 +869,8 @@ def cargar_hist_tarjetas():
         if "Orden" not in _dfh.columns:
             continue
         _o = _dfh["Orden"].astype(str).str.strip()
-        _sel = _dfh[_o.str.startswith(("amex_", "rakuten_", "robinhood_", "capital_", "usbank_", "intuit_"))]
+        _sel = _dfh[_o.str.startswith(("amex_", "rakuten_", "robinhood_", "capital_", "usbank_", "intuit_",
+                                       "discover_"))]
         if len(_sel):
             partes.append(_sel)
     return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
@@ -3392,6 +3393,15 @@ DISCOVER_MOTIVO = "Tarjeta Discover"
 #   - None -> INACTIVO (kill switch de emergencia).
 DISCOVER_FECHA_DESDE = "2026-09-09"
 
+# 🚫 COMPRAS QUE NO SE LE CARGAN A JULIAN (decisión del usuario). Se excluyen DESPUÉS de calcular
+# el Orden (no mueven el hash de nadie), junto con las devoluciones de esas mismas compras, y se
+# avisan en cada corrida para que no pasen en silencio.
+#   - Amazon del 9 al 14-sep-2026: "no aplican" (usuario, 2026-09-15).
+#   - La de Amazon del 15-sep queda RETENIDA hasta que el usuario la valide (2026-09-21). Las
+#     tres están en ~/Downloads/20260921_Discover_Santi_Amazon_por_validar.xlsx.
+DISCOVER_EXCLUIR_RANGOS = [("AMAZON", "2026-09-09", "2026-09-14")]   # (prefijo desc, desde, hasta)
+DISCOVER_RETENIDAS = {"AMAZON.COM*5L3RC1722": "Amazon del 15-sep, por validar (2026-09-21)"}
+
 
 def _discover_monto(s) -> float:
     """Monto de Discover a float. El extracto usa formato EUROPEO: '1.054,32' -> 1054.32 y
@@ -3541,9 +3551,30 @@ def procesar_discover(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendien
 
     # 💵 PAGOS A LA TARJETA: se ignoran siempre. Por Category exacta y, como red de seguridad,
     # por la descripción (Discover los escribe "PAYMENT - THANK YOU").
+    # 🔁 Pero Discover pone TAMBIÉN las devoluciones del comercio en esa Category. Un crédito
+    # (monto < 0) cuya descripción es IDÉNTICA a la de una compra —del extracto o ya cargada—
+    # es una devolución, no un pago (eBay trae el nº de orden en la descripción). Lo demás de
+    # esa Category se sigue ignorando. Hasta el 2026-09-21 se ignoraban TODAS (5 devoluciones,
+    # USD 1.976,19, habían quedado sin abonar).
     _cat = df["Category"].astype(str).str.strip()
     _desc = df["Description"].astype(str).str.strip()
+    _desc_n = _desc.map(lambda s: " ".join(s.upper().split()))
     _m_pago = _cat.eq(DISCOVER_CAT_PAGO) | _desc.str.upper().str.startswith("PAYMENT")
+    _desc_compras = set(_desc_n[~_m_pago & (df["_monto"] > 0)])
+    if hist_tarjetas is not None and len(hist_tarjetas) and "Orden" in hist_tarjetas.columns:
+        _pref_g = "TARJETA DISCOVER - GASTO - "
+        _hd = hist_tarjetas[hist_tarjetas["Orden"].astype(str).str.startswith("discover_")]
+        _desc_compras |= {s[len(_pref_g):] for s in _hd["Nombre del producto"].astype(str)
+                          .map(lambda s: " ".join(s.upper().split())) if s.startswith(_pref_g)}
+    _m_dev = (_m_pago & (df["_monto"] < 0) & _desc_n.isin(_desc_compras)
+              & ~_desc.str.upper().str.contains("PAYMENT"))
+    _m_pago = _m_pago & ~_m_dev
+    if _m_dev.any():
+        _cobradas_info(
+            f"🔁 Discover: {int(_m_dev.sum())} devolución(es) del comercio en "
+            f"'{DISCOVER_CAT_PAGO}' (USD {float(df.loc[_m_dev, '_monto'].abs().sum()):,.2f}) — "
+            f"se abonan como reembolso."
+        )
     if _m_pago.any():
         _cobradas_info(
             f"ℹ️ Discover: {int(_m_pago.sum())} pago(s) a la tarjeta ignorados "
@@ -3584,6 +3615,29 @@ def procesar_discover(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendien
         )
     df["_fecha_iso"] = df["_fecha"].dt.strftime("%Y-%m-%d")
     df["_merch_attr"] = _desc.reindex(df.index)
+
+    # 🚫 Compras que NO se cargan (DISCOVER_EXCLUIR_RANGOS / DISCOVER_RETENIDAS) y las
+    # devoluciones de esas mismas compras. Va después del Orden: no mueve el hash de nadie.
+    _d_up = _desc_n.reindex(df.index)
+    _m_exc = pd.Series(False, index=df.index)
+    for _px, _ini_x, _fin_x in DISCOVER_EXCLUIR_RANGOS:
+        _m_exc |= (_d_up.str.startswith(_px.upper()) & (df["_tipo"] == "Egreso")
+                   & (df["_fecha"] >= pd.Timestamp(_ini_x))
+                   & (df["_fecha"] <= pd.Timestamp(_fin_x)))
+    for _tok in DISCOVER_RETENIDAS:
+        _m_exc |= _d_up.str.startswith(_tok.upper())
+    _m_exc |= (df["_tipo"] == "Ingreso") & _d_up.isin(set(_d_up[_m_exc]))
+    if _m_exc.any():
+        _cobradas_warn(
+            f"🚫 Discover: {int(_m_exc.sum())} movimiento(s) NO se cargan por decisión del "
+            f"usuario (Amazon 9-14 sep / retenidas por validar), USD "
+            f"{float(df.loc[_m_exc, '_usd'].sum()):,.2f}: "
+            + "; ".join(f"{r['_fecha_iso']} {r['_tipo']} {r['_usd']:,.2f} {str(r['Description'])[:24]}"
+                        for _, r in df[_m_exc].iterrows())
+        )
+        df = df[~_m_exc].copy()
+    if df.empty:
+        return {}
 
     # 🛡️ BARRERA 1 (principal): excluir lo que ya está en la lista, por Orden. Va ANTES de la TRM.
     _ordenes_universo = set(df["_orden"])
