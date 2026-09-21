@@ -3660,6 +3660,11 @@ def procesar_discover(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendien
     # 🛡️ BARRERA 2 (por atributos, independiente del hash): tapa el caso en que Discover
     # re-expidiera un movimiento ya liquidado con la fecha o el importe corridos. La llave
     # incluye el SIGNO, para que un cobro-compra huérfano no tape al reembolso de esa compra.
+    # 🐛 FIX 2026-09-21: faltaban _cas y _tipo_attr. Mientras no hubiera cobros huérfanos la
+    # barrera salía antes de leerlos; con el primer movimiento re-fechado habría reventado
+    # (KeyError) y, sin signo, una compra huérfana podía tapar su propia devolución.
+    df["_cas"] = DISCOVER_CASILLERO
+    df["_tipo_attr"] = df["_tipo"]
     _drop_attr = _excluir_por_atributos(df, cobrados_df, "discover", _ordenes_universo,
                                         _rango_extracto, "Discover")
     if _drop_attr:
