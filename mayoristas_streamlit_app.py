@@ -416,6 +416,24 @@ COMPRAS_TC_PROPIA = {
     # tarjeta -> nunca se compró. Se recompró al día siguiente como 170541 (eBay, USD 611,82),
     # que SÍ se cobra. Cobrar las dos era cobrarle a Paula USD 866,84 de más.
     "170314": ("11591", "Agotada, recomprada como 170541"),
+    # Envíos REFACTURADOS el 24-sep-2026: el portal volvió a emitir con número nuevo 10 envíos
+    # de Paula que ya estaban cobrados (16, 17 y 23-sep), sin anular los viejos. Mismo valor y
+    # misma TRM del original; el 106329 salió partido en cuatro. El dedup no los ve (Orden
+    # distinto). Decisión del usuario (25-sep): se quedan cobrados los ANTERIORES y se
+    # neutralizan los nuevos. Total que se dejaba de más: COP 8.526.289.
+    "Envio 106540": ("11591", "Refacturado: ya cobrado en Envio 106329"),
+    "Envio 106539": ("11591", "Refacturado: ya cobrado en Envio 106329"),
+    "Envio 106538": ("11591", "Refacturado: ya cobrado en Envio 106329"),
+    "Envio 106537": ("11591", "Refacturado: ya cobrado en Envio 106329"),
+    "Envio 106535": ("11591", "Refacturado: ya cobrado en Envio 105468"),
+    "Envio 106534": ("11591", "Refacturado: ya cobrado en Envio 105342"),
+    "Envio 106532": ("11591", "Refacturado: ya cobrado en Envio 105465"),
+    "Envio 106531": ("11591", "Refacturado: ya cobrado en Envio 105336"),
+    "Envio 106529": ("11591", "Refacturado: ya cobrado en Envio 105335"),
+    "Envio 106528": ("11591", "Refacturado: ya cobrado en Envio 105534"),
+    "Envio 106472": ("11591", "Refacturado: ya cobrado en Envio 105340"),
+    "Envio 106471": ("11591", "Refacturado: ya cobrado en Envio 105339"),
+    "Envio 106470": ("11591", "Refacturado: ya cobrado en Envio 105469"),
 }
 
 
@@ -2904,7 +2922,9 @@ INTUIT_FECHA_FORMATO = "%b %d, %Y"          # "Aug 30, 2026"
 # 'User' del extracto (en minúsculas) -> casillero. Confirmado con el usuario el 2026-09-02:
 # "Elvis Martinez" es la tarjeta de Paula Herrera (11591). 'santiago largo' SIGUE IGNORADO: su
 # gasto NO es de 1444 (mismo criterio que en Robinhood).
-INTUIT_MAP_USUARIO = {"maria moises": "1444", "elvis martinez": "11591"}
+# 2026-09-28: "Juan Pablo Correal" (usuario nuevo) también compra para Maria Moises (1444), igual
+# que el "correal" de la migración Amex.
+INTUIT_MAP_USUARIO = {"maria moises": "1444", "elvis martinez": "11591", "juan pablo correal": "1444"}
 INTUIT_USUARIOS_IGNORAR = {"santiago largo"}
 INTUIT_STATUS_VALIDOS = {"Settled"}
 INTUIT_USUARIOS = {"1444": "Maria Moises", "11591": "Paula Herrera"}
