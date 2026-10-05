@@ -444,6 +444,9 @@ COMPRAS_TC_PROPIA = {
     "170157": ("11591", "Reembolsada por la tienda (Walmart Business, US Bank 0534 23-sep)"),
     "172579": ("11591", "Reembolsada por la tienda (eBay 24-15190-36684, Capital 5263 26-sep)"),
     "158942": ("11591", "Reembolsada por la tienda (eBay 04-14961-90867, reportado por Paula 5-oct)"),
+    # La 166413 se dejó cobrada en un primer momento; el usuario decidió quitarla también ese
+    # mismo día, al ver que se pagó con la AAdvantage (no es tarjeta de mayoristas).
+    "166413": ("11591", "Reembolsada por la tienda (eBay 25-15067-50540, AAdvantage; reportado por Paula 5-oct)"),
 }
 
 
