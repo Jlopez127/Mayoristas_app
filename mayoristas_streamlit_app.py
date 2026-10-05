@@ -434,6 +434,16 @@ COMPRAS_TC_PROPIA = {
     "Envio 106472": ("11591", "Refacturado: ya cobrado en Envio 105340"),
     "Envio 106471": ("11591", "Refacturado: ya cobrado en Envio 105339"),
     "Envio 106470": ("11591", "Refacturado: ya cobrado en Envio 105469"),
+    # Compras REEMBOLSADAS por la tienda, reportadas por Paula el 5-oct-2026. Se pagaron con
+    # tarjetas de Encargomío que no se le cargan (US Bank 0534 de Santiago, Capital 5263 de
+    # Iris...), así que el reembolso nunca le llega por el módulo de tarjetas. Decisión del
+    # usuario (5-oct): se le quitan todas menos la 166413 (eBay 25-15067-50540, USD 600,99).
+    "170158": ("11591", "Reembolsada por la tienda (Walmart Business, US Bank 0534 22/23-sep)"),
+    "170310": ("11591", "Reembolsada por la tienda (Walmart Business, US Bank 0534 22/23-sep)"),
+    "170161": ("11591", "Reembolsada por la tienda (Walmart Business, US Bank 0534 22/23-sep)"),
+    "170157": ("11591", "Reembolsada por la tienda (Walmart Business, US Bank 0534 23-sep)"),
+    "172579": ("11591", "Reembolsada por la tienda (eBay 24-15190-36684, Capital 5263 26-sep)"),
+    "158942": ("11591", "Reembolsada por la tienda (eBay 04-14961-90867, reportado por Paula 5-oct)"),
 }
 
 
