@@ -447,6 +447,14 @@ COMPRAS_TC_PROPIA = {
     # La 166413 se dejó cobrada en un primer momento; el usuario decidió quitarla también ese
     # mismo día, al ver que se pagó con la AAdvantage (no es tarjeta de mayoristas).
     "166413": ("11591", "Reembolsada por la tienda (eBay 25-15067-50540, AAdvantage; reportado por Paula 5-oct)"),
+    # Envíos FRACCIONADOS de Paula (reporte del 7-oct-2026): el portal deja el padre en estado
+    # 'Fraccionado' con su valor completo y cobra además cada hijo (columna ENVIO MADRE del
+    # export). Esta vez se quita el PADRE y se cobran los hijos. 107953 y 108166 son hijos que se
+    # volvieron a partir, así que también son padres. Total cobrado dos veces: COP 11.474.440.
+    "Envio 107727": ("11591", "Fraccionado: se cobra en sus hijos 107983+107984+107985"),
+    "Envio 107027": ("11591", "Fraccionado: se cobra en sus hijos 107951+107952+107953"),
+    "Envio 107953": ("11591", "Fraccionado: se cobra en sus hijos 108165+108166"),
+    "Envio 108166": ("11591", "Fraccionado: se cobra en sus hijos 108338+108339"),
 }
 
 
