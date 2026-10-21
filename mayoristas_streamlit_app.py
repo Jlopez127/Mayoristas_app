@@ -4453,6 +4453,55 @@ COL_PESO_HIST = "Peso_lb"   # nombre canónico del peso (LIBRAS) en el históric
 TARIFA_ENVIO_1444 = {"usd_por_libra": 6.0, "fijo": 5.0, "min_libras": 1.0}
 TARIFA_ENVIO_1444_DESDE = "2026-08-14"   # fecha de envío desde la que aplica (>= estricto)
 
+# ⚖️ PESO FINAL de envíos de CA1444 (sep-2026), aprobado por Julián el 21-oct-2026.
+# El portal cobró con el peso del Dash (casi siempre 1 lb); el peso final real fue otro
+# (archivo 20261019_Comparacion_pesos_1444_resumida.xlsx). Aquí se fija el peso final y
+# aplicar_tarifa_envio_por_peso lo usa en CADA corrida en vez del que traiga la fila: el archivo
+# de envíos es una ventana de ~30 días y vuelve a traer algunos con el peso viejo; como el dedup
+# es keep="last", sin esto el siguiente cargue revertiría la corrección.
+# Solo los envíos cuyo cobro cambia (186: 182 suben, 4 bajan). Los 4 sin peso final
+# (103722, 103991, 105244, 106746) no están: se dejan como se cobraron.
+PESO_FINAL_1444 = {
+    "Envio 103743": 2.2, "Envio 103846": 2.2, "Envio 103853": 4.41, "Envio 103854": 2.2, "Envio 103856": 2.2,
+    "Envio 103858": 4.41, "Envio 103860": 2.2, "Envio 103861": 2.2, "Envio 103866": 2.2, "Envio 103886": 2.2,
+    "Envio 103890": 2.2, "Envio 103892": 2.2, "Envio 103896": 2.2, "Envio 103898": 2.2, "Envio 103899": 2.2,
+    "Envio 103901": 2.2, "Envio 103908": 17.64, "Envio 103915": 2.2, "Envio 103922": 2.2, "Envio 103930": 2.2,
+    "Envio 103931": 2.2, "Envio 103995": 2.2, "Envio 103997": 2.2, "Envio 103998": 2.2, "Envio 103999": 2.2,
+    "Envio 104003": 2.2, "Envio 104007": 2.2, "Envio 104014": 2.2, "Envio 104016": 2.2, "Envio 104020": 2.2,
+    "Envio 104023": 2.2, "Envio 104039": 4.41, "Envio 104040": 4.41, "Envio 104041": 2.2, "Envio 104043": 2.2,
+    "Envio 104046": 2.2, "Envio 104048": 2.2, "Envio 104096": 2.2, "Envio 104124": 4.41, "Envio 104125": 4.41,
+    "Envio 104132": 4.41, "Envio 104133": 2.2, "Envio 104134": 2.2, "Envio 104135": 2.2, "Envio 104162": 2.2,
+    "Envio 104164": 2.2, "Envio 104188": 2.2, "Envio 104189": 2.2, "Envio 104190": 2.2, "Envio 104193": 4.41,
+    "Envio 104195": 4.41, "Envio 104197": 2.2, "Envio 104213": 2.2, "Envio 104214": 2.2, "Envio 104215": 2.2,
+    "Envio 104219": 2.2, "Envio 104220": 2.2, "Envio 104245": 2.2, "Envio 104247": 2.2, "Envio 104260": 2.2,
+    "Envio 104262": 26.46, "Envio 104266": 4.41, "Envio 104333": 2.2, "Envio 104335": 4.41, "Envio 104337": 2.2,
+    "Envio 104339": 2.2, "Envio 104341": 2.2, "Envio 104375": 4.41, "Envio 104378": 20.72, "Envio 104394": 2.2,
+    "Envio 104395": 2.2, "Envio 104400": 2.2, "Envio 104403": 2.2, "Envio 104405": 2.2, "Envio 104408": 2.2,
+    "Envio 104409": 2.2, "Envio 104411": 2.2, "Envio 104413": 44.09, "Envio 104450": 2.2, "Envio 104452": 2.2,
+    "Envio 104454": 2.2, "Envio 104461": 2.2, "Envio 104465": 2.2, "Envio 104485": 2.2, "Envio 104487": 2.2,
+    "Envio 104488": 2.2, "Envio 104489": 2.2, "Envio 104497": 4.41, "Envio 104608": 4.41, "Envio 104614": 2.2,
+    "Envio 104616": 2.2, "Envio 104617": 2.2, "Envio 104620": 4.41, "Envio 104623": 2.2, "Envio 104630": 2.2,
+    "Envio 104633": 2.2, "Envio 104639": 2.2, "Envio 104641": 2.2, "Envio 104644": 4.41, "Envio 104645": 2.2,
+    "Envio 104646": 2.2, "Envio 104649": 4.41, "Envio 104653": 4.41, "Envio 104656": 2.2, "Envio 104677": 13.23,
+    "Envio 104679": 2.2, "Envio 104708": 2.2, "Envio 104711": 4.41, "Envio 104712": 24.25, "Envio 104714": 4.41,
+    "Envio 104719": 2.2, "Envio 104725": 4.41, "Envio 104727": 4.41, "Envio 104728": 2.2, "Envio 104730": 2.2,
+    "Envio 104732": 2.2, "Envio 104734": 4.41, "Envio 104735": 2.2, "Envio 104737": 2.2, "Envio 104738": 2.2,
+    "Envio 104741": 2.2, "Envio 104743": 2.2, "Envio 104744": 2.2, "Envio 104750": 4.41, "Envio 104751": 2.2,
+    "Envio 104820": 17.64, "Envio 104827": 2.2, "Envio 104829": 4.41, "Envio 104831": 2.2, "Envio 104832": 2.2,
+    "Envio 104833": 2.2, "Envio 104864": 2.2, "Envio 104866": 2.2, "Envio 104867": 2.2, "Envio 104966": 2.2,
+    "Envio 105354": 2.2, "Envio 105493": 4.41, "Envio 105495": 4.41, "Envio 105496": 2.2, "Envio 105497": 4.41,
+    "Envio 105498": 2.2, "Envio 105504": 4.41, "Envio 105506": 2.2, "Envio 105510": 4.41, "Envio 105515": 2.2,
+    "Envio 105516": 4.41, "Envio 105518": 4.41, "Envio 105521": 6.61, "Envio 105550": 13.23, "Envio 105551": 11.02,
+    "Envio 105557": 30.86, "Envio 105560": 6.61, "Envio 105563": 4.41, "Envio 105565": 2.2, "Envio 105575": 6.61,
+    "Envio 105579": 2.2, "Envio 105580": 4.41, "Envio 105583": 2.2, "Envio 105586": 2.2, "Envio 105644": 2.2,
+    "Envio 105650": 4.41, "Envio 105652": 2.2, "Envio 105657": 2.2, "Envio 105800": 2.2, "Envio 105801": 8.82,
+    "Envio 105924": 2.2, "Envio 105926": 8.82, "Envio 105928": 2.2, "Envio 105934": 2.2, "Envio 105935": 4.41,
+    "Envio 105949": 4.41, "Envio 105951": 2.2, "Envio 105952": 4.41, "Envio 105957": 2.2, "Envio 105961": 2.2,
+    "Envio 105966": 4.41, "Envio 105969": 2.2, "Envio 105973": 2.2, "Envio 105977": 4.41, "Envio 106133": 2.2,
+    "Envio 106134": 11.02, "Envio 106135": 2.2, "Envio 106137": 4.41, "Envio 106143": 2.2, "Envio 106144": 4.41,
+    "Envio 106315": 2.2,
+}
+
 
 def aplicar_tarifa_envio_por_peso(combinado: pd.DataFrame, cas: str, conf: dict, desde: str):
     """Recalcula por PESO el Monto de los envíos de 'cas' con Fecha >= 'desde'.
@@ -4477,6 +4526,15 @@ def aplicar_tarifa_envio_por_peso(combinado: pd.DataFrame, cas: str, conf: dict,
         df["TRM"] = ""
     if COL_PESO_HIST not in df.columns:
         df[COL_PESO_HIST] = ""
+
+    # ⚖️ Peso final fijado a mano (PESO_FINAL_1444): reemplaza el peso que traiga la fila
+    # (del histórico o del archivo de envíos) antes de calcular. Solo CA1444.
+    if str(cas).strip() == "1444" and PESO_FINAL_1444:
+        _ord = df["Orden"].astype(str).str.strip()
+        _pf = _ord.map(PESO_FINAL_1444)
+        _m_pf = _pf.notna() & df["Motivo"].astype(str).str.strip().str.casefold().eq("envio")
+        if _m_pf.any():
+            df.loc[_m_pf, COL_PESO_HIST] = _pf[_m_pf].astype(float)
 
     _fecha = pd.to_datetime(df["Fecha"], errors="coerce")
     _monto = pd.to_numeric(df["Monto"], errors="coerce")
