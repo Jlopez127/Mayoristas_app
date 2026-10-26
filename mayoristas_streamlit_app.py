@@ -459,6 +459,10 @@ COMPRAS_TC_PROPIA = {
     "175289": ("11591", "Cancelada en el portal: eliminada del cobro (9-oct-2026)"),
     "175702": ("11591", "Cancelada en el portal: eliminada del cobro (9-oct-2026)"),
     "174432": ("11591", "Eliminada del cobro por pedido de Julián (9-oct-2026)"),
+    # Discover: Amazon US$499,99 del 30-sep (AMAZON.COM*510HG2OU2), cargada el 5-oct a Julian.
+    # Pedido de Julián 26-oct-2026: se le quita y no se le vuelve a cargar. Además está en
+    # DISCOVER_RETENIDAS para que el extracto no la traiga ni abone una devolución suya.
+    "discover_5eab459b5a3c": ("13608", "Eliminada del cobro por pedido de Julián (26-oct-2026)"),
 }
 
 
@@ -3445,7 +3449,10 @@ DISCOVER_FECHA_DESDE = "2026-09-09"
 #   - La de Amazon del 15-sep queda RETENIDA hasta que el usuario la valide (2026-09-21). Las
 #     tres están en ~/Downloads/20260921_Discover_Santi_Amazon_por_validar.xlsx.
 DISCOVER_EXCLUIR_RANGOS = [("AMAZON", "2026-09-09", "2026-09-14")]   # (prefijo desc, desde, hasta)
-DISCOVER_RETENIDAS = {"AMAZON.COM*5L3RC1722": "Amazon del 15-sep, por validar (2026-09-21)"}
+#   - La Amazon US$499,99 del 30-sep (AMAZON.COM*510HG2OU2) NUNCA se le carga (usuario,
+#     2026-10-26); la fila ya cargada se neutraliza en COMPRAS_TC_PROPIA.
+DISCOVER_RETENIDAS = {"AMAZON.COM*5L3RC1722": "Amazon del 15-sep, por validar (2026-09-21)",
+                      "AMAZON.COM*510HG2OU2": "Amazon del 30-sep, nunca se carga (2026-10-26)"}
 
 
 def _discover_monto(s) -> float:
