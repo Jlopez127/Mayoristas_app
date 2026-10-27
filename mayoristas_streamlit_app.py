@@ -455,6 +455,9 @@ COMPRAS_TC_PROPIA = {
     "Envio 107027": ("11591", "Fraccionado: se cobra en sus hijos 107951+107952+107953"),
     "Envio 107953": ("11591", "Fraccionado: se cobra en sus hijos 108165+108166"),
     "Envio 108166": ("11591", "Fraccionado: se cobra en sus hijos 108338+108339"),
+    # 108805 (9-oct, 571.781) se fraccionó el 10-oct en 108869+108870 y el viejo cobró los tres
+    # (hallazgo H2 de Mayoristas 2.0). Julián, 27-oct-2026: neutralizarlo.
+    "Envio 108805": ("11591", "Fraccionado: se cobra en sus hijos 108869+108870"),
     # Pedido de Julián 9-oct-2026: se eliminan del cobro y no pueden volver a cargar.
     "175289": ("11591", "Cancelada en el portal: eliminada del cobro (9-oct-2026)"),
     "175702": ("11591", "Cancelada en el portal: eliminada del cobro (9-oct-2026)"),
