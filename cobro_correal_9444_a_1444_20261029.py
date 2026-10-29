@@ -47,6 +47,9 @@ COBROS = [
     ("2026-10-06", "Extra386", "Kevin Montero San", 5000000.0),
 ]
 TOTAL_9444 = 60740000.0
+ABONO = 4570000.0
+ORDEN_ABONO = "abono_perdida1_202610_1444"
+NOMBRE_ABONO = "Abono perdida 1"
 TOTAL_COBRO = 61347400.0
 EXTRA = "/Users/julianlopez/Library/CloudStorage/OneDrive-Personal/Historico Carga/Conciliacion/Mayoristas/ingresos_extra.xlsx"
 ONEDRIVE_DIR = "/Users/julianlopez/Library/CloudStorage/OneDrive-Personal/Historico Carga/Conciliacion/Mayoristas"
@@ -131,7 +134,7 @@ def main():
             and pd.to_datetime(r["Fecha"]).iloc[0].strftime("%Y-%m-%d") == x["f9"],
             "" if len(r) != 1 else str(r["Nombre del producto"].iloc[0]))
     o0 = vivo[HOJA]["Orden"].astype(str).str.strip()
-    chk("1444 todavía no tiene ninguno de estos cobros", not o0.isin([x["orden"] for x in filas_cobro]).any())
+    chk("1444 todavía no tiene ninguno de estos cobros ni el abono", not o0.isin([x["orden"] for x in filas_cobro] + [ORDEN_ABONO]).any())
     ex = pd.read_excel(EXTRA, sheet_name=None)
     HEX = next(h for h in ex if h.split("-")[0].strip() == CAS)
     chk("ingresos_extra.xlsx todavía no los tiene",
@@ -140,39 +143,86 @@ def main():
     if not ok:
         raise SystemExit("⛔ ABORTA.")
 
-    banner("3) APLICAR")
+    banner("3) APLICAR — cada cobro en SU fecha + abono perdida 1 de octubre hoy")
     hoy = pd.Timestamp.today().strftime("%Y-%m-%d")
     historico = {k: mod.asegurar_columnas_historico(v.copy()) for k, v in vivo.items()}
     d = historico[HOJA]
     u_orig = usuario_de_totales(vivo[HOJA]) or "Maria Moises"
+    cas_t = cas_de_totales(vivo[HOJA], CAS)
     nuevas = []
     for x in filas_cobro:
         fila = {c: "" for c in d.columns}
-        fila.update({"Fecha": FECHA, "Tipo": "Ingreso", "Monto": x["monto"], "Orden": x["orden"],
+        fila.update({"Fecha": pd.Timestamp(x["f9"]), "Tipo": "Ingreso", "Monto": x["monto"], "Orden": x["orden"],
                      "Motivo": "Ingreso_extra", "TRM": "", "Usuario": u_orig, "Casillero": int(CAS),
                      "Nombre del producto": x["nombre"], "Fecha de Carga": hoy})
         nuevas.append(fila)
-        print(f"  + {x['orden']:<42} {x['monto']:>16,.2f}  {x['nombre']}")
+        print(f"  + {x['f9']} {x['orden']:<42} {x['monto']:>16,.2f}")
+    fila = {c: "" for c in d.columns}
+    fila.update({"Fecha": FECHA, "Tipo": "Ingreso", "Monto": ABONO, "Orden": ORDEN_ABONO,
+                 "Motivo": "Ingreso_extra", "TRM": "", "Usuario": u_orig, "Casillero": int(CAS),
+                 "Nombre del producto": NOMBRE_ABONO, "Fecha de Carga": hoy})
+    nuevas.append(fila)
+    print(f"  + {FECHA:%Y-%m-%d} {ORDEN_ABONO:<42} {ABONO:>16,.2f}  {NOMBRE_ABONO}")
     d = pd.concat([d, pd.DataFrame(nuevas)], ignore_index=True)
-    historico[HOJA] = mod.recalcular_totales_diarios(d, usuario=u_orig, cas=cas_de_totales(vivo[HOJA], CAS))
+    d = mod.recalcular_totales_diarios(d, usuario=u_orig, cas=cas_t)
+
     def tots(df):
         t = df[df["Tipo"].astype(str).str.strip().str.upper() == "TOTAL"].copy()
         return t.assign(F=pd.to_datetime(t["Fecha"]).dt.normalize()).groupby("F")["Monto"].last().astype(float)
+
+    banner("3b) COMISIÓN QUINCENAL RECALCULADA (1,5% × |día más negativo|), quincena por quincena en orden")
+    import calendar
+    MESES = {4: "abril", 5: "mayo", 6: "junio", 7: "julio", 8: "agosto", 9: "septiembre", 10: "octubre"}
+    QUINCENAS = []
+    for m in range(4, 11):
+        QUINCENAS.append((pd.Timestamp(2026, m, 1), pd.Timestamp(2026, m, 15), f"1-15 {MESES[m]} 2026"))
+        if m < 10:  # 16-31 oct no ha cerrado: la calcula la app en su ventana (1-15 nov)
+            QUINCENAS.append((pd.Timestamp(2026, m, 16), pd.Timestamp(2026, m, calendar.monthrange(2026, m)[1]),
+                              f"16-fin {MESES[m]} 2026"))
+    resumen_com = []
+    for ini, fin, et in QUINCENAS:
+        orden_c = f"Comision de ({et})"
+        tt = tots(d)
+        w = tt[(tt.index >= ini) & (tt.index <= fin)]
+        peor = float(w.min()) if len(w) else 0.0
+        com = round(abs(peor) * 0.015, 2) if peor < 0 else 0.0
+        mk = d["Orden"].astype(str).str.strip().str.lower().eq(orden_c.lower())
+        antes_c = float(pd.to_numeric(d.loc[mk, "Monto"], errors="coerce").sum()) if mk.any() else None
+        if mk.any():
+            d.loc[mk, "Monto"] = com
+            d.loc[mk, "Fecha de Carga"] = hoy
+        elif com > 0:
+            fila = {c: "" for c in d.columns}
+            fila.update({"Fecha": fin + pd.Timedelta(days=1), "Tipo": "Egreso", "Orden": orden_c, "Monto": com,
+                         "Motivo": "comision", "TRM": "", "Usuario": u_orig, "Casillero": CAS,
+                         "Nombre del producto": orden_c, "Fecha de Carga": hoy})
+            d = pd.concat([d, pd.DataFrame([fila])], ignore_index=True)
+        d = mod.recalcular_totales_diarios(d, usuario=u_orig, cas=cas_t)
+        resumen_com.append((et, peor, antes_c, com))
+        print(f"  {et:<24} peor día {peor:>16,.2f}   comisión {('—' if antes_c is None else f'{antes_c:,.2f}'):>14} → {com:>14,.2f}")
+    historico[HOJA] = d
+    DELTA_COM = sum(c - (a or 0.0) for _, _, a, c in resumen_com)
+    print(f"  Δ comisiones = {DELTA_COM:,.2f}")
     ta, tb = tots(vivo[HOJA]), tots(historico[HOJA])
-    print(pd.DataFrame({"antes": ta, "después": tb}).tail(6).to_string(float_format=lambda v: f"{v:,.2f}"))
 
     banner("4) INVARIANTES")
     s1 = saldo(historico[HOJA])
-    chk("saldo baja exactamente 61.347.400", abs((s0 - s1) - TOTAL_COBRO) < 0.01, f"{s0:,.2f} → {s1:,.2f}")
+    esperado = TOTAL_COBRO - ABONO + DELTA_COM
+    chk("saldo baja exactamente cobros − abono + Δ comisiones", abs((s0 - s1) - esperado) < 0.01,
+        f"{s0:,.2f} → {s1:,.2f}")
     def movs(df):
         return int((df["Tipo"].astype(str).str.strip().str.upper() != "TOTAL").sum())
-    chk("+8 filas de movimiento (no se borra nada)", movs(historico[HOJA]) == movs(vivo[HOJA]) + 8)
-    comun = ta.index[ta.index < FECHA]
-    chk("saldos diarios ANTERIORES a hoy idénticos", (tb.reindex(comun) - ta.reindex(comun)).abs().max() < 0.01, f"{len(comun)} días")
+    n_nuevas_com = sum(1 for _, _, a, c in resumen_com if a is None and c > 0)
+    chk(f"+9 filas (+{n_nuevas_com} comisiones nuevas), no se borra nada",
+        movs(historico[HOJA]) == movs(vivo[HOJA]) + 9 + n_nuevas_com)
+    comun = ta.index[ta.index < pd.Timestamp("2026-04-01")]
+    chk("saldos diarios ANTERIORES al 1-abr idénticos", (tb.reindex(comun) - ta.reindex(comun)).abs().max() < 0.01, f"{len(comun)} días")
+    recalc = {f"comision de ({et})".lower() for _, _, et in QUINCENAS}
     def comis(df):
         c = df[df["Orden"].astype(str).str.contains("Comision", case=False, na=False)]
+        c = c[~c["Orden"].astype(str).str.strip().str.lower().isin(recalc)]
         return sorted(zip(c["Orden"].astype(str), pd.to_numeric(c["Monto"]).round(2)))
-    chk("filas de comisión idénticas", comis(vivo[HOJA]) == comis(historico[HOJA]), f"{len(comis(vivo[HOJA]))}")
+    chk("comisiones fuera de abr–oct idénticas", comis(vivo[HOJA]) == comis(historico[HOJA]), f"{len(comis(vivo[HOJA]))}")
     vac = {"", "nan", "none", "nat"}
     a = {y for y in vivo[HOJA]["Orden"].astype(str).str.strip() if y.lower() not in vac}
     b = {y for y in historico[HOJA]["Orden"].astype(str).str.strip() if y.lower() not in vac}
@@ -186,9 +236,10 @@ def main():
             igual = abs(pd.to_numeric(A["Monto"], errors="coerce").fillna(0).sum() -
                         pd.to_numeric(B["Monto"], errors="coerce").fillna(0).sum()) < 0.01
         chk(f"verbatim: {hoja}", igual, f"{len(A)} filas")
-    if s1 < 0:
-        print(f"  ⚠️  1444 queda NEGATIVA ({s1:,.2f}): la comisión quincenal 16-31 oct (1,5% del peor "
-              f"saldo negativo) la tomará en la próxima corrida ≈ {abs(s1) * 0.015:,.0f}")
+    import json
+    json.dump({"s0": s0, "s1": s1, "delta_com": DELTA_COM, "com": resumen_com,
+               "diario": {k.strftime("%Y-%m-%d"): [float(ta.get(k, float("nan"))), float(v)] for k, v in tb.items() if k >= pd.Timestamp("2026-04-01")}},
+              open(os.environ.get("RES_JSON", "/dev/null"), "w"), default=str)
     if not ok:
         raise SystemExit("⛔ ABORTA: falló alguna invariante.")
 
@@ -241,6 +292,10 @@ def main():
     for x in filas_cobro:
         q = orl == x["orden"]
         chk2(f"1444: {x['orden']}", int(q.sum()) == 1 and abs(float(pd.to_numeric(rel[HOJA].loc[q, "Monto"]).iloc[0]) - x["monto"]) < 0.01)
+    chk2("1444: abono perdida 1 de octubre", int((orl == ORDEN_ABONO).sum()) == 1)
+    for et, _, _, com in resumen_com:
+        q = orl.str.lower() == f"comision de ({et})".lower()
+        chk2(f"1444: comisión {et}", (com == 0 and not q.any()) or abs(float(pd.to_numeric(rel[HOJA].loc[q, "Monto"]).sum()) - com) < 0.01)
     chk2("1444: saldo", abs(saldo(rel[HOJA]) - s1) < 0.01, f"COP {saldo(rel[HOJA]):,.2f}")
     for hoja in vivo:
         if hoja == HOJA:
@@ -260,9 +315,12 @@ def main():
     wb = openpyxl.load_workbook(EXTRA); ws = wb[HEX]
     cab = [c.value for c in ws[1]]
     for x in filas_cobro:
-        val = {"Tipo": "Ingreso", "Fecha": FECHA.to_pydatetime(), "Orden": x["orden"], "Monto": x["monto"],
+        val = {"Tipo": "Ingreso", "Fecha": pd.Timestamp(x["f9"]).to_pydatetime(), "Orden": x["orden"], "Monto": x["monto"],
                "Usuario": u_orig, "Casillero": int(CAS), "Motivo": "Ingreso_extra", "Nombre del producto": x["nombre"]}
         ws.append([val.get(c) for c in cab])
+    val = {"Tipo": "Ingreso", "Fecha": FECHA.to_pydatetime(), "Orden": ORDEN_ABONO, "Monto": ABONO,
+           "Usuario": u_orig, "Casillero": int(CAS), "Motivo": "Ingreso_extra", "Nombre del producto": NOMBRE_ABONO}
+    ws.append([val.get(c) for c in cab])
     wb.save(EXTRA)
     ex2 = pd.read_excel(EXTRA, sheet_name=None)
     oex = ex2[HEX]["Orden"].astype(str)
