@@ -170,11 +170,12 @@ def main():
         t = df[df["Tipo"].astype(str).str.strip().str.upper() == "TOTAL"].copy()
         return t.assign(F=pd.to_datetime(t["Fecha"]).dt.normalize()).groupby("F")["Monto"].last().astype(float)
 
-    banner("3b) COMISIÓN QUINCENAL RECALCULADA (1,5% × |día más negativo|), quincena por quincena en orden")
+    banner("3b) COMISIÓN QUINCENAL RECALCULADA DESDE 1-15 JUNIO (1,5% × |día más negativo|), en orden")
     import calendar
     MESES = {4: "abril", 5: "mayo", 6: "junio", 7: "julio", 8: "agosto", 9: "septiembre", 10: "octubre"}
     QUINCENAS = []
-    for m in range(4, 11):
+    # Decisión de Julián (29-oct): abril y mayo se quedan con la comisión que ya tienen; se recalcula desde junio.
+    for m in range(6, 11):
         QUINCENAS.append((pd.Timestamp(2026, m, 1), pd.Timestamp(2026, m, 15), f"1-15 {MESES[m]} 2026"))
         if m < 10:  # 16-31 oct no ha cerrado: la calcula la app en su ventana (1-15 nov)
             QUINCENAS.append((pd.Timestamp(2026, m, 16), pd.Timestamp(2026, m, calendar.monthrange(2026, m)[1]),
@@ -222,7 +223,7 @@ def main():
         c = df[df["Orden"].astype(str).str.contains("Comision", case=False, na=False)]
         c = c[~c["Orden"].astype(str).str.strip().str.lower().isin(recalc)]
         return sorted(zip(c["Orden"].astype(str), pd.to_numeric(c["Monto"]).round(2)))
-    chk("comisiones fuera de abr–oct idénticas", comis(vivo[HOJA]) == comis(historico[HOJA]), f"{len(comis(vivo[HOJA]))}")
+    chk("comisiones anteriores a junio idénticas (abril y mayo no se tocan)", comis(vivo[HOJA]) == comis(historico[HOJA]), f"{len(comis(vivo[HOJA]))}")
     vac = {"", "nan", "none", "nat"}
     a = {y for y in vivo[HOJA]["Orden"].astype(str).str.strip() if y.lower() not in vac}
     b = {y for y in historico[HOJA]["Orden"].astype(str).str.strip() if y.lower() not in vac}
