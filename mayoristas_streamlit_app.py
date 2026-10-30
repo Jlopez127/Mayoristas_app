@@ -466,6 +466,13 @@ COMPRAS_TC_PROPIA = {
     # Pedido de Julián 26-oct-2026: se le quita y no se le vuelve a cargar. Además está en
     # DISCOVER_RETENIDAS para que el extracto no la traiga ni abone una devolución suya.
     "discover_5eab459b5a3c": ("13608", "Eliminada del cobro por pedido de Julián (26-oct-2026)"),
+    # Reclamo de MariaPaz Shop (punto 2.1, PEC consolidados y cobrados individualmente).
+    # Pedido de Julián 30-oct-2026: se le quitan estos 4 envíos y no se le vuelven a cobrar.
+    # Al cambiar el Motivo, la tarifa por peso de 1444 (filtra Motivo == "Envio") no los toca.
+    "Envio 110112": ("1444", "Consolidado (PEC 353388): eliminado del cobro por pedido de Julián (30-oct-2026)"),
+    "Envio 110068": ("1444", "Consolidado (PEC 353393): eliminado del cobro por pedido de Julián (30-oct-2026)"),
+    "Envio 110036": ("1444", "Consolidado (PEC 353443): eliminado del cobro por pedido de Julián (30-oct-2026)"),
+    "Envio 110680": ("1444", "Consolidado (PEC 353478): eliminado del cobro por pedido de Julián (30-oct-2026)"),
 }
 
 
