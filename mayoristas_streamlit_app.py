@@ -2199,6 +2199,16 @@ def _capital_cas_por_fecha(f_iso: str):
         return CAPITAL_CASILLERO_DESDE, CAPITAL_USUARIO_DESDE
     return CAPITAL_CASILLERO, CAPITAL_USUARIO
 CAPITAL_CARD_NO = "1484"
+# 💳 TARJETAS SPARK (cuenta Capital One "Spark", decisión de Julián 9-nov-2026): sub-tarjetas de la
+# misma descarga de Capital One, cada una de UN mayorista FIJO (sin traspaso por fecha). Se cargan
+# completas (son nuevas). La 5315 es de Santiago (Iris) y NO se carga. La 1484 sigue igual que antes.
+#   - Su Orden lleva la tarjeta en la clave ("<tarjeta>|<fecha>|…") para que nunca colisione con la
+#     1484 ni le mueva el 'seq' a sus filas: los Orden de la 1484 quedan IDÉNTICOS.
+CAPITAL_TARJETAS_FIJAS = {
+    "6259": ("13608", "Julian Sanchez"),
+    "9719": ("1444", "Maria Moises"),
+    "5269": ("11591", "Paula Herrera"),
+}
 CAPITAL_COLS = ["Transaction Date", "Posted Date", "Card No.", "Description", "Category",
                 "Debit", "Credit"]
 CAPITAL_CAT_PAGO = "Payment/Credit"   # pagos a la tarjeta: se ignoran SIEMPRE
@@ -2246,6 +2256,11 @@ def _capital_clave_y_seq(df: pd.DataFrame):
              + df["Debit"].astype(str).str.strip() + "|"
              + df["Credit"].astype(str).str.strip() + "|"
              + df["Description"].astype(str).str.strip())
+    # Tarjetas Spark: la tarjeta va al frente de la clave (la 1484 no cambia).
+    if "Card No." in df.columns:
+        _c = df["Card No."].astype(str).str.strip()
+        _f = _c.isin(CAPITAL_TARJETAS_FIJAS)
+        clave = clave.where(~_f, _c + "|" + clave)
     canon = pd.DataFrame(
         {"_k": clave, "_p": df["Posted Date"].astype(str).str.strip()}
     ).sort_values(["_k", "_p"], kind="mergesort")
@@ -2289,16 +2304,18 @@ def procesar_capital(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendient
             "No se procesa nada: sin la lista se recobrarían transacciones ya cobradas."
         )
 
-    # 🔒 SEGMENTACIÓN POR TARJETA: solo la 1484 (Julian). Otras se ignoran con aviso.
+    # 🔒 SEGMENTACIÓN POR TARJETA: la 1484 + las tarjetas Spark fijas. Otras se ignoran con aviso.
     _card = df["Card No."].astype(str).str.strip()
-    _otras = sorted(set(_card.unique()) - {CAPITAL_CARD_NO})
+    _validas = {CAPITAL_CARD_NO} | set(CAPITAL_TARJETAS_FIJAS)
+    _otras = sorted(set(_card.unique()) - _validas)
     if _otras:
         _cobradas_warn(
-            f"⚠️ Capital: el CSV trae {int((~_card.eq(CAPITAL_CARD_NO)).sum())} fila(s) de otras "
-            f"tarjetas ({', '.join(_otras)}) — IGNORADAS. Solo se carga la {CAPITAL_CARD_NO} "
-            f"(casillero {CAPITAL_CASILLERO})."
+            f"⚠️ Capital: el CSV trae {int((~_card.isin(_validas)).sum())} fila(s) de otras "
+            f"tarjetas ({', '.join(_otras)}) — IGNORADAS. Solo se cargan la {CAPITAL_CARD_NO} y las "
+            f"Spark {', '.join(sorted(CAPITAL_TARJETAS_FIJAS))}."
         )
-    df = df[_card.eq(CAPITAL_CARD_NO)].copy()
+    df = df[_card.isin(_validas)].copy()
+    df["_card"] = df["Card No."].astype(str).str.strip()
     if df.empty:
         return {}
 
@@ -2376,8 +2393,8 @@ def procesar_capital(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendient
             "usd": round(float(r["_usd"]), 2),
             # Capital es de UNA sola tarjeta: se puebla 'cm' igual que Rakuten para que
             # _resolver_trm_reembolsos aplique la misma regla sin casos especiales.
-            "cm": CAPITAL_USUARIO,
-            "cas": CAPITAL_CASILLERO,
+            "cm": CAPITAL_TARJETAS_FIJAS.get(r["_card"], (None, CAPITAL_USUARIO))[1],
+            "cas": CAPITAL_TARJETAS_FIJAS.get(r["_card"], (CAPITAL_CASILLERO, None))[0],
             "trm_fecha": r["_fecha"].strftime("%Y-%m-%d"),
         }
         for _, r in df[df["_tipo"] == "Egreso"].iterrows()
@@ -2410,7 +2427,7 @@ def procesar_capital(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendient
     # 'merchant' es la Description (trae el order-id de eBay) -> emparejamiento muy preciso.
     # 🔏 La llave incluye el SIGNO: sin él, un cobro-compra huérfano taparía al reembolso de esa
     # misma compra (misma Description y mismo monto, a ≤3 días).
-    df["_cas"] = CAPITAL_CASILLERO
+    df["_cas"] = df["_card"].map(lambda c: CAPITAL_TARJETAS_FIJAS.get(c, (CAPITAL_CASILLERO, None))[0])
     df["_tipo_attr"] = df["_tipo"]
     _drop_attr = _excluir_por_atributos(df, cobrados_df, "capital", _ordenes_universo,
                                         _rango_extracto, "Capital")
@@ -2423,7 +2440,8 @@ def procesar_capital(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendient
     _reembolsos = [
         {"id": r["_orden"], "fecha": r["_fecha"], "merch": r["_merch_attr"],
          "usd": round(float(r["_usd"]), 2),
-         "cm": CAPITAL_USUARIO, "cas": CAPITAL_CASILLERO}
+         "cm": CAPITAL_TARJETAS_FIJAS.get(r["_card"], (None, CAPITAL_USUARIO))[1],
+         "cas": CAPITAL_TARJETAS_FIJAS.get(r["_card"], (CAPITAL_CASILLERO, None))[0]}
         for _, r in df[df["_tipo"] == "Ingreso"].iterrows()
     ]
     _trm_ok, _trm_sin_match, _trm_ambiguos = _resolver_trm_reembolsos(
@@ -2472,10 +2490,15 @@ def procesar_capital(df: pd.DataFrame, fecha_desde=None, cobrados=None, pendient
             trm = _trm_hist if _origen == "historico" else trm_cache[_f_compra]
             etq = f"reembolso{' parcial' if _parcial else ''} (TRM compra {_f_compra})"
             f_cas = _f_compra
-        elif tipo == "Ingreso" and CAPITAL_FECHA_TRASPASO:
+        elif tipo == "Ingreso" and CAPITAL_FECHA_TRASPASO and r["_card"] not in CAPITAL_TARJETAS_FIJAS:
             _reemb_sin_origen.append(f"{f_iso} USD {float(r['_usd']):,.2f}")
-        cas_fila, usuario_fila = _capital_cas_por_fecha(f_cas)
+        if r["_card"] in CAPITAL_TARJETAS_FIJAS:
+            cas_fila, usuario_fila = CAPITAL_TARJETAS_FIJAS[r["_card"]]   # Spark: mayorista fijo
+        else:
+            cas_fila, usuario_fila = _capital_cas_por_fecha(f_cas)
         desc = " ".join(str(r["Description"]).split())
+        if r["_card"] in CAPITAL_TARJETAS_FIJAS:
+            desc = f"Spark {r['_card']} - {desc}"
         filas.append({
             "Fecha": f_iso,
             "Tipo": tipo,
